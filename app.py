@@ -25,11 +25,13 @@ from controller import (
     save_zones,
     validate_zones,
 )
-from waveshare_relay import DEFAULT_HOST, DEFAULT_PORT, WaveshareRelays
+from waveshare_relay import WaveshareRelays
+from service import DEFAULT_CONFIG, default_socket
+from service_client import ServiceClient
 
 GREEN = "#37cc87"
 RUNNING_RED = "#ff2020"
-BLUE = "#55aaff"
+SCHEDULED_GREEN = "#20ff20"
 GREY = "#8b98ab"
 RED = "#b63e4b"
 WINDOW_COLORS = (
@@ -58,7 +60,7 @@ class SprinklerApp(ctk.CTk):
     def __init__(
         self,
         settings_path: Path,
-        backend: WaveshareRelays,
+        backend: WaveshareRelays | ServiceClient,
     ) -> None:
         super().__init__()
         self.withdraw()
@@ -70,11 +72,14 @@ class SprinklerApp(ctk.CTk):
         self.timer: str | None = None
         self.dirty = False
         self.faulted = False
+        self.syncing = False
+        self.service_error = ""
+        self.remote = isinstance(backend, ServiceClient)
         self.relay = backend
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         try:
-            zones = load_zones(settings_path)
-            rain_paused = load_rain_pause(settings_path)
+            zones = backend.zones if isinstance(backend, ServiceClient) else load_zones(settings_path)
+            rain_paused = backend.rain_paused if isinstance(backend, ServiceClient) else load_rain_pause(settings_path)
         except (OSError, ValueError) as exc:
             messagebox.showerror(
                 "Cannot load settings",
@@ -87,7 +92,12 @@ class SprinklerApp(ctk.CTk):
         try:
             # Startup intentionally turns every physical relay OFF before
             # applying routines that may be active at the current time.
-            self.controller = Controller(zones, backend, rain_paused=rain_paused)
+            self.controller: Controller | ServiceClient
+            if isinstance(backend, ServiceClient):
+                self.controller = backend
+                self.edit_revision = backend.revision
+            else:
+                self.controller = Controller(zones, backend, rain_paused=rain_paused)
         except ExceptionGroup as exc:
             logging.exception("Relay startup failed")
             messagebox.showerror(
@@ -174,7 +184,7 @@ class SprinklerApp(ctk.CTk):
             self.zone_dots.append(dot)
         ctk.CTkLabel(
             sidebar,
-            text="Red: watering\nBlue: scheduled now\nGrey: inactive",
+            text="Red: watering\nBright green: scheduled now\nGrey: inactive",
             text_color=GREY,
             justify="left",
         ).grid(row=9, column=0, columnspan=2, padx=20, pady=10, sticky="w")
@@ -218,7 +228,9 @@ class SprinklerApp(ctk.CTk):
         self.test_button.grid(row=0, column=1, sticky="ew", padx=(5, 0))
         ctk.CTkLabel(
             panel,
-            text="Schedules run only while this app is open. Changes apply after saving.\n"
+            text=("Background service keeps watering when this window is closed.\n"
+                  if self.remote else "Schedules run only while this app is open. Changes apply after saving.\n")
+            +
             "Manual watering stops after 10 minutes. Stop All stops current windows only.",
             text_color=GREY,
             justify="left",
@@ -363,6 +375,8 @@ class SprinklerApp(ctk.CTk):
         self._refresh()
 
     def _edited(self, *_args: str) -> None:
+        if self.syncing:
+            return
         self.dirty = True
         self._validate()
         self._refresh()
@@ -390,7 +404,7 @@ class SprinklerApp(ctk.CTk):
             master = channel == self.controller.master_channel
             active = self.controller.pump_on if master else channel in self.controller.runs
             color = RUNNING_RED if active else (
-                BLUE if not master and not self.controller.rain_paused and zone.scheduled(now) else GREY
+                SCHEDULED_GREEN if not master and not self.controller.rain_paused and zone.scheduled(now) else GREY
             )
             self.zone_dots[channel].configure(text_color=color)
             name = "Master Pump" if master else self.fields[channel].name.get().strip() or "(Unnamed)"
@@ -413,7 +427,10 @@ class SprinklerApp(ctk.CTk):
         if self.controller.rain_paused:
             text = "RAIN PAUSE / All watering OFF"
         if self.faulted:
-            text = "FAULT / output state unknown - check device"
+            text = ("SERVICE UNAVAILABLE / status unknown" if self.service_error else
+                    "FAULT / output state unknown - check device")
+            if isinstance(self.controller, ServiceClient) and self.controller.fault and not self.service_error:
+                text = "SERVICE FAULT / " + self.controller.fault
         self.status.configure(
             text=text, text_color="#ff9999" if self.faulted else RUNNING_RED
             if run or (master_selected and self.controller.pump_on) else GREY
@@ -436,17 +453,21 @@ class SprinklerApp(ctk.CTk):
         )
         count = len(self.controller.runs) + int(self.controller.pump_on)
         self.system_status.configure(
-            text="System: FAULT - output state unknown" if self.faulted else (
+            text=("System: SERVICE UNAVAILABLE - status unknown" if self.service_error
+                  else "System: FAULT - output state unknown") if self.faulted else (
                 ("RAIN PAUSE / All watering OFF" if self.controller.rain_paused
                  else f"RELAY / {count} relays on")
                 + (" / Unsaved changes" if self.dirty else " / Ready")
             )
         )
         if self.faulted:
-            self.connection_label.configure(text="HARDWARE FAULT - output state unknown")
+            self.connection_label.configure(
+                text="SERVICE / status unknown" if self.service_error else
+                "HARDWARE FAULT - output state unknown"
+            )
         else:
             self.connection_label.configure(
-                text=f"WAVESHARE RELAY - {self.relay.host}:{self.relay.port}"
+                text=f"{'SERVICE' if self.remote else 'WAVESHARE RELAY'} - {self.relay.host}:{self.relay.port}"
             )
         self.connection_button.configure(
             state="disabled" if self.faulted else "normal",
@@ -464,11 +485,14 @@ class SprinklerApp(ctk.CTk):
         ):
             self.rain_pause_var.set(True)
             return
-        if paused:
+        if paused and not self.remote:
             self.controller.rain_paused = True
         try:
-            save_rain_pause(self.settings_path, paused)
+            if not self.remote:
+                save_rain_pause(self.settings_path, paused)
             self.controller.set_rain_pause(paused, datetime.now())
+        except ValueError as exc:
+            messagebox.showerror("Cannot change Rain Pause", str(exc), parent=self)
         except (OSError, RuntimeError, ExceptionGroup) as exc:
             self._fault("Cannot change Rain Pause", exc)
         self._refresh()
@@ -476,6 +500,9 @@ class SprinklerApp(ctk.CTk):
     def read_relay_status(self) -> None:
         try:
             states = self.relay.read_states()
+        except ValueError as exc:
+            messagebox.showerror("Cannot read relay status", str(exc), parent=self)
+            return
         except (OSError, RuntimeError) as exc:
             self._fault("Relay status read failed", exc)
             return
@@ -491,7 +518,10 @@ class SprinklerApp(ctk.CTk):
     def save(self) -> bool:
         try:
             zones = [fields.read() for fields in self.fields]
-            save_zones(self.settings_path, zones)
+            if isinstance(self.controller, ServiceClient):
+                self.controller.revision = self.edit_revision
+            else:
+                save_zones(self.settings_path, zones)
             self.controller.apply(zones, datetime.now())
         except ValueError as exc:
             messagebox.showerror("Cannot save/apply settings", str(exc), parent=self)
@@ -500,6 +530,8 @@ class SprinklerApp(ctk.CTk):
             self._fault("Cannot save/apply settings", exc)
             return False
         self.dirty = False
+        if isinstance(self.controller, ServiceClient):
+            self.edit_revision = self.controller.revision
         self._refresh()
         return True
 
@@ -509,6 +541,8 @@ class SprinklerApp(ctk.CTk):
                 self.controller.stop(self.selected, datetime.now())
             else:
                 self.controller.start_manual(self.selected, datetime.now())
+        except ValueError as exc:
+            messagebox.showerror("Manual operation rejected", str(exc), parent=self)
         except (OSError, RuntimeError, ExceptionGroup) as exc:
             self._fault("Manual operation failed", exc)
         self._refresh()
@@ -516,6 +550,8 @@ class SprinklerApp(ctk.CTk):
     def test(self) -> None:
         try:
             self.controller.toggle_test(self.selected, datetime.now())
+        except ValueError as exc:
+            messagebox.showerror("Zone test rejected", str(exc), parent=self)
         except (OSError, RuntimeError, ExceptionGroup) as exc:
             self._fault("Zone test failed", exc)
         self._refresh()
@@ -528,6 +564,19 @@ class SprinklerApp(ctk.CTk):
 
     def _fault(self, title: str, error: Exception) -> None:
         logging.error("%s: %s", title, self._error_details(error))
+        if self.remote:
+            self.faulted = True
+            self.service_error = self._error_details(error)
+            self._validate()
+            self._refresh()
+            messagebox.showerror(
+                title,
+                f"{self.service_error}\n\nThe desktop cannot confirm current output states. "
+                "The background service may still be running. Do not assume watering "
+                "has stopped. Check the service/device; this window will reconnect.",
+                parent=self,
+            )
+            return
         self.faulted = True
         self.controller.closed = True
         details = self._error_details(error)
@@ -548,11 +597,41 @@ class SprinklerApp(ctk.CTk):
     def stop_all(self) -> None:
         try:
             self.controller.stop_all(datetime.now())
-        except ExceptionGroup as exc:
+        except (OSError, RuntimeError, ValueError, ExceptionGroup) as exc:
             self._fault("Relay shutdown failed", exc)
         self._refresh()
 
     def _tick(self) -> None:
+        if isinstance(self.controller, ServiceClient):
+            try:
+                self.controller.sync()
+            except (OSError, RuntimeError, ValueError) as exc:
+                if not self.service_error:
+                    logging.error("Service connection lost: %s", exc)
+                self.service_error = str(exc)
+                self.faulted = True
+            else:
+                self.service_error = ""
+                self.faulted = bool(self.controller.fault)
+                if not self.dirty:
+                    self.syncing = True
+                    try:
+                        for fields, zone in zip(self.fields, self.controller.zones):
+                            if fields.name.get() != zone.name:
+                                fields.name.set(zone.name)
+                            if fields.enabled.get() != zone.enabled:
+                                fields.enabled.set(zone.enabled)
+                            for variables, row in zip(fields.schedule, zone.schedule):
+                                for variable, value in zip(variables, row):
+                                    if variable.get() != value:
+                                        variable.set(value)
+                        self.edit_revision = self.controller.revision
+                    finally:
+                        self.syncing = False
+            self._validate()
+            self._refresh()
+            self.timer = self.after(1000, self._tick)
+            return
         try:
             self.controller.tick(datetime.now())
         except (OSError, RuntimeError, ExceptionGroup) as exc:
@@ -583,24 +662,28 @@ class SprinklerApp(ctk.CTk):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--config", type=Path,
-        default=Path.home() / ".config" / "garden-sprinkler-controller" / "settings.json",
-        help="Settings JSON file path",
-    )
-    parser.add_argument("--host", default=DEFAULT_HOST, help="Relay IP address")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="RTU-over-TCP port")
-    parser.add_argument("--slave-id", type=int, default=1, help="Numeric Modbus slave ID")
-    parser.add_argument("--timeout", type=float, default=1.0, help="Transaction timeout in seconds")
+    parser.add_argument("--socket", type=Path, default=default_socket(),
+                        help="Local background service socket")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     ctk.set_appearance_mode("dark")
     ctk.set_default_color_theme("blue")
     try:
-        backend = WaveshareRelays(args.host, args.port, args.slave_id, args.timeout)
-    except ValueError as exc:
-        parser.error(str(exc))
-    app = SprinklerApp(args.config.expanduser(), backend)
+        backend = ServiceClient(args.socket.expanduser())
+    except (OSError, ValueError) as exc:
+        logging.error("Cannot connect to background controller: %s", exc)
+        root = ctk.CTk()
+        root.withdraw()
+        messagebox.showerror(
+            "Background service unavailable",
+            f"{exc}\n\nStart/check the service:\n"
+            "systemctl --user status garden-sprinkler.service\n\n"
+            "This app will not connect directly to the relay board.",
+            parent=root,
+        )
+        root.destroy()
+        raise SystemExit(1) from exc
+    app = SprinklerApp(DEFAULT_CONFIG, backend)
     try:
         app.mainloop()
     finally:

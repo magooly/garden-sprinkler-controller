@@ -9,12 +9,14 @@ from unittest.mock import patch
 
 import customtkinter as ctk
 
-from app import SprinklerApp
+from app import GREY, RUNNING_RED, SCHEDULED_GREEN, SprinklerApp
 from controller import (
     Zone, default_zones, load_rain_pause, load_zones, rain_pause_path, save_zones,
 )
 from test_controller import schedule_for
 from waveshare_relay import WaveshareRelays
+from service_client import ServiceClient
+from test_service import RunningService
 
 
 @unittest.skipUnless(os.environ.get("DISPLAY"), "Requires a graphical display")
@@ -48,6 +50,17 @@ class RainPauseGuiTests(unittest.TestCase):
     def pause(self) -> None:
         self.app.rain_pause_var.set(True)
         self.app.toggle_rain_pause()
+
+    def test_scheduled_dot_is_bright_green_with_watering_red_and_pause_grey(self) -> None:
+        self.assertEqual(self.app.zone_dots[0].cget("text_color"), RUNNING_RED)
+        self.app.controller.stop(0, self.time.now.return_value)
+        self.app._refresh()
+        self.assertEqual(SCHEDULED_GREEN, "#20ff20")
+        self.assertEqual(self.app.zone_dots[0].cget("text_color"), SCHEDULED_GREEN)
+        self.assertEqual(self.app.zone_dots[1].cget("text_color"), GREY)
+        self.assertEqual(self.app.zone_dots[7].cget("text_color"), GREY)
+        self.pause()
+        self.assertEqual(self.app.zone_dots[0].cget("text_color"), GREY)
 
     def test_pause_disables_controls_and_preserves_unsaved_edits(self) -> None:
         self.app.fields[0].name.set("Unsaved name")
@@ -222,3 +235,77 @@ class RainPauseGuiTests(unittest.TestCase):
                     self.app.validation.winfo_rooty() + self.app.validation.winfo_height(),
                     viewport.winfo_rooty() + viewport.winfo_height(),
                 )
+
+    def test_service_desktop_controls_and_close_do_not_reset_hardware(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, RunningService(Path(directory)) as running:
+            client = ServiceClient(running.path)
+            calls = len(running.device.calls)
+            other = SprinklerApp(running.config, client)
+            try:
+                self.assertEqual(len(running.device.calls), calls)
+                other.manual()
+                self.assertTrue(running.device.states[0])
+                self.assertTrue(running.device.states[7])
+                other.fields[0].name.set("Service garden")
+                self.assertTrue(other.save())
+                self.assertEqual(load_zones(running.config)[0].name, "Service garden")
+                other.rain_pause_var.set(True)
+                other.toggle_rain_pause()
+                self.assertTrue(load_rain_pause(running.config))
+                self.assertFalse(any(running.device.states))
+                with patch("app.messagebox.askyesno", return_value=True):
+                    other.rain_pause_var.set(False)
+                    other.toggle_rain_pause()
+                other.manual()
+                calls = len(running.device.calls)
+            finally:
+                other.dirty = False
+                other.on_close()
+            self.assertEqual(len(running.device.calls), calls)
+            self.assertTrue(running.device.states[0])
+            self.assertTrue(running.device.states[7])
+
+    def test_service_desktop_sync_preserves_edits_and_rejects_stale_save(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, RunningService(Path(directory)) as running:
+            other = SprinklerApp(running.config, ServiceClient(running.path))
+            try:
+                other.fields[0].name.set("Unsaved")
+                second = ServiceClient(running.path)
+                zones = default_zones()
+                zones[0] = Zone("Changed elsewhere")
+                second.apply(zones, datetime.now())
+                if other.timer:
+                    other.after_cancel(other.timer)
+                other._tick()
+                self.assertEqual(other.fields[0].name.get(), "Unsaved")
+                with patch("app.messagebox.showerror") as error:
+                    self.assertFalse(other.save())
+                error.assert_called_once()
+                self.assertEqual(load_zones(running.config)[0].name, "Changed elsewhere")
+                other.dirty = False
+                if other.timer:
+                    other.after_cancel(other.timer)
+                other._tick()
+                self.assertEqual(other.fields[0].name.get(), "Changed elsewhere")
+            finally:
+                other.dirty = False
+                other.on_close()
+
+    def test_service_disconnect_disables_controls_and_reconnects(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, RunningService(Path(directory)) as running:
+            other = SprinklerApp(running.config, ServiceClient(running.path))
+            try:
+                with patch.object(other.controller, "sync", side_effect=OSError("Disconnected")), self.assertLogs(level="ERROR"):
+                    if other.timer:
+                        other.after_cancel(other.timer)
+                    other._tick()
+                self.assertTrue(other.faulted)
+                self.assertEqual(other.manual_button.cget("state"), "disabled")
+                self.assertIn("UNAVAILABLE", other.system_status.cget("text"))
+                if other.timer:
+                    other.after_cancel(other.timer)
+                other._tick()
+                self.assertFalse(other.faulted)
+                self.assertEqual(other.manual_button.cget("state"), "normal")
+            finally:
+                other.on_close()

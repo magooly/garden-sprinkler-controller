@@ -1,15 +1,26 @@
 # Garden Sprinkler Controller
 
-Release **1.0.0**.
+Release **1.1.0**.
+
+### Upgrading from 1.0.0
+
+Version 1.1.0 introduces a Linux background service. Close the older desktop
+app before enabling the service using the installation steps below. The desktop
+now requires that service and no longer accepts direct relay/configuration
+arguments; configure those on the service instead. Saved schedules and Rain
+Pause files remain compatible. Closing the desktop now leaves watering running.
 
 A dark-mode CustomTkinter desktop app for seven independently named sprinkler
 zones plus a channel 8 master pump, connected directly to the
 **Waveshare Modbus POE ETH Relay (B)**.
-The relay box must be powered and reachable whenever the app is opened.
+The headless controller runs as a Linux user service, including while logged
+out. The desktop app connects locally to that service; it never owns the relays.
 
 ## Setup and launch
 
-Requires Python **3.11 or newer**, Tk, and a graphical desktop session.
+Requires Linux with systemd and Python **3.11 or newer**. Only the desktop app
+requires Tk, CustomTkinter, and a graphical session. The service uses the
+standard library and does not need a display.
 On Debian/Ubuntu, install the Python desktop/virtual-environment prerequisites:
 
 ```sh
@@ -21,17 +32,49 @@ From this folder:
 ```sh
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
+mkdir -p ~/.config/systemd/user
+cp garden-sprinkler.service ~/.config/systemd/user/
+loginctl enable-linger "$USER"
+systemctl --user daemon-reload
+systemctl --user enable --now garden-sprinkler.service
 .venv/bin/python app.py
 ```
 
-On Windows, use `.venv\Scripts\python` instead of `.venv/bin/python`. The standard
-python.org installer includes Tk when the Tcl/Tk option is selected.
+Close any older, direct-hardware version of the app before starting the service.
+The supplied unit expects this project at
+`~/Documents/garden-sprinkler-controller`; edit its paths if installed elsewhere.
+Enabling linger may require administrator approval on other machines.
+Do not move/delete this project or its virtual environment while it is installed.
 
-To choose a different settings location:
+Useful service commands:
 
 ```sh
-.venv/bin/python app.py --config ./settings.json
+systemctl --user status garden-sprinkler.service
+journalctl --user -u garden-sprinkler.service -n 50 --no-pager
+systemctl --user restart garden-sprinkler.service
+systemctl --user disable --now garden-sprinkler.service
 ```
+
+Linger starts the user service manager at boot, without requiring a login.
+The enabled service survives logout and restarts after a process failure.
+Failed startup (for example the network/relay still booting) retries every
+15 seconds. Runtime hardware faults latch scheduling OFF rather than repeatedly
+retrying ON commands: check the equipment/log, then restart the service.
+Opening, closing, or reconnecting the desktop does not reset outputs.
+To stop watering, use Rain Pause or STOP ALL, not the window close button.
+
+The PC must remain awake. This installation does not change machine-wide sleep
+or BIOS/UEFI settings. For recovery after a mains failure the PC must actually
+power up again: enable "Restore on AC Power Loss"/"AC Back" in firmware if
+needed. The service cannot turn on a powered-off computer.
+
+To change relay/configuration parameters, use `systemctl --user edit
+garden-sprinkler.service` and override `ExecStart` (first clear it with an empty
+`ExecStart=`). The `--config`, `--host`, `--port`, `--slave-id`, and `--timeout`
+arguments now belong to **service.py**, not app.py. Restart the service afterward.
+For foreground diagnosis only, stop the installed service before running
+`.venv/bin/python service.py`; never run a second hardware controller.
+The desktop accepts `--socket` for an alternate local service endpoint.
 
 The default is `~/.config/garden-sprinkler-controller/settings.json`. Settings
 are validated and written using atomic replacement. Missing settings start with
@@ -77,22 +120,29 @@ It can take several minutes if the device is not responding. Cancel with Ctrl+C.
 If no address responds, check network access, relay power, and port/protocol
 settings; a failed scan does not establish that the slave ID is wrong.
 
-Start the hardware-connected GUI:
+Open the service-connected desktop:
 
 ```sh
 .venv/bin/python app.py
 ```
 
-Every app launch connects to `192.168.0.99`, port `4196`, slave ID `1`. Startup
+The service connects to `192.168.0.99`, port `4196`, slave ID `1`. Service startup
 sends OFF commands to all eight relays and verifies each state, then starts any
 saved routines that are scheduled now, unless Rain Pause is enabled. A routine
-can therefore energize a valve immediately on launch when not paused.
+can therefore energize a valve immediately on service start when not paused.
 The **Read Relay Status** button queries and displays the
-current physical states without changing them. Optional `--host`, `--port`,
-`--slave-id`, and `--timeout` arguments override connection parameters.
+current physical states through the service without changing them.
 
-There is no simulation mode. If the relay is unreachable, startup fails visibly;
-the app does not substitute a fake backend.
+There is no simulation mode or direct-hardware fallback. If the service is
+unavailable, the app displays an explicit error. If connection is lost while
+open, it marks status unknown, disables watering controls and retries its local
+connection every second. The service may still be watering while disconnected.
+Request timeouts are not retried: a command may have succeeded before its reply
+was lost. Status polling reconciles the result.
+The local Unix socket is private to the user (mode 0600); there is no network
+control listener. File locks prevent duplicate service owners using the same
+configuration or relay host/port. Multiple desktop windows are supported;
+saving stale edits is rejected rather than overwriting another window's changes.
 
 The network adapter in [waveshare_relay.py](waveshare_relay.py) uses RTU CRC16,
 checks response addresses, functions, CRCs, write echoes, and coil readback.
@@ -104,8 +154,9 @@ device's reported logical state, **not** valve movement, water flow, or contact
 integrity. Other programs and the board's digital inputs can change outputs;
 use command-compatible, non-linkage relay modes and avoid competing controllers.
 
-On a communication error, the app stops scheduling, attempts OFF on every
-channel, displays the failure, and requires restart. Output state is labelled
+On a hardware communication error, the service stops scheduling, attempts OFF on
+every channel, records the failure in its log and requires a service restart.
+The app shows the service fault. Output state is labelled
 unknown when a fault occurs.
 STOP ALL remains available to retry OFF commands. Requests are synchronous:
 the GUI may pause during network operations; a failed all-channel OFF sequence
@@ -142,7 +193,7 @@ write also requires a separate readback transaction.
   seven garden zones and the preserved channel 8 settings**.
   Unsaved edits survive switching between zones but do not alter
   the running schedule. Closing prompts to save or discard them.
-- Red indicates a commanded/confirmed energized relay, blue an enabled
+- Red indicates a commanded/confirmed energized relay, bright green an enabled
   schedule that is active at the current time, and grey no current watering
   window. Sidebar status uses the
   **saved/applied** routine, not unsaved edits.
@@ -167,8 +218,9 @@ write also requires a separate readback transaction.
 - **STOP THIS ZONE** and **STOP ALL** act immediately and suppress the currently
   active automatic watering window(s) until they end. Later scheduled windows
   that day are unaffected. Another manual/test run can still be started.
-  Suppression is not persisted: restarting during a saved window starts that
-  routine again unless Rain Pause is enabled.
+  Suppression is not persisted: restarting the service or PC during a saved
+  window starts that routine again unless Rain Pause is enabled. Closing or
+  reopening the desktop does not clear suppression.
 - Manual/test watering replaces that zone's current scheduled run; when the
   timed override ends, the routine does not resume in the same window.
   Disabling a routine and saving stops its scheduled run, but does not cancel
@@ -190,9 +242,9 @@ Failed ON commands trigger an all-output OFF attempt and stop scheduling.
 Communication failures can prevent OFF commands from reaching the device.
 
 The original channel 8 name and schedule are preserved in settings but ignored
-in pump mode. To restore eight independent garden zones, close the app and set
+in pump mode. To restore eight independent garden zones, stop the service and set
 `MASTER_PUMP_CHANNEL = None` near the top of [controller.py](controller.py),
-then restart. The nearby comment explains this switch; the original scheduling
+then restart the service. The nearby comment explains this switch; the original scheduling
 and editing logic remains available, rather than being deleted. Restoring
 eight-zone mode also restores any enabled saved channel 8 routine, which may
 start immediately. Review it before restoring that mode.
@@ -204,10 +256,10 @@ independent dry-run, pressure, overload, or emergency-stop protection.
 
 ## Timing and operational limits
 
-The app must remain open and the computer awake for schedules to run. It checks
+The service must be running and the computer awake for schedules to run. It checks
 outputs every 250 ms when idle; network operations can delay these checks.
 Start/stop actions do not have real-time precision. It uses the operating system's **local time and
-weekday**. Launching during a scheduled window runs only its remaining time;
+weekday**. Starting the service during a scheduled window runs only its remaining time;
 missed windows are not replayed.
 
 Routine runs end at their stop time or their originally calculated elapsed-time
@@ -218,7 +270,8 @@ is not a timezone-aware scheduling service. Multiple zones may run simultaneousl
 the master pump follows their combined demand. There is no sequential queuing
 or flow/pressure monitoring.
 
-Normal window closure sends OFF to all eight outputs. A killed process, network
+Normal service shutdown sends OFF to all eight outputs. Closing the desktop
+leaves watering running. A killed service process, network
 failure, sleeping computer, or frozen event loop cannot guarantee shutdown.
 **Timers are software-only; they do not program a hardware auto-off or watchdog.**
 Use normally-open contacts and an independently designed hardware cutoff. Test
@@ -231,13 +284,17 @@ app alone to prevent flooding or protect a pump.
 The UI and scheduling code use the `RelayBackend` protocol in
 [controller.py](controller.py).
 
-- [app.py](app.py): dark-mode desktop interface and hardware launch.
+- [app.py](app.py): dark-mode desktop service interface.
+- [service.py](service.py): sole hardware owner, headless scheduler and local IPC.
+- [service_client.py](service_client.py): desktop snapshots and control requests.
+- [garden-sprinkler.service](garden-sprinkler.service): boot/logout systemd user unit.
 - [controller.py](controller.py): schedule engine, timed overrides, JSON persistence.
 - [waveshare_relay.py](waveshare_relay.py): RTU-over-TCP adapter and read-only
   status/discovery command.
 - [test_controller.py](test_controller.py) and
   [test_waveshare_relay.py](test_waveshare_relay.py), and
-  [test_app.py](test_app.py): automated tests. GUI checks require a display and
+  [test_app.py](test_app.py), and [test_service.py](test_service.py): automated tests.
+  GUI checks require a display and
   use mocked relay writes.
 
 ## Tests
@@ -246,7 +303,7 @@ The core and network adapter have no third-party dependencies and can be tested 
 display:
 
 ```sh
-python3 -m unittest -v
+python3 -m unittest -v test_controller test_waveshare_relay test_service
 ```
 
 Tests cover validation, configuration round-trips and failure preservation,
@@ -255,4 +312,8 @@ suppression, clock rollback, independent zones, and shutdown behavior. Protocol
 tests cover vendor CRC examples, fragmented responses, malformed frames, device
 exceptions, timeout errors, write/readback validation, and read-only discovery.
 A loopback TCP server tests controller startup, manual operation, and shutdown
-over real local sockets. Tests do not contact the physical relay board.
+over real local sockets. Service tests use private local Unix sockets and fake
+hardware, including logout-safe client closure, exclusive ownership, restart
+state, stale-edit rejection, Rain Pause and fault latching.
+Run `.venv/bin/python -m unittest -v` to include GUI checks with a display.
+Tests do not contact the physical relay board.

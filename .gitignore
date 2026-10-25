@@ -1,3 +1,6 @@
 .venv/
 __pycache__/
 settings.json
+*.rain-pause.json
+*.service.lock
+*.sock

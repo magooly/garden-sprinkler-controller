@@ -139,7 +139,10 @@ def validate_zones(zones: list[Zone]) -> None:
 def load_zones(path: Path) -> list[Zone]:
     if not path.exists():
         return default_zones()
-    data = json.loads(path.read_text(encoding="utf-8"))
+    return decode_zones(json.loads(path.read_text(encoding="utf-8")))
+
+
+def decode_zones(data: object) -> list[Zone]:
     if not isinstance(data, dict) or type(data.get("version")) is not int or data["version"] not in (1, 2, 3):
         raise ValueError("Unsupported settings format; expected version 1, 2, or 3.")
     records = data.get("zones")
@@ -183,8 +186,12 @@ def load_zones(path: Path) -> list[Zone]:
 
 def save_zones(path: Path, zones: list[Zone]) -> None:
     """Validate before replacing the existing file atomically."""
+    _save_json(path, encode_zones(zones))
+
+
+def encode_zones(zones: list[Zone]) -> dict[str, object]:
     validate_zones(zones)
-    data = {
+    return {
         "version": 3,
         "zones": [
             {
@@ -195,9 +202,6 @@ def save_zones(path: Path, zones: list[Zone]) -> None:
             for zone in zones
         ],
     }
-    _save_json(path, data)
-
-
 def _save_json(path: Path, data: Mapping[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary: str | None = None
