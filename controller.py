@@ -10,53 +10,57 @@ import time
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from pathlib import Path
-from typing import Callable, Protocol
+from typing import Callable, Mapping, Protocol
 
 ZONE_COUNT = 8
+# Set to None to restore the original eight independent zones, including the
+# preserved channel 8 name/schedule. Channel numbers here are zero-based.
+MASTER_PUMP_CHANNEL: int | None = 7
 MANUAL_SECONDS = 10 * 60
-TEST_SECONDS = 60
+TEST_SECONDS = 10 * 60
 DAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+WINDOW_COUNT = 4
 
 
-def empty_schedule() -> tuple[tuple[str, str, str, str], ...]:
-    return (("", "", "", ""),) * 7
+def empty_schedule() -> tuple[tuple[str, ...], ...]:
+    return (("",) * (WINDOW_COUNT * 2),) * 7
 
 
 def legacy_schedule(
     days: tuple[int, ...], start: str, stop: str
-) -> tuple[tuple[str, str, str, str], ...]:
-    schedule = [("", "", "", "") for _ in DAY_NAMES]
+) -> tuple[tuple[str, ...], ...]:
+    schedule = list(empty_schedule())
     for day in days:
         if type(day) is int and day in range(7):
-            schedule[day] = (start, stop, "", "")
+            schedule[day] = (start, stop) + ("",) * 6
     return tuple(schedule)
 
 
 def copy_day_times(
-    schedule: tuple[tuple[str, str, str, str], ...],
+    schedule: tuple[tuple[str, ...], ...],
     source_day: int,
-) -> tuple[tuple[str, str, str, str], ...]:
+) -> tuple[tuple[str, ...], ...]:
     if len(schedule) != len(DAY_NAMES) or type(source_day) is not int or source_day not in range(7):
         raise ValueError("Choose a valid weekday from a seven-day schedule.")
     source = schedule[source_day]
-    if not isinstance(source, tuple) or len(source) != 4:
-        raise ValueError("The selected day must contain two start/stop pairs.")
+    if not isinstance(source, tuple) or len(source) != WINDOW_COUNT * 2:
+        raise ValueError("The selected day must contain four start/stop pairs.")
     return tuple(source for _ in DAY_NAMES)
 
 
 def parse_time(value: str) -> int:
-    """Convert an exact 24-hour HH:MM value into minutes after midnight."""
-    if not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", value):
-        raise ValueError("Enter time as HH:MM in 24-hour format (for example 06:20).")
-    hours, minutes = value.split(":")
-    return int(hours) * 60 + int(minutes)
+    """Convert a 24-hour HHMM or HH:MM value into minutes after midnight."""
+    if not re.fullmatch(r"(?:[01][0-9]|2[0-3]):?[0-5][0-9]", value):
+        raise ValueError("Enter a 24-hour time such as 1620 or 16:20 (four digits).")
+    digits = value.replace(":", "")
+    return int(digits[:2]) * 60 + int(digits[2:])
 
 
 @dataclass(frozen=True)
 class Zone:
     name: str
     enabled: bool = False
-    schedule: tuple[tuple[str, str, str, str], ...] = field(
+    schedule: tuple[tuple[str, ...], ...] = field(
         default_factory=empty_schedule
     )
 
@@ -71,10 +75,10 @@ class Zone:
             raise ValueError("Schedule must contain exactly one row for each weekday.")
         has_window = False
         for day, row in enumerate(self.schedule):
-            if not isinstance(row, tuple) or len(row) != 4:
-                raise ValueError(f"{DAY_NAMES[day]} must have two start/stop pairs.")
-            intervals: list[tuple[int, int]] = []
-            for slot in range(2):
+            if not isinstance(row, tuple) or len(row) != WINDOW_COUNT * 2:
+                raise ValueError(f"{DAY_NAMES[day]} must have four start/stop pairs.")
+            previous_stop = -1
+            for slot in range(WINDOW_COUNT):
                 start, stop = row[slot * 2 : slot * 2 + 2]
                 if not isinstance(start, str) or not isinstance(stop, str):
                     raise ValueError(f"{DAY_NAMES[day]} times must be strings.")
@@ -89,12 +93,13 @@ class Zone:
                     raise ValueError(
                         f"{DAY_NAMES[day]} window {slot + 1}: stop must be later than start."
                     )
-                intervals.append((start_minute, stop_minute))
+                if start_minute < previous_stop:
+                    raise ValueError(
+                        f"{DAY_NAMES[day]} window {slot + 1} must start at or after "
+                        "the previous window ends."
+                    )
+                previous_stop = stop_minute
                 has_window = True
-            if len(intervals) == 2 and intervals[1][0] < intervals[0][1]:
-                raise ValueError(
-                    f"{DAY_NAMES[day]} window 2 must start after window 1 ends."
-                )
         if self.enabled and not has_window:
             raise ValueError("Set at least one daily time window for an enabled routine.")
 
@@ -108,7 +113,7 @@ class Zone:
         row = self.schedule[now.weekday()]
         return tuple(
             (start, stop)
-            for start, stop in (row[:2], row[2:])
+            for start, stop in zip(row[::2], row[1::2])
             if start and parse_time(start) <= minute < parse_time(stop)
         )
 
@@ -135,8 +140,8 @@ def load_zones(path: Path) -> list[Zone]:
     if not path.exists():
         return default_zones()
     data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict) or type(data.get("version")) is not int or data["version"] not in (1, 2):
-        raise ValueError("Unsupported settings format; expected version 1 or 2.")
+    if not isinstance(data, dict) or type(data.get("version")) is not int or data["version"] not in (1, 2, 3):
+        raise ValueError("Unsupported settings format; expected version 1, 2, or 3.")
     records = data.get("zones")
     if not isinstance(records, list):
         raise ValueError("Settings must contain a list of zones.")
@@ -160,12 +165,17 @@ def load_zones(path: Path) -> list[Zone]:
             schedule = legacy_schedule(tuple(record["days"]), record["start"], record["stop"])
         else:
             if set(record) != {"name", "enabled", "schedule"}:
-                raise ValueError("Version 2 zones must contain name, enabled, and schedule.")
+                raise ValueError("Zones must contain name, enabled, and schedule.")
             if not isinstance(record["schedule"], list):
                 raise ValueError("Zone schedule must be a list.")
-            if any(not isinstance(row, list) for row in record["schedule"]):
-                raise ValueError("Each daily schedule must be a list of four times.")
-            schedule = tuple(tuple(row) for row in record["schedule"])
+            expected_times = 4 if data["version"] == 2 else WINDOW_COUNT * 2
+            if any(
+                not isinstance(row, list) or len(row) != expected_times
+                for row in record["schedule"]
+            ):
+                raise ValueError(f"Each daily schedule must be a list of {expected_times} times.")
+            padding = ("",) * (WINDOW_COUNT * 2 - expected_times)
+            schedule = tuple(tuple(row) + padding for row in record["schedule"])
         zones.append(Zone(name=record["name"], enabled=record["enabled"], schedule=schedule))
     validate_zones(zones)
     return zones
@@ -175,7 +185,7 @@ def save_zones(path: Path, zones: list[Zone]) -> None:
     """Validate before replacing the existing file atomically."""
     validate_zones(zones)
     data = {
-        "version": 2,
+        "version": 3,
         "zones": [
             {
                 "name": zone.name.strip(),
@@ -185,6 +195,10 @@ def save_zones(path: Path, zones: list[Zone]) -> None:
             for zone in zones
         ],
     }
+    _save_json(path, data)
+
+
+def _save_json(path: Path, data: Mapping[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary: str | None = None
     try:
@@ -200,6 +214,30 @@ def save_zones(path: Path, zones: list[Zone]) -> None:
     finally:
         if temporary is not None and os.path.exists(temporary):
             os.unlink(temporary)
+
+
+def rain_pause_path(settings_path: Path) -> Path:
+    return settings_path.with_name(settings_path.name + ".rain-pause.json")
+
+
+def load_rain_pause(settings_path: Path) -> bool:
+    path = rain_pause_path(settings_path)
+    if not path.exists():
+        return False
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if (
+        not isinstance(data, dict)
+        or set(data) != {"rain_paused"}
+        or type(data["rain_paused"]) is not bool
+    ):
+        raise ValueError(f"Invalid rain pause state in {path}; expected a rain_paused boolean.")
+    return data["rain_paused"]
+
+
+def save_rain_pause(settings_path: Path, paused: bool) -> None:
+    if type(paused) is not bool:
+        raise ValueError("Rain pause must be true or false.")
+    _save_json(rain_pause_path(settings_path), {"rain_paused": paused})
 
 
 class RelayBackend(Protocol):
@@ -223,6 +261,8 @@ class Controller:
         zones: list[Zone],
         backend: RelayBackend,
         clock: Callable[[], float] = time.monotonic,
+        *,
+        rain_paused: bool = False,
     ) -> None:
         validate_zones(zones)
         self.zones = list(zones)
@@ -231,8 +271,11 @@ class Controller:
         self.runs: dict[int, Run] = {}
         self.blocked: dict[int, set[tuple[date, str, str]]] = {}
         self.closed = False
+        self.rain_paused = rain_paused
+        self.master_channel = MASTER_PUMP_CHANNEL
+        self.pump_on = False
         errors: list[Exception] = []
-        for channel in range(ZONE_COUNT):
+        for channel in self._shutdown_channels():
             try:
                 self.backend.set_relay(channel, False)
             except (OSError, RuntimeError) as exc:
@@ -242,6 +285,8 @@ class Controller:
             raise ExceptionGroup("Some relays could not be initialized OFF", errors)
 
     def _current_windows(self, channel: int, now: datetime) -> tuple[tuple[date, str, str], ...]:
+        if channel == self.master_channel:
+            return ()
         return tuple(
             (now.date(), start, stop)
             for start, stop in self.zones[channel].scheduled_windows(now)
@@ -255,11 +300,39 @@ class Controller:
 
     def _off(self, channel: int) -> None:
         if channel in self.runs:
+            if self.master_channel is not None and self.pump_on and len(self.runs) == 1:
+                self.backend.set_relay(self.master_channel, False)
+                self.pump_on = False
             self.backend.set_relay(channel, False)
             del self.runs[channel]
 
+    def _shutdown_channels(self) -> tuple[int, ...]:
+        channels = tuple(channel for channel in range(ZONE_COUNT) if channel != self.master_channel)
+        return channels if self.master_channel is None else (self.master_channel, *channels)
+
+    def _on(self, channel: int, run: Run, now: datetime) -> None:
+        try:
+            self.backend.set_relay(channel, True)
+            self.runs[channel] = run
+            if self.master_channel is not None and not self.pump_on:
+                self.backend.set_relay(self.master_channel, True)
+                self.pump_on = True
+        except (OSError, RuntimeError) as exc:
+            # An uncertain valve/pump ON must never leave scheduling running.
+            self.closed = True
+            try:
+                self.stop_all(now, suppress=False)
+            except ExceptionGroup as shutdown_error:
+                raise ExceptionGroup(
+                    "Watering start failed; shutdown also failed",
+                    [exc, *shutdown_error.exceptions],
+                ) from exc
+            raise
+
     def stop(self, channel: int, now: datetime) -> None:
         """Stop immediately and suppress only currently active schedule windows."""
+        if channel == self.master_channel:
+            raise RuntimeError("The master pump is controlled automatically by garden zones.")
         run = self.runs.get(channel)
         self._off(channel)
         if run is not None and run.source == "Routine":
@@ -270,12 +343,26 @@ class Controller:
     def start_manual(self, channel: int, now: datetime, *, test: bool = False) -> None:
         if self.closed:
             raise RuntimeError("Controller is closed.")
+        if self.rain_paused:
+            raise RuntimeError("Rain Pause is enabled. All watering is disabled.")
+        if channel == self.master_channel:
+            raise RuntimeError("The master pump is controlled automatically by garden zones.")
         duration = TEST_SECONDS if test else MANUAL_SECONDS
         active_windows = self._current_windows(channel, now)
-        self.backend.set_relay(channel, True)
-        self.runs[channel] = Run("Test" if test else "Manual", self.clock() + duration)
+        self._on(channel, Run("Test" if test else "Manual", self.clock() + duration), now)
         for window in active_windows:
             self._block(channel, window, self.blocked)
+
+    def toggle_test(self, channel: int, now: datetime) -> None:
+        if self.closed:
+            raise RuntimeError("Controller is closed.")
+        run = self.runs.get(channel)
+        if run is not None:
+            if run.source != "Test":
+                raise RuntimeError("Stop the current watering run before starting a test.")
+            self.stop(channel, now)
+        else:
+            self.start_manual(channel, now, test=True)
 
     def apply(self, zones: list[Zone], now: datetime) -> None:
         validate_zones(zones)
@@ -289,7 +376,7 @@ class Controller:
         self.tick(now)
 
     def tick(self, now: datetime) -> None:
-        if self.closed:
+        if self.closed or self.rain_paused:
             return
         monotonic_now = self.clock()
         for channel, zone in enumerate(self.zones):
@@ -321,24 +408,35 @@ class Controller:
                     second=0,
                     microsecond=0,
                 )
-                self.backend.set_relay(channel, True)
-                self.runs[channel] = Run(
-                    "Routine",
-                    monotonic_now + (end - now).total_seconds(),
-                    next_window,
+                self._on(
+                    channel,
+                    Run("Routine", monotonic_now + (end - now).total_seconds(), next_window),
+                    now,
                 )
 
-    def stop_all(self, now: datetime) -> None:
+    def set_rain_pause(self, paused: bool, now: datetime) -> None:
+        if self.closed:
+            raise RuntimeError("Controller is closed.")
+        self.rain_paused = paused
+        if paused:
+            self.stop_all(now, suppress=False)
+        else:
+            self.tick(now)
+
+    def stop_all(self, now: datetime, *, suppress: bool = True) -> None:
         errors: list[Exception] = []
-        for channel in range(ZONE_COUNT):
+        for channel in self._shutdown_channels():
             try:
                 # Send OFF even when local state already says OFF.
                 self.backend.set_relay(channel, False)
+                if channel == self.master_channel:
+                    self.pump_on = False
                 run = self.runs.get(channel)
-                if run is not None and run.source == "Routine":
+                if suppress and run is not None and run.source == "Routine":
                     self._block(channel, run.window_key, self.blocked)
-                for window in self._current_windows(channel, now):
-                    self._block(channel, window, self.blocked)
+                if suppress:
+                    for window in self._current_windows(channel, now):
+                        self._block(channel, window, self.blocked)
                 self.runs.pop(channel, None)
             except (OSError, RuntimeError) as exc:
                 errors.append(exc)

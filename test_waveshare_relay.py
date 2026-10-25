@@ -209,11 +209,17 @@ class LoopbackTests(unittest.TestCase):
                 device = WaveshareRelays("127.0.0.1", server.server_address[1])
                 controller = Controller(default_zones(), device)
                 self.assertFalse(any(states))
-                controller.start_manual(7, datetime.now())
+                controller.start_manual(0, datetime.now())
+                self.assertTrue(states[0])
                 self.assertTrue(states[7])
+                writes = [frame for frame in requests if frame[1] == 5]
+                self.assertEqual(struct.unpack(">H", writes[0][2:4])[0], 7)
+                self.assertEqual(
+                    [struct.unpack(">H", frame[2:4])[0] for frame in writes[-2:]], [0, 7]
+                )
                 controller.close(datetime.now())
                 self.assertFalse(any(states))
-                self.assertEqual(len(requests), (8 + 1 + 8) * 2)
+                self.assertEqual(len(requests), (8 + 2 + 8) * 2)
             finally:
                 server.shutdown()
                 thread.join(timeout=3)
