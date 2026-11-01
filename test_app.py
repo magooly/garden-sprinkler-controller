@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 import customtkinter as ctk
 
-from app import GREY, RUNNING_RED, SCHEDULED_GREEN, SprinklerApp
+from app import GREY, RUNNING_RED, SCHEDULED_GREEN, SprinklerApp, display_time, overlap_notices
 from controller import (
     Zone, default_zones, load_rain_pause, load_zones, rain_pause_path, save_zones,
 )
@@ -51,6 +51,88 @@ class RainPauseGuiTests(unittest.TestCase):
         self.app.rain_pause_var.set(True)
         self.app.toggle_rain_pause()
 
+    def test_weekly_overview_all_days_periods_warnings_and_navigation(self) -> None:
+        for day in range(7):
+            for slot, value in enumerate(("0600", "0620", "1000", "1020", "1400", "1420", "1800", "1820")):
+                self.app.fields[0].schedule[day][slot].set(value)
+        self.app.fields[1].enabled.set(True)
+        self.app.fields[1].schedule[0][0].set("0610")
+        self.app.fields[1].schedule[0][1].set("0630")
+        self.app.show_overview()
+        self.app.show_weekly_overview()
+        weekly = self.app.weekly_overview
+        try:
+            self.app.update()
+            self.assertEqual(self.app.overview.title(), "Daily Schedule")
+            self.assertEqual(weekly.title(), "Weekly Overview")
+            self.assertEqual(len(weekly.cells), 49)
+            for cell in weekly.cells.values():
+                self.assertLessEqual(
+                    cell.winfo_rootx() + cell.winfo_width(),
+                    weekly.winfo_rootx() + weekly.winfo_width(),
+                )
+            self.assertIn("UNSAVED EDITS", weekly.summary.cget("text"))
+            for day in range(7):
+                text = weekly.cells[0, day].cget("text")
+                self.assertIn("1: 06:00-06:20", text)
+                self.assertIn("4: 18:00-18:20", text)
+            self.assertEqual(weekly.cells[0, 0].cget("fg_color"), "#51432d")
+            self.assertEqual(weekly.cells[1, 0].cget("fg_color"), "#51432d")
+            self.assertEqual(weekly.cells[0, 0].cget("text_color"), "#ff2020")
+            self.assertEqual(weekly.cells[1, 0].cget("text_color"), "#ff2020")
+            self.assertEqual(weekly.cells[0, 1].cget("fg_color"), "#242b34")
+            self.assertNotIn((7, 0), weekly.cells)
+            weekly.open_channel(1)
+            self.assertEqual(self.app.selected, 1)
+            self.app.fields[1].schedule[0][1].set("")
+            self.assertEqual(weekly.cells[1, 0].cget("fg_color"), "#503238")
+            weekly.hide_disabled.set(True)
+            weekly.refresh()
+            self.assertEqual(len(weekly.cells), 14)
+            self.app.show_weekly_overview()
+            self.assertIs(self.app.weekly_overview, weekly)
+            self.pause()
+            self.assertIn("RAIN PAUSE", weekly.summary.cget("text"))
+        finally:
+            weekly.destroy()
+            self.app.overview.destroy()
+        self.app.show_weekly_overview()
+        self.assertIsNot(self.app.weekly_overview, weekly)
+        self.app.weekly_overview.destroy()
+
+    def test_schedule_overview_unsaved_edits_filters_navigation_and_refresh(self) -> None:
+        self.app.fields[1].schedule[0][0].set("0600")
+        self.app.fields[1].schedule[0][1].set("0610")
+        self.app.fields[1].enabled.set(True)
+        self.app.show_overview()
+        overview = self.app.overview
+        self.assertIsNotNone(overview)
+        try:
+            self.app.update()
+            self.assertIn("UNSAVED EDITS", overview.summary.cget("text"))
+            self.assertEqual(len(overview.table.get_children()), 2)
+            self.assertTrue(all("Same start" in row.warning for row in overview.rows))
+            overview.table.selection_set("1")
+            overview.open_selected()
+            self.assertEqual(self.app.selected, 1)
+            self.app.fields[1].enabled.set(False)
+            self.assertEqual(overview.rows[0].warning, "")
+            overview.hide_disabled.set(True)
+            overview.refresh()
+            self.assertEqual(len(overview.rows), 1)
+            overview.day.set("Tue")
+            overview.refresh()
+            self.assertEqual(len(overview.rows), 0)
+            self.app.show_overview()
+            self.assertIs(self.app.overview, overview)
+            self.pause()
+            self.assertIn("RAIN PAUSE", overview.summary.cget("text"))
+        finally:
+            overview.destroy()
+        self.app.show_overview()
+        self.assertIsNot(self.app.overview, overview)
+        self.app.overview.destroy()
+
     def test_scheduled_dot_is_bright_green_with_watering_red_and_pause_grey(self) -> None:
         self.assertEqual(self.app.zone_dots[0].cget("text_color"), RUNNING_RED)
         self.app.controller.stop(0, self.time.now.return_value)
@@ -70,7 +152,6 @@ class RainPauseGuiTests(unittest.TestCase):
         self.assertEqual(load_zones(self.path)[0].name, "Lawn")
         self.assertFalse(self.app.controller.runs)
         self.assertEqual(self.app.manual_button.cget("state"), "disabled")
-        self.assertEqual(self.app.test_button.cget("state"), "disabled")
         self.assertIn("RAIN PAUSE", self.app.system_status.cget("text"))
         self.app.geometry("1100x760")
         self.app.update()
@@ -80,6 +161,116 @@ class RainPauseGuiTests(unittest.TestCase):
         self.assertTrue(self.app.save())
         self.assertTrue(load_rain_pause(self.path))
         self.assertFalse(self.app.controller.runs)
+
+    def test_start_header_pauses_and_saves_that_window_number(self) -> None:
+        times = next(
+            widget for widget in self.app.editor.winfo_children()
+            if int(widget.grid_info()["row"]) == 5
+        )
+        start_two = next(
+            widget for widget in times.winfo_children()
+            if isinstance(widget, ctk.CTkButton) and widget.cget("text") == "Start 2"
+        )
+        start_two.invoke()
+        self.assertTrue(self.app.fields[0].paused_windows[1].get())
+        self.assertEqual(self.app.window_pause_labels[1].cget("text"), "Paused")
+        self.assertLess(
+            self.app.window_pause_labels[1].cget("font")[1],
+            start_two.cget("font")[1],
+        )
+        self.assertTrue(self.app.dirty)
+        self.assertTrue(self.app.save())
+        self.assertTrue(load_zones(self.path)[0].paused_windows[1])
+
+    def test_short_time_inputs_display_as_hhmm_and_use_narrow_fields(self) -> None:
+        start = self.app.fields[0].schedule[0][0]
+        stop = self.app.fields[0].schedule[0][1]
+        start.set("815")
+        stop.set("840")
+        self.app._format_time_field(start)
+        self.app._format_time_field(stop)
+        self.assertEqual(start.get(), "08:15")
+        self.assertEqual(stop.get(), "08:40")
+        self.assertEqual(self.app.fields[0].read().schedule[0][:2], ("08:15", "08:40"))
+
+        table = next(
+            widget for widget in self.app.editor.winfo_children()
+            if int(widget.grid_info()["row"]) == 5
+        )
+        entries = [
+            widget for widget in table.winfo_children()
+            if isinstance(widget, ctk.CTkEntry)
+        ]
+        self.assertTrue(all(entry.cget("width") == 60 for entry in entries))
+
+    def test_display_time_normalizes_all_supported_input_forms(self) -> None:
+        for value in ("815", "0815", "08:15"):
+            with self.subTest(value=value):
+                self.assertEqual(display_time(value), "08:15")
+
+    def test_overlap_message_updates_while_entering_time_and_names_groups(self) -> None:
+        self.app.fields[0].schedule[0][2].set("06:10")
+        self.app.fields[0].schedule[0][3].set("06:30")
+        self.assertIn(
+            "Mon Start/Stop group 1 overlaps Start/Stop group 2",
+            self.app.validation.cget("text"),
+        )
+        self.assertEqual(self.app.validation.cget("text_color"), "#ff9999")
+        self.assertEqual(self.app.save_button.cget("state"), "disabled")
+        conflicting_entries = [
+            self.app.schedule_entries[0, index]
+            for index in range(4)
+        ]
+        self.assertTrue(all(entry.cget("border_color") == "#ff5555"
+                            for entry in conflicting_entries))
+        self.assertTrue(all(entry.cget("border_width") == 2
+                            for entry in conflicting_entries))
+        self.assertNotEqual(self.app.schedule_entries[0, 4].cget("border_color"), "#ff5555")
+
+    def test_overlap_popup_appears_when_clicking_conflicting_stop_once(self) -> None:
+        self.app.fields[0].schedule[0][2].set("06:10")
+        self.app.fields[0].schedule[0][3].set("06:30")
+        self.app.update()
+        with patch("app.messagebox.showwarning") as warning:
+            self.app.schedule_entries[0, 5]._entry.event_generate("<Button-1>")
+            warning.assert_not_called()
+            self.app.schedule_entries[0, 3]._entry.event_generate("<Button-1>")
+            warning.assert_called_once()
+            self.assertIn("Mon Start/Stop group 1 overlaps Start/Stop group 2",
+                          warning.call_args.args[1])
+            self.app.schedule_entries[0, 1]._entry.event_generate("<Button-1>")
+            warning.assert_called_once()
+
+            self.app.fields[0].schedule[0][2].set("")
+            self.app.fields[0].schedule[0][3].set("")
+            self.app.fields[0].schedule[0][2].set("06:10")
+            self.app.fields[0].schedule[0][3].set("06:30")
+            self.app.schedule_entries[0, 3]._entry.event_generate("<Button-1>")
+            self.assertEqual(warning.call_count, 2)
+
+    def test_clicking_stop_after_overlapping_start_warns_before_stop_is_entered(self) -> None:
+        self.app.fields[0].schedule[0][2].set("06:10")
+        self.assertIn(
+            "start time falls within",
+            overlap_notices(tuple(variable.get() for variable in self.app.fields[0].schedule[0]))[(0, 1)],
+        )
+        self.app.update()
+        with patch("app.messagebox.showwarning") as warning:
+            self.app.schedule_entries[0, 3]._canvas.event_generate(
+                "<Button-1>", x=0, y=0, when="now"
+            )
+            warning.assert_called_once()
+            self.assertIn("Mon Start/Stop group 2 start time falls within",
+                          warning.call_args.args[1])
+
+    def test_run_stop_button_replaces_manual_and_test_controls(self) -> None:
+        self.assertEqual(self.app.manual_button.cget("text"), "STOP THIS ZONE")
+        self.app.manual_button.invoke()
+        self.assertNotIn(0, self.app.controller.runs)
+        self.assertEqual(self.app.manual_button.cget("text"), "RUN ZONE (10 min max)")
+        self.app.manual_button.invoke()
+        self.assertEqual(self.app.controller.runs[0].source, "Manual")
+        self.assertEqual(self.app.manual_button.cget("text"), "STOP THIS ZONE")
 
     def test_resume_confirmation_can_cancel_or_start_active_routine(self) -> None:
         self.pause()
@@ -152,7 +343,6 @@ class RainPauseGuiTests(unittest.TestCase):
         self.assertEqual(self.app.zone_buttons[7].cget("text"), "8  Master Pump")
         self.assertIn("MASTER PUMP / ON", self.app.status.cget("text"))
         self.assertEqual(self.app.manual_button.cget("state"), "disabled")
-        self.assertEqual(self.app.test_button.cget("state"), "disabled")
         self.assertEqual(len(self.app.editor.winfo_children()), 3)
         original = load_zones(self.path)[7]
         self.assertTrue(self.app.save())
@@ -172,18 +362,19 @@ class RainPauseGuiTests(unittest.TestCase):
             self.assertNotIn("Master Pump", other.zone_buttons[7].cget("text"))
             self.assertGreater(len(other.editor.winfo_children()), 3)
             self.assertEqual(other.manual_button.cget("state"), "normal")
-            self.assertEqual(other.test_button.cget("state"), "normal")
         finally:
             other.on_close()
 
     def test_compact_layout_keeps_actions_visible_at_opening_and_minimum_sizes(self) -> None:
-        for size in ("1180x760", "1100x620"):
+        for size in ("940x760", "940x620"):
             with self.subTest(size=size):
                 self.app.geometry(size)
                 self.app.update()
                 for widget in (
-                    self.app.manual_button, self.app.test_button,
+                    self.app.manual_button,
                     self.app.stop_all_button, self.app.save_button,
+                    self.app.overview_button,
+                    self.app.weekly_button,
                     self.app.rain_pause_switch, *self.app.zone_buttons,
                 ):
                     self.assertGreaterEqual(widget.winfo_rooty(), self.app.winfo_rooty())
@@ -195,9 +386,6 @@ class RainPauseGuiTests(unittest.TestCase):
                         widget.winfo_rootx() + widget.winfo_width(),
                         self.app.winfo_rootx() + self.app.winfo_width(),
                     )
-                self.assertEqual(
-                    self.app.manual_button.winfo_rooty(), self.app.test_button.winfo_rooty()
-                )
                 self.assertLess(
                     self.app.editor.master.winfo_rooty() + self.app.editor.master.winfo_height(),
                     self.app.manual_button.winfo_rooty(),
@@ -211,18 +399,36 @@ class RainPauseGuiTests(unittest.TestCase):
                     if isinstance(widget, ctk.CTkEntry)
                 ]
                 self.assertEqual(len(entries), 56)
+                monday = next(
+                    widget for widget in table.winfo_children()
+                    if isinstance(widget, ctk.CTkLabel) and widget.cget("text") == "Mon"
+                )
+                first_entry = min(entries, key=lambda entry: (entry.grid_info()["row"], entry.grid_info()["column"]))
+                self.assertLessEqual(
+                    first_entry.winfo_rootx() - (monday.winfo_rootx() + monday.winfo_width()),
+                    20,
+                )
+                last_entry = max(
+                    entries,
+                    key=lambda entry: (entry.grid_info()["row"], entry.grid_info()["column"]),
+                )
+                self.assertLessEqual(
+                    table.winfo_rootx() + table.winfo_width()
+                    - last_entry.winfo_rootx() - last_entry.winfo_width(),
+                    20,
+                )
                 for entry in entries:
                     self.assertLessEqual(
                         entry.winfo_rootx() + entry.winfo_width(),
                         self.app.winfo_rootx() + self.app.winfo_width(),
                     )
-                    if size == "1180x760":
+                    if size == "940x760":
                         self.assertLessEqual(
                             entry.winfo_rooty() + entry.winfo_height(),
                             self.app.editor.master.winfo_rooty()
                             + self.app.editor.master.winfo_height(),
                         )
-                if size == "1180x760":
+                if size == "940x760":
                     self.assertLessEqual(
                         self.app.validation.winfo_rooty() + self.app.validation.winfo_height(),
                         self.app.editor.master.winfo_rooty()

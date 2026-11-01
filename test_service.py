@@ -112,6 +112,18 @@ class ServiceTests(unittest.TestCase):
             )
         self.assertEqual(load_zones(self.path)[1].name, "New name")
 
+    def test_old_service_settings_error_explains_restart_without_applying(self) -> None:
+        client = ServiceClient.__new__(ServiceClient)
+        client.path = Path("unused")
+        client.revision = "revision"
+        with patch(
+            "service_client.exchange",
+            side_effect=ValueError("Unsupported settings format; expected version 1, 2, or 3."),
+        ):
+            with self.assertRaisesRegex(ValueError, "Restart garden-sprinkler.service") as error:
+                client.apply(default_zones(), datetime.now())
+        self.assertIn("Your edits have not been applied", str(error.exception))
+
     def test_invalid_commands_never_fault_or_energize_hardware(self) -> None:
         calls = list(self.device.calls)
         for request in (

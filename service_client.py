@@ -51,7 +51,16 @@ class ServiceClient:
         self.sync()
 
     def apply(self, zones: list[Zone], now: datetime) -> None:
-        self.command("save", settings=encode_zones(zones), revision=self.revision)
+        try:
+            self.command("save", settings=encode_zones(zones), revision=self.revision)
+        except ValueError as exc:
+            if str(exc).startswith("Unsupported settings format"):
+                raise ValueError(
+                    "The background service is older than this desktop app. "
+                    "Restart garden-sprinkler.service, then close and reopen the desktop "
+                    "before saving again. Your edits have not been applied."
+                ) from exc
+            raise
 
     def stop(self, channel: int, now: datetime) -> None:
         self.command("stop", channel=channel)

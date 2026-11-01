@@ -1,13 +1,6 @@
 GARDEN SPRINKLER CONTROLLER
 ==========================
 
-Release 1.1.0
-
-Upgrading from 1.0.0: close the older app before enabling the service.
-The desktop now requires the service. Configure relay/configuration
-arguments on the service instead. Saved settings remain compatible.
-Closing the desktop now leaves watering running.
-
 Developed by Wally Horsman, 2026
 
 Seven garden zones and an automatic channel 8 master pump, using the
@@ -105,7 +98,7 @@ Rain Pause is saved separately beside it:
 Include BOTH files in backups. Missing schedules start disabled.
 A missing pause file means not paused. Invalid files produce errors;
 they are not silently overwritten. Writes use atomic replacement.
-Older version 1 and 2 schedules are preserved and saved as version 3.
+Older version 1, 2 and 3 schedules are preserved and saved as version 4.
 
 The service owns settings writes. To change configuration paths or
 relay parameters, use:
@@ -124,20 +117,47 @@ The desktop accepts --socket for an alternate local service endpoint.
 USING THE DESKTOP
 -----------------
 
-The compact opening window is 1180 x 760. Manual Watering and Test Zone
-are side by side. STOP ALL and Save Settings stay fixed at the bottom.
-At smaller heights (minimum 620), scroll the configuration panel.
+Daily Schedule, above the editor, opens a weekday table of all
+configured garden periods sorted by start time. It includes unsaved
+edits, clearly labelled, and excludes the master pump. Disabled routines
+are marked and can be hidden. Select a row to open that relay's settings.
+Amber warnings flag identical starts and overlapping periods across
+enabled relays. Adjacent end/start times do not overlap. Warnings are
+advisory and do not block saving: when two enabled, unpaused schedules
+overlap, both relays can run at the same time. Watering is not queued
+sequentially; the shared master pump runs for their combined demand.
+Invalid/incomplete pairs remain visible with a warning; they cannot be
+fully checked for conflicts. Rain Pause and stale service status are
+labelled. The table shows configured times, not current relay outputs.
+
+Weekly Overview, beside Daily Schedule, shows all garden relays and all
+seven weekdays at once. Each cell lists four numbered start-stop pairs;
+unused periods show --. Bright red text and ! flag same-start or overlapping
+periods on both affected relays; red cells flag invalid/incomplete pairs.
+Click a garden or cell to open its settings.
+Both tables can stay open together and update as you edit. Both can hide
+disabled routines and label unsaved edits. Conflicts compare the same
+weekday across enabled garden relays, not different days.
+
+The compact opening window is 940 x 760, with a minimum size of 940 x 620.
+One RUN ZONE / STOP THIS ZONE button handles timed watering and stopping.
+STOP ALL and Save Settings stay fixed at the bottom. At smaller heights,
+scroll the configuration panel.
 Watering controls and Rain Pause remain outside the scrolling panel.
 
 Select a garden zone (1-7), edit its Relay / Garden Name, and save.
 Each name can have up to 40 characters.
 
 Each weekday has four independent start/stop pairs, shown in muted
-blue, green, amber and purple. Enter four-digit 24-hour times such as
-0600 or 1620; 06:00 and 16:20 are also accepted.
+blue, green, amber and purple. Enter 24-hour times as HMM (815), HHMM
+(0815), or HH:MM (08:15). Times display as HH:MM.
 Leave both fields blank to skip a window. Every used pair needs both
-times. Stop must be later than start. Windows must be ordered without
-overlaps and cannot cross midnight.
+times. Stop must be later than start. Enter windows in any numbered order,
+but do not overlap windows within one zone; windows cannot cross midnight.
+Click a Start heading to pause/resume that window number for the selected zone
+across all weekdays. The smaller Paused marker appears below paused headings.
+Changes apply on save. Red borders identify overlap fields. Clicking a
+conflicting Stop field opens an acknowledgment popup naming both groups.
 
 "Copy selected day's times to all days" copies all four pairs once.
 Every day remains independently editable afterward.
@@ -157,14 +177,13 @@ Status dots:
   Grey         No active schedule, disabled routine, or Rain Pause.
   Fault colour Status unknown; check the service and device.
 
-Turn On Now runs for a maximum of 10 minutes. Its button becomes
-STOP THIS ZONE while watering. Test Zone toggles ON/OFF and also has
-a 10-minute maximum. Stop a manual/routine run before starting a test.
+RUN ZONE waters the selected zone for up to 10 minutes, even if its
+routine is disabled. Its button becomes STOP THIS ZONE while watering.
 
 STOP THIS ZONE and STOP ALL suppress currently active schedule windows
 until they end. Later windows still run. Suppression survives closing
-the desktop, but not restarting the service/computer. Manual/test runs
-can still be started unless Rain Pause is enabled.
+the desktop, but not restarting the service/computer. Manual runs can
+still be started unless Rain Pause is enabled.
 
 RAIN PAUSE
 ----------
@@ -187,7 +206,7 @@ CHANNEL 8 MASTER PUMP
 
 Channel 8 is labelled Master Pump, automatically ON whenever any garden
 zone (1-7) is watering, including manual/test operation. It has no
-independent schedule or manual/test controls.
+independent schedule or watering controls.
 
 The first valve opens before pump ON. Pump stays ON while any zone runs,
 and stops before the last valve closes. Startup, STOP ALL, Rain Pause,

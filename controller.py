@@ -49,11 +49,40 @@ def copy_day_times(
 
 
 def parse_time(value: str) -> int:
-    """Convert a 24-hour HHMM or HH:MM value into minutes after midnight."""
-    if not re.fullmatch(r"(?:[01][0-9]|2[0-3]):?[0-5][0-9]", value):
-        raise ValueError("Enter a 24-hour time such as 1620 or 16:20 (four digits).")
-    digits = value.replace(":", "")
-    return int(digits[:2]) * 60 + int(digits[2:])
+    """Convert a 24-hour HMM, HHMM, or HH:MM value into minutes after midnight."""
+    if ":" in value:
+        if not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", value):
+            raise ValueError("Enter a 24-hour time such as 815, 0815, or 08:15.")
+        hour, minute = value.split(":")
+    else:
+        if not re.fullmatch(r"[0-9]{3,4}", value):
+            raise ValueError("Enter a 24-hour time such as 815, 0815, or 08:15.")
+        hour, minute = value[:-2], value[-2:]
+    hours, minutes = int(hour), int(minute)
+    if hours > 23 or minutes > 59:
+        raise ValueError("Enter a 24-hour time such as 815, 0815, or 08:15.")
+    return hours * 60 + minutes
+
+
+def overlapping_windows(row: tuple[str, ...]) -> tuple[tuple[int, int], ...]:
+    windows = []
+    for slot, (start, stop) in enumerate(zip(row[::2], row[1::2])):
+        if not start or not stop:
+            continue
+        try:
+            begin, end = parse_time(start), parse_time(stop)
+        except ValueError:
+            continue
+        if end > begin:
+            windows.append((begin, end, slot))
+    windows.sort(key=lambda window: window[0])
+    conflicts = []
+    for index, first in enumerate(windows):
+        for second in windows[index + 1 :]:
+            if second[0] >= first[1]:
+                break
+            conflicts.append((first[2], second[2]))
+    return tuple(conflicts)
 
 
 @dataclass(frozen=True)
@@ -63,6 +92,7 @@ class Zone:
     schedule: tuple[tuple[str, ...], ...] = field(
         default_factory=empty_schedule
     )
+    paused_windows: tuple[bool, ...] = (False,) * WINDOW_COUNT
 
     def validate(self) -> None:
         if not isinstance(self.name, str) or not self.name.strip():
@@ -71,13 +101,18 @@ class Zone:
             raise ValueError("Zone names must be 40 characters or fewer.")
         if type(self.enabled) is not bool:
             raise ValueError("Routine enabled must be true or false.")
+        if (
+            not isinstance(self.paused_windows, tuple)
+            or len(self.paused_windows) != WINDOW_COUNT
+            or any(type(paused) is not bool for paused in self.paused_windows)
+        ):
+            raise ValueError("Each of the four schedule windows must have a true/false pause state.")
         if not isinstance(self.schedule, tuple) or len(self.schedule) != 7:
             raise ValueError("Schedule must contain exactly one row for each weekday.")
         has_window = False
         for day, row in enumerate(self.schedule):
             if not isinstance(row, tuple) or len(row) != WINDOW_COUNT * 2:
                 raise ValueError(f"{DAY_NAMES[day]} must have four start/stop pairs.")
-            previous_stop = -1
             for slot in range(WINDOW_COUNT):
                 start, stop = row[slot * 2 : slot * 2 + 2]
                 if not isinstance(start, str) or not isinstance(stop, str):
@@ -93,13 +128,14 @@ class Zone:
                     raise ValueError(
                         f"{DAY_NAMES[day]} window {slot + 1}: stop must be later than start."
                     )
-                if start_minute < previous_stop:
-                    raise ValueError(
-                        f"{DAY_NAMES[day]} window {slot + 1} must start at or after "
-                        "the previous window ends."
-                    )
-                previous_stop = stop_minute
                 has_window = True
+            conflicts = overlapping_windows(row)
+            if conflicts:
+                first, second = conflicts[0]
+                raise ValueError(
+                    f"{DAY_NAMES[day]} Start/Stop group {first + 1} overlaps "
+                    f"Start/Stop group {second + 1}."
+                )
         if self.enabled and not has_window:
             raise ValueError("Set at least one daily time window for an enabled routine.")
 
@@ -111,11 +147,15 @@ class Zone:
             return ()
         minute = now.hour * 60 + now.minute
         row = self.schedule[now.weekday()]
-        return tuple(
-            (start, stop)
-            for start, stop in zip(row[::2], row[1::2])
-            if start and parse_time(start) <= minute < parse_time(stop)
-        )
+        return tuple(sorted(
+            [
+                (start, stop)
+                for slot, (start, stop) in enumerate(zip(row[::2], row[1::2]))
+                if not self.paused_windows[slot]
+                and start and parse_time(start) <= minute < parse_time(stop)
+            ],
+            key=lambda window: parse_time(window[0]),
+        ))
 
 
 def default_zones() -> list[Zone]:
@@ -143,8 +183,8 @@ def load_zones(path: Path) -> list[Zone]:
 
 
 def decode_zones(data: object) -> list[Zone]:
-    if not isinstance(data, dict) or type(data.get("version")) is not int or data["version"] not in (1, 2, 3):
-        raise ValueError("Unsupported settings format; expected version 1, 2, or 3.")
+    if not isinstance(data, dict) or type(data.get("version")) is not int or data["version"] not in (1, 2, 3, 4):
+        raise ValueError("Unsupported settings format; expected version 1, 2, 3, or 4.")
     records = data.get("zones")
     if not isinstance(records, list):
         raise ValueError("Settings must contain a list of zones.")
@@ -167,8 +207,12 @@ def decode_zones(data: object) -> list[Zone]:
                 raise ValueError("Version 1 zone stop time must be later than its start time.")
             schedule = legacy_schedule(tuple(record["days"]), record["start"], record["stop"])
         else:
-            if set(record) != {"name", "enabled", "schedule"}:
-                raise ValueError("Zones must contain name, enabled, and schedule.")
+            expected_fields = (
+                {"name", "enabled", "schedule", "paused_windows"}
+                if data["version"] == 4 else {"name", "enabled", "schedule"}
+            )
+            if set(record) != expected_fields:
+                raise ValueError("Zone settings contain unexpected or missing fields.")
             if not isinstance(record["schedule"], list):
                 raise ValueError("Zone schedule must be a list.")
             expected_times = 4 if data["version"] == 2 else WINDOW_COUNT * 2
@@ -179,7 +223,19 @@ def decode_zones(data: object) -> list[Zone]:
                 raise ValueError(f"Each daily schedule must be a list of {expected_times} times.")
             padding = ("",) * (WINDOW_COUNT * 2 - expected_times)
             schedule = tuple(tuple(row) + padding for row in record["schedule"])
-        zones.append(Zone(name=record["name"], enabled=record["enabled"], schedule=schedule))
+        paused_windows = (False,) * WINDOW_COUNT
+        if data["version"] == 4:
+            values = record["paused_windows"]
+            if (
+                not isinstance(values, list) or len(values) != WINDOW_COUNT
+                or any(type(paused) is not bool for paused in values)
+            ):
+                raise ValueError("Each zone paused_windows value must contain four booleans.")
+            paused_windows = tuple(values)
+        zones.append(Zone(
+            name=record["name"], enabled=record["enabled"], schedule=schedule,
+            paused_windows=paused_windows,
+        ))
     validate_zones(zones)
     return zones
 
@@ -192,12 +248,13 @@ def save_zones(path: Path, zones: list[Zone]) -> None:
 def encode_zones(zones: list[Zone]) -> dict[str, object]:
     validate_zones(zones)
     return {
-        "version": 3,
+        "version": 4,
         "zones": [
             {
                 "name": zone.name.strip(),
                 "enabled": zone.enabled,
                 "schedule": [list(day) for day in zone.schedule],
+                "paused_windows": list(zone.paused_windows),
             }
             for zone in zones
         ],

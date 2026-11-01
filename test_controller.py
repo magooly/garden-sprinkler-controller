@@ -15,6 +15,7 @@ from controller import (
     Zone,
     copy_day_times,
     default_zones,
+    encode_zones,
     load_zones,
     load_rain_pause,
     rain_pause_path,
@@ -70,12 +71,18 @@ class ValidationTests(unittest.TestCase):
     def test_time_format(self) -> None:
         self.assertEqual(parse_time("00:00"), 0)
         self.assertEqual(parse_time("23:59"), 1439)
+        self.assertEqual(parse_time("815"), 8 * 60 + 15)
+        self.assertEqual(parse_time("620"), 6 * 60 + 20)
+        self.assertEqual(parse_time("100"), 60)
+        self.assertEqual(parse_time("000"), 0)
         self.assertEqual(parse_time("1620"), 16 * 60 + 20)
         self.assertEqual(parse_time("0600"), 6 * 60)
         self.assertEqual(parse_time("0000"), 0)
         self.assertEqual(parse_time("2359"), 1439)
+        self.assertEqual(parse_time("08:15"), 8 * 60 + 15)
         for value in ("6:00", "24:00", "12:60", "06:00 AM", " 06:00", "",
-                      "2400", "1260", "620", "16200", "16:2"):
+                      "2400", "1260", "16200", "16:2", "999",
+                      "8:15", "0815:"):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 parse_time(value)
 
@@ -84,13 +91,43 @@ class ValidationTests(unittest.TestCase):
             with self.subTest(stop=stop), self.assertRaises(ValueError):
                 Zone("Lawn", schedule=schedule_for((0,), ("06:00", stop))).validate()
 
-    def test_second_window_must_follow_first_without_overlapping(self) -> None:
+    def test_overlapping_windows_are_rejected_regardless_of_slot_order(self) -> None:
         for second in (("06:19", "06:30"), ("06:00", "06:30")):
-            with self.subTest(second=second), self.assertRaisesRegex(ValueError, "window 2"):
+            with self.subTest(second=second), self.assertRaisesRegex(ValueError, "overlap"):
                 Zone(
                     "Lawn",
                     schedule=schedule_for((0,), ("06:00", "06:20"), second),
                 ).validate()
+
+    def test_overlap_error_names_weekday_and_both_window_groups(self) -> None:
+        zone = Zone(
+            "Lawn", schedule=schedule_for((0,), ("06:00", "06:20"), ("06:10", "06:30"))
+        )
+        with self.assertRaisesRegex(
+            ValueError, "Mon Start/Stop group 1 overlaps Start/Stop group 2"
+        ):
+            zone.validate()
+
+    def test_long_window_overlap_reports_first_conflicting_pair(self) -> None:
+        zone = Zone(
+            "Lawn",
+            schedule=schedule_for(
+                (0,), ("06:00", "12:00"), ("07:00", "08:00"), ("09:00", "10:00")
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "group 1 overlaps Start/Stop group 2"):
+            zone.validate()
+
+    def test_non_overlapping_windows_can_be_entered_out_of_time_order(self) -> None:
+        zone = Zone(
+            "Lawn", True,
+            schedule_for((0,), ("17:00", "17:15"), ("06:00", "06:20")),
+        )
+        zone.validate()
+        self.assertEqual(zone.scheduled_windows(MONDAY.replace(hour=6, minute=10)),
+                         (("06:00", "06:20"),))
+        self.assertEqual(zone.scheduled_windows(MONDAY.replace(hour=17, minute=5)),
+                         (("17:00", "17:15"),))
 
     def test_second_window_can_be_the_only_window_for_a_day(self) -> None:
         schedule = list(schedule_for((0,)))
@@ -200,7 +237,7 @@ class PersistenceTests(unittest.TestCase):
         zones[0] = Zone("Front Lawn", True, tuple(schedule))
         save_zones(self.path, zones)
         self.assertEqual(load_zones(self.path), zones)
-        self.assertEqual(json.loads(self.path.read_text())["version"], 3)
+        self.assertEqual(json.loads(self.path.read_text())["version"], 4)
 
     def test_invalid_save_preserves_file(self) -> None:
         zones = default_zones()
@@ -235,7 +272,9 @@ class PersistenceTests(unittest.TestCase):
         save_zones(self.path, default_zones())
         original = json.loads(self.path.read_text())
         for field, value in (("enabled", "false"), ("schedule", "Mon"),
-                             ("name", None), ("schedule", [[False, "", "", ""]] * 7)):
+                             ("name", None), ("schedule", [[False, "", "", ""]] * 7),
+                             ("paused_windows", [False, False, False]),
+                             ("paused_windows", [False, False, "false", False])):
             data = json.loads(json.dumps(original))
             data["zones"][0][field] = value
             self.path.write_text(json.dumps(data))
@@ -279,8 +318,18 @@ class PersistenceTests(unittest.TestCase):
             self.assertEqual(zone.schedule, (tuple(row) + ("",) * 4,) * 7)
         self.assertEqual(self.path.read_text(), original)
         save_zones(self.path, zones)
-        self.assertEqual(json.loads(self.path.read_text())["version"], 3)
+        self.assertEqual(json.loads(self.path.read_text())["version"], 4)
         self.assertEqual(load_zones(self.path), zones)
+
+    def test_version_three_settings_migrate_with_unpaused_windows(self) -> None:
+        data = encode_zones(default_zones())
+        data["version"] = 3
+        for zone in data["zones"]:
+            del zone["paused_windows"]
+        self.path.parent.mkdir()
+        self.path.write_text(json.dumps(data))
+        zones = load_zones(self.path)
+        self.assertTrue(all(not any(zone.paused_windows) for zone in zones))
 
 
 class ControllerTests(unittest.TestCase):
@@ -308,6 +357,28 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(self.controller.runs[0].source, "Routine")
         self.assertNotIn(1, self.controller.runs)
         self.assertNotIn(2, self.controller.runs)
+
+    def test_paused_slot_is_skipped_but_other_slot_still_runs(self) -> None:
+        self.zones[0] = Zone(
+            "Lawn", True,
+            schedule_for((0,), ("0600", "0620"), ("1700", "1715")),
+            (True, False, False, False),
+        )
+        self.controller.apply(self.zones, MONDAY - timedelta(minutes=1))
+        self.controller.tick(MONDAY)
+        self.assertFalse(self.backend.states[0])
+        self.controller.tick(MONDAY.replace(hour=17))
+        self.assertTrue(self.backend.states[0])
+
+    def test_pausing_current_window_and_applying_stops_it(self) -> None:
+        self.controller.tick(MONDAY)
+        self.assertTrue(self.backend.states[0])
+        self.zones[0] = Zone(
+            "Lawn", True, schedule_for((0,)), (True, False, False, False)
+        )
+        self.controller.apply(self.zones, MONDAY)
+        self.assertFalse(self.backend.states[0])
+        self.assertNotIn(0, self.controller.runs)
 
     def test_rain_pause_survives_restart_during_active_schedule(self) -> None:
         restarted = Controller(self.zones, self.backend, rain_paused=True)

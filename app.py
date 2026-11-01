@@ -23,11 +23,14 @@ from controller import (
     load_rain_pause,
     save_rain_pause,
     save_zones,
+    parse_time,
+    overlapping_windows,
     validate_zones,
 )
 from waveshare_relay import WaveshareRelays
 from service import DEFAULT_CONFIG, default_socket
 from service_client import ServiceClient
+from schedule_overview import ScheduleOverview, WeeklyOverview
 
 GREEN = "#37cc87"
 RUNNING_RED = "#ff2020"
@@ -42,17 +45,61 @@ WINDOW_COLORS = (
 )
 
 
+def display_time(value: str) -> str:
+    if not value:
+        return ""
+    minutes = parse_time(value)
+    return f"{minutes // 60:02}:{minutes % 60:02}"
+
+
+def overlap_notices(row: tuple[str, ...]) -> dict[tuple[int, int], str]:
+    notices = {
+        pair: f"Start/Stop group {pair[0] + 1} overlaps Start/Stop group {pair[1] + 1}."
+        for pair in overlapping_windows(row)
+    }
+    complete_windows: list[tuple[int, int, int]] = []
+    for slot, (start, stop) in enumerate(zip(row[::2], row[1::2])):
+        if not start or not stop:
+            continue
+        try:
+            begin, end = parse_time(start), parse_time(stop)
+        except ValueError:
+            continue
+        if end > begin:
+            complete_windows.append((slot, begin, end))
+    for slot, start in enumerate(row[::2]):
+        if not start or row[slot * 2 + 1]:
+            continue
+        try:
+            start_minute = parse_time(start)
+        except ValueError:
+            continue
+        for other, begin, end in complete_windows:
+            if other != slot and begin <= start_minute < end:
+                pair = tuple(sorted((slot, other)))
+                notices[pair] = (
+                    f"Start/Stop group {slot + 1} start time falls within "
+                    f"Start/Stop group {other + 1}."
+                )
+    return notices
+
+
 @dataclass
 class ZoneFields:
     name: tk.StringVar
     enabled: tk.BooleanVar
     schedule: list[list[tk.StringVar]]
+    paused_windows: list[tk.BooleanVar]
 
     def read(self) -> Zone:
         return Zone(
             self.name.get().strip(),
             self.enabled.get(),
-            tuple(tuple(time.get().strip() for time in day) for day in self.schedule),
+            tuple(
+                tuple(display_time(time.get().strip()) for time in day)
+                for day in self.schedule
+            ),
+            tuple(paused.get() for paused in self.paused_windows),
         )
 
 
@@ -65,8 +112,8 @@ class SprinklerApp(ctk.CTk):
         super().__init__()
         self.withdraw()
         self.title("Garden Sprinkler Controller")
-        self.geometry("1180x760")
-        self.minsize(1100, 620)
+        self.geometry("940x760")
+        self.minsize(940, 620)
         self.settings_path = settings_path
         self.selected = 0
         self.timer: str | None = None
@@ -74,7 +121,10 @@ class SprinklerApp(ctk.CTk):
         self.faulted = False
         self.syncing = False
         self.service_error = ""
+        self.acknowledged_overlaps: set[tuple[int, int, int, int]] = set()
         self.remote = isinstance(backend, ServiceClient)
+        self.overview: ScheduleOverview | None = None
+        self.weekly_overview: WeeklyOverview | None = None
         self.relay = backend
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         try:
@@ -114,18 +164,21 @@ class SprinklerApp(ctk.CTk):
                 tk.StringVar(self, zone.name),
                 tk.BooleanVar(self, zone.enabled),
                 [
-                    [tk.StringVar(self, value) for value in day]
+                    [tk.StringVar(self, display_time(value)) for value in day]
                     for day in zone.schedule
                 ],
+                [tk.BooleanVar(self, paused) for paused in zone.paused_windows],
             )
             for zone in zones
         ]
+        self.window_pause_labels: list[ctk.CTkLabel] = []
         self._build_layout()
         for fields in self.fields:
             for variable in (
                 fields.name,
                 fields.enabled,
                 *(time for day in fields.schedule for time in day),
+                *fields.paused_windows,
             ):
                 variable.trace_add("write", self._edited)
         self.select_zone(0)
@@ -214,18 +267,26 @@ class SprinklerApp(ctk.CTk):
             title_row, text="", anchor="e", text_color=GREY, wraplength=400
         )
         self.status.grid(row=0, column=1, sticky="ew")
+        overview_controls = ctk.CTkFrame(panel, fg_color="transparent")
+        overview_controls.grid(row=1, column=0, sticky="ew", pady=(0, 4))
+        self.overview_button = ctk.CTkButton(
+            overview_controls, text="Daily Schedule", command=self.show_overview, width=150,
+        )
+        self.overview_button.pack(side="left", padx=(0, 8))
+        self.weekly_button = ctk.CTkButton(
+            overview_controls, text="Weekly Overview", command=self.show_weekly_overview, width=150,
+        )
+        self.weekly_button.pack(side="left")
         self.editor = ctk.CTkScrollableFrame(panel)
         self.editor.grid(row=2, column=0, sticky="nsew")
         self.editor.grid_columnconfigure(0, weight=1)
         actions = ctk.CTkFrame(panel, fg_color="transparent")
         actions.grid(row=3, column=0, sticky="ew", pady=(8, 0))
         actions.grid_columnconfigure((0, 1), weight=1, uniform="actions")
-        self.manual_button = ctk.CTkButton(actions, text="", height=36, command=self.manual)
-        self.manual_button.grid(row=0, column=0, sticky="ew", padx=(0, 5))
-        self.test_button = ctk.CTkButton(
-            actions, text="Test Zone - ON (10 min max)", height=36, command=self.test
+        self.manual_button = ctk.CTkButton(
+            actions, text="RUN ZONE (10 min max)", height=36, command=self.manual
         )
-        self.test_button.grid(row=0, column=1, sticky="ew", padx=(5, 0))
+        self.manual_button.grid(row=0, column=0, columnspan=2, sticky="ew")
         ctk.CTkLabel(
             panel,
             text=("Background service keeps watering when this window is closed.\n"
@@ -253,15 +314,43 @@ class SprinklerApp(ctk.CTk):
         self.save_button.grid(row=0, column=2, padx=(10, 24))
         ctk.CTkLabel(
             footer,
-            text="Developed by Wally Horsman \u00a9 2026",
+            text="Developed by Wally Horsman \u00a9 2026  |  wrhorsman@gmail.com",
             text_color=GREY,
             font=("", 11),
         ).grid(row=1, column=0, columnspan=3, padx=20, pady=(0, 8), sticky="e")
+
+    def overview_snapshot(self) -> tuple[list[Zone], int | None, bool, bool, bool]:
+        return (
+            [fields.read() for fields in self.fields], self.controller.master_channel,
+            self.dirty, self.controller.rain_paused, self.faulted,
+        )
+
+    def show_weekly_overview(self) -> None:
+        if self.weekly_overview is not None and self.weekly_overview.winfo_exists():
+            self.weekly_overview.refresh()
+            self.weekly_overview.deiconify()
+            self.weekly_overview.lift()
+            return
+        self.weekly_overview = WeeklyOverview(self, self.overview_snapshot, self.select_zone)
+
+    def show_overview(self) -> None:
+        if self.overview is not None and self.overview.winfo_exists():
+            self.overview.refresh()
+            self.overview.deiconify()
+            self.overview.lift()
+            return
+        self.overview = ScheduleOverview(
+            self,
+            self.overview_snapshot,
+            self.select_zone, datetime.now().weekday(),
+        )
 
     def select_zone(self, channel: int) -> None:
         self.selected = channel
         for widget in self.editor.winfo_children():
             widget.destroy()
+        self.window_pause_labels = []
+        self.schedule_entries: dict[tuple[int, int], ctk.CTkEntry] = {}
         if channel == self.controller.master_channel:
             ctk.CTkLabel(
                 self.editor, text="CHANNEL 8 / MASTER PUMP", font=("", 18, "bold"),
@@ -270,7 +359,7 @@ class SprinklerApp(ctk.CTk):
                 self.editor,
                 text="Automatically ON whenever a garden zone (1-7) is watering.\n"
                 "The valve opens before the pump starts. The pump stops before\n"
-                "the last valve closes. No independent schedule or manual test.\n\n"
+                "the last valve closes. No independent schedule or manual watering.\n\n"
                 "The previous channel 8 name and schedule are preserved but ignored.",
                 justify="left", anchor="w", wraplength=650,
             ).grid(row=1, column=0, padx=20, pady=10, sticky="ew")
@@ -330,47 +419,77 @@ class SprinklerApp(ctk.CTk):
             command=copy_selected_day,
         ).pack(side="left")
         times = ctk.CTkFrame(self.editor, fg_color="transparent")
-        times.grid(row=5, column=0, columnspan=2, padx=12, pady=6, sticky="ew")
-        times.grid_columnconfigure(0, weight=1)
+        times.grid(row=5, column=0, columnspan=2, padx=12, pady=(4, 4), sticky="ew")
+        times.grid_columnconfigure(0, weight=0)
         for column in range(1, WINDOW_COUNT * 2 + 1):
-            times.grid_columnconfigure(column, weight=2)
+            times.grid_columnconfigure(column, weight=0)
         ctk.CTkLabel(times, text="Day", anchor="w").grid(
             row=0, column=0, padx=(0, 8), pady=(0, 5), sticky="w"
         )
-        for column, label in enumerate(
-            (f"{label} {window}" for window in range(1, WINDOW_COUNT + 1)
-             for label in ("Start", "Stop")),
-            start=1,
-        ):
-            background, _ = WINDOW_COLORS[(column - 1) // 2]
+        for window in range(WINDOW_COUNT):
+            start_column = window * 2 + 1
+            background, border = WINDOW_COLORS[window]
+            ctk.CTkButton(
+                times, text=f"Start {window + 1}", width=60, height=18, font=("", 11),
+                fg_color=background, hover_color=border,
+                command=lambda index=window: self._toggle_window_pause(index),
+            ).grid(row=0, column=start_column, padx=4, pady=(0, 0), sticky="ew")
+            pause_label = ctk.CTkLabel(
+                times, text="", height=8, font=("", 8), text_color="#ffcb70",
+            )
+            pause_label.grid(
+                row=1, column=start_column, padx=4, pady=(0, 1), sticky="ew"
+            )
+            self.window_pause_labels.append(pause_label)
             ctk.CTkLabel(
-                times, text=label, fg_color=background, text_color="#edf0f4",
-                corner_radius=5,
+                times, text=f"Stop {window + 1}", width=60, fg_color=background,
+                text_color="#edf0f4", corner_radius=5,
             ).grid(
-                row=0, column=column, padx=4, pady=(0, 5), sticky="ew"
+                row=0, column=start_column + 1, rowspan=2, padx=4, pady=(0, 1),
+                sticky="nsew",
             )
         for day_index, day_name in enumerate(DAY_NAMES):
             ctk.CTkLabel(times, text=day_name, anchor="w").grid(
-                row=day_index + 1, column=0, padx=(0, 8), pady=4, sticky="w"
+                row=day_index + 2, column=0, padx=(0, 8), pady=1, sticky="w"
             )
             for slot, variable in enumerate(fields.schedule[day_index], start=1):
                 background, border = WINDOW_COLORS[(slot - 1) // 2]
-                ctk.CTkEntry(
-                    times, textvariable=variable, width=70, height=30,
+                entry = ctk.CTkEntry(
+                    times, textvariable=variable, width=60, height=26,
                     fg_color=background, border_color=border, text_color="#edf0f4",
-                ).grid(
-                    row=day_index + 1, column=slot, padx=4, pady=2, sticky="ew"
                 )
+                entry.grid(
+                    row=day_index + 2, column=slot, padx=4, pady=0, sticky="ew"
+                )
+                entry.bind(
+                    "<FocusOut>",
+                    lambda _event, time_variable=variable: self._format_time_field(time_variable),
+                )
+                if (slot - 1) % 2:
+                    click_handler = (
+                        lambda _event, day=day_index, window=(slot - 1) // 2:
+                        self._overlap_stop_clicked(day, window)
+                    )
+                    entry.bind(
+                        "<Button-1>",
+                        click_handler,
+                        add="+",
+                    )
+                    entry._canvas.bind("<Button-1>", click_handler, add="+")
+                self.schedule_entries[day_index, slot - 1] = entry
+        self._update_window_pause_labels()
+        self.validation = ctk.CTkLabel(self.editor, text="", anchor="w", wraplength=700)
+        self.validation.grid(row=6, column=0, columnspan=2, padx=12, pady=(0, 4), sticky="ew")
         ctk.CTkLabel(
             self.editor,
-            text="Enter 1620 or 16:20 (24-hour time). Leave a pair blank to skip it. "
-            "Keep windows in time order without overlaps.",
+            text="Enter 815, 0815, or 08:15 (24-hour time). Leave a pair blank to skip it. "
+            "Windows may be entered in any order but cannot overlap. Click a Start heading "
+            "to pause/resume that window number for this zone across all weekdays; save to apply. "
+            "Red borders identify overlapping groups. Click a conflicting Stop field for details.",
             text_color=GREY,
             anchor="w",
             wraplength=700,
-        ).grid(row=6, column=0, columnspan=2, padx=12, pady=(0, 4), sticky="ew")
-        self.validation = ctk.CTkLabel(self.editor, text="", anchor="w", wraplength=700)
-        self.validation.grid(row=7, column=0, columnspan=2, padx=12, pady=(0, 4), sticky="ew")
+        ).grid(row=7, column=0, columnspan=2, padx=12, pady=(0, 4), sticky="ew")
         self._validate()
         self._refresh()
 
@@ -378,10 +497,35 @@ class SprinklerApp(ctk.CTk):
         if self.syncing:
             return
         self.dirty = True
+        self._update_window_pause_labels()
         self._validate()
         self._refresh()
 
+    def _toggle_window_pause(self, window: int) -> None:
+        paused = self.fields[self.selected].paused_windows[window]
+        paused.set(not paused.get())
+
+    def _format_time_field(self, variable: tk.StringVar) -> None:
+        value = variable.get().strip()
+        if not value:
+            variable.set("")
+            return
+        try:
+            formatted = display_time(value)
+        except ValueError:
+            return
+        variable.set(formatted)
+
+    def _update_window_pause_labels(self) -> None:
+        if self.selected == self.controller.master_channel:
+            return
+        for label, variable in zip(
+            self.window_pause_labels, self.fields[self.selected].paused_windows
+        ):
+            label.configure(text="Paused" if variable.get() else "")
+
     def _validate(self) -> None:
+        self._update_overlap_highlights()
         try:
             self.fields[self.selected].read().validate()
         except ValueError as exc:
@@ -397,6 +541,51 @@ class SprinklerApp(ctk.CTk):
             self.save_button.configure(state="disabled")
         else:
             self.save_button.configure(state="disabled" if self.faulted else "normal")
+
+    def _update_overlap_highlights(self) -> None:
+        conflicting: set[tuple[int, int]] = set()
+        active_conflicts: set[tuple[int, int, int, int]] = set()
+        for day_index, day in enumerate(self.fields[self.selected].schedule):
+            row = tuple(variable.get().strip() for variable in day)
+            for first, second in overlap_notices(row):
+                active_conflicts.add((self.selected, day_index, first, second))
+            for first, second in overlapping_windows(row):
+                conflicting.add((day_index, first))
+                conflicting.add((day_index, second))
+        self.acknowledged_overlaps.intersection_update(active_conflicts)
+        for (day_index, field_index), entry in self.schedule_entries.items():
+            slot = field_index // 2
+            _, border = WINDOW_COLORS[slot]
+            is_conflicting = (day_index, slot) in conflicting
+            entry.configure(
+                border_color="#ff5555" if is_conflicting else border,
+                border_width=2 if is_conflicting else 1,
+            )
+
+    def _overlap_stop_clicked(self, day: int, window: int) -> None:
+        row = tuple(variable.get().strip() for variable in self.fields[self.selected].schedule[day])
+        notices = overlap_notices(row)
+        conflicts = [
+            (first, second, notice)
+            for (first, second), notice in notices.items()
+            if window in (first, second)
+            and (self.selected, day, first, second) not in self.acknowledged_overlaps
+        ]
+        if not conflicts:
+            return
+        self.acknowledged_overlaps.update(
+            (self.selected, day, first, second) for first, second, _ in conflicts
+        )
+        messages = [
+            f"{DAY_NAMES[day]} {notice}"
+            for _, _, notice in conflicts
+        ]
+        messagebox.showwarning(
+            "Overlapping schedule times",
+            "These windows overlap:\n\n" + "\n".join(messages)
+            + "\n\nAdjust the times before saving.",
+            parent=self,
+        )
 
     def _refresh(self) -> None:
         now = datetime.now()
@@ -439,17 +628,10 @@ class SprinklerApp(ctk.CTk):
             for dot in self.zone_dots:
                 dot.configure(text_color="#ff9999")
         self.manual_button.configure(
-            text="STOP THIS ZONE" if run else "Manual Override: TURN ON NOW (10 min)",
+            text="STOP THIS ZONE" if run else "RUN ZONE (10 min max)",
             fg_color=RED if run else "#1f6aa5",
             hover_color="#92313c" if run else "#144870",
             state="disabled" if self.faulted or self.controller.rain_paused or master_selected else "normal",
-        )
-        testing = run is not None and run.source == "Test"
-        self.test_button.configure(
-            text="Stop Test - OFF" if testing else "Test Zone - ON (10 min max)",
-            fg_color=RED if testing else "#1f6aa5",
-            hover_color="#92313c" if testing else "#144870",
-            state="disabled" if self.faulted or self.controller.rain_paused or master_selected or (run is not None and not testing) else "normal",
         )
         count = len(self.controller.runs) + int(self.controller.pump_on)
         self.system_status.configure(
@@ -474,6 +656,10 @@ class SprinklerApp(ctk.CTk):
         )
         self.rain_pause_var.set(self.controller.rain_paused)
         self.rain_pause_switch.configure(state="disabled" if self.faulted else "normal")
+        if self.overview is not None and self.overview.winfo_exists():
+            self.overview.refresh()
+        if self.weekly_overview is not None and self.weekly_overview.winfo_exists():
+            self.weekly_overview.refresh()
 
     def toggle_rain_pause(self) -> None:
         paused = self.rain_pause_var.get()
@@ -545,15 +731,6 @@ class SprinklerApp(ctk.CTk):
             messagebox.showerror("Manual operation rejected", str(exc), parent=self)
         except (OSError, RuntimeError, ExceptionGroup) as exc:
             self._fault("Manual operation failed", exc)
-        self._refresh()
-
-    def test(self) -> None:
-        try:
-            self.controller.toggle_test(self.selected, datetime.now())
-        except ValueError as exc:
-            messagebox.showerror("Zone test rejected", str(exc), parent=self)
-        except (OSError, RuntimeError, ExceptionGroup) as exc:
-            self._fault("Zone test failed", exc)
         self._refresh()
 
     @staticmethod
