@@ -11,6 +11,7 @@ from controller import Controller, default_zones
 from waveshare_relay import (
     ModbusDeviceError,
     ModbusError,
+    RelayBoards,
     WaveshareRelays,
     main,
     rtu_frame,
@@ -59,6 +60,26 @@ class ProtocolTests(unittest.TestCase):
         with patch("waveshare_relay.socket.create_connection") as connect:
             WaveshareRelays()
         connect.assert_not_called()
+
+    def test_two_boards_route_channels_and_concatenate_readback(self) -> None:
+        primary = WaveshareRelays("192.0.2.1")
+        secondary = WaveshareRelays("192.0.2.2")
+        boards = RelayBoards(primary, secondary)
+        with patch.object(primary, "set_relay") as first, patch.object(secondary, "set_relay") as second:
+            for channel in range(16):
+                boards.set_relay(channel, True)
+            self.assertEqual(first.call_count, 8)
+            self.assertEqual(second.call_count, 8)
+            first.assert_called_with(7, True)
+            second.assert_called_with(7, True)
+        with patch.object(primary, "read_states", return_value=(False,) * 8), patch.object(
+            secondary, "read_states", return_value=(True,) * 8
+        ):
+            self.assertEqual(boards.read_states(), (False,) * 8 + (True,) * 8)
+        with self.assertRaises(ValueError):
+            RelayBoards(primary, WaveshareRelays("192.0.2.1"))
+        with self.assertRaises(ValueError):
+            RelayBoards(primary).set_relay(8, True)
 
     def test_read_only_status_fragmented_and_lsb_order(self) -> None:
         sock = FakeSocket(rtu_frame(bytes((1, 1, 1, 0b10000101))))

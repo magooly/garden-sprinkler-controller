@@ -25,12 +25,25 @@ class ServiceClient:
         }
         if not required.issubset(data) or data["protocol"] != 1:
             raise OSError("Incompatible service reply. Update/restart the service and app together.")
-        self.zones = decode_zones(data["settings"])
+        zones = decode_zones(data["settings"])
+        channel_count = data.get("channel_count", 8)
+        if type(channel_count) is not int or channel_count not in (8, 16) or channel_count > len(zones):
+            raise OSError("Invalid configured channel count in service reply.")
+        if hasattr(self, "zones") and (
+            len(zones) != len(self.zones) or channel_count != self.channel_count
+        ):
+            raise OSError("Board configuration changed. Close and reopen this window.")
+        self.zones = zones
+        self.channel_count = channel_count
+        self.boards = data.get("boards", [
+            {"host": data["host"], "port": data["port"], "slave_id": data["slave_id"]}
+        ])
         self.revision = data["revision"]
         self.rain_paused = data["rain_paused"]
         self.master_channel = data["master_channel"]
         self.pump_on = data["pump_on"]
         self.fault = data["fault"]
+        self.timetables = data.get("timetables")
         self.host = data["host"]
         self.port = data["port"]
         self.slave_id = data["slave_id"]
@@ -64,6 +77,16 @@ class ServiceClient:
 
     def stop(self, channel: int, now: datetime) -> None:
         self.command("stop", channel=channel)
+
+    def save_profile(self, name: str) -> None:
+        if self.timetables is None:
+            raise ValueError("Restart the background service to enable timetable profiles.")
+        self.command("profile_save", name=name, revision=self.revision)
+
+    def load_profile(self, name: str) -> None:
+        if self.timetables is None:
+            raise ValueError("Restart the background service to enable timetable profiles.")
+        self.command("profile_load", name=name, revision=self.revision)
 
     def stop_all(self, now: datetime) -> None:
         self.command("stop_all")

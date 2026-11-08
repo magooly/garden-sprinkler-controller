@@ -235,9 +235,10 @@ class PersistenceTests(unittest.TestCase):
         schedule = list(schedule_for((0, 2, 4), ("05:30", "05:50")))
         schedule[5] = ("0600", "0610", "1000", "1010", "1400", "1410", "1800", "1820")
         zones[0] = Zone("Front Lawn", True, tuple(schedule))
+        zones[1] = replace(zones[1], rain_pause_exempt=True, pump_exempt=True)
         save_zones(self.path, zones)
         self.assertEqual(load_zones(self.path), zones)
-        self.assertEqual(json.loads(self.path.read_text())["version"], 4)
+        self.assertEqual(json.loads(self.path.read_text())["version"], 7)
 
     def test_invalid_save_preserves_file(self) -> None:
         zones = default_zones()
@@ -274,7 +275,9 @@ class PersistenceTests(unittest.TestCase):
         for field, value in (("enabled", "false"), ("schedule", "Mon"),
                              ("name", None), ("schedule", [[False, "", "", ""]] * 7),
                              ("paused_windows", [False, False, False]),
-                             ("paused_windows", [False, False, "false", False])):
+                             ("paused_windows", [False, False, "false", False]),
+                             ("rain_pause_exempt", "false"), ("pump_exempt", "false"),
+                             ("pump_exempt", 1)):
             data = json.loads(json.dumps(original))
             data["zones"][0][field] = value
             self.path.write_text(json.dumps(data))
@@ -318,7 +321,7 @@ class PersistenceTests(unittest.TestCase):
             self.assertEqual(zone.schedule, (tuple(row) + ("",) * 4,) * 7)
         self.assertEqual(self.path.read_text(), original)
         save_zones(self.path, zones)
-        self.assertEqual(json.loads(self.path.read_text())["version"], 4)
+        self.assertEqual(json.loads(self.path.read_text())["version"], 7)
         self.assertEqual(load_zones(self.path), zones)
 
     def test_version_three_settings_migrate_with_unpaused_windows(self) -> None:
@@ -326,10 +329,35 @@ class PersistenceTests(unittest.TestCase):
         data["version"] = 3
         for zone in data["zones"]:
             del zone["paused_windows"]
+            del zone["rain_pause_exempt"]
+            del zone["pump_exempt"]
         self.path.parent.mkdir()
         self.path.write_text(json.dumps(data))
         zones = load_zones(self.path)
         self.assertTrue(all(not any(zone.paused_windows) for zone in zones))
+        self.assertFalse(any(zone.rain_pause_exempt for zone in zones))
+
+    def test_version_four_settings_migrate_with_zones_included_by_default(self) -> None:
+        data = encode_zones(default_zones())
+        data["version"] = 4
+        for zone in data["zones"]:
+            del zone["rain_pause_exempt"]
+            del zone["pump_exempt"]
+        self.path.parent.mkdir()
+        self.path.write_text(json.dumps(data))
+        zones = load_zones(self.path)
+        self.assertTrue(all(not any(zone.paused_windows) for zone in zones))
+        self.assertFalse(any(zone.rain_pause_exempt for zone in zones))
+
+    def test_version_five_and_six_default_to_pump_participation(self) -> None:
+        for version, count in ((5, 8), (6, 16)):
+            data = encode_zones(default_zones(count))
+            data["version"] = version
+            for record in data["zones"]:
+                del record["pump_exempt"]
+            self.path.parent.mkdir(exist_ok=True)
+            self.path.write_text(json.dumps(data))
+            self.assertFalse(any(zone.pump_exempt for zone in load_zones(self.path)))
 
 
 class ControllerTests(unittest.TestCase):
@@ -357,6 +385,34 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(self.controller.runs[0].source, "Routine")
         self.assertNotIn(1, self.controller.runs)
         self.assertNotIn(2, self.controller.runs)
+
+    def test_rain_pause_keeps_exempt_schedule_and_manual_watering(self) -> None:
+        self.zones[1] = Zone(
+            "Exempt", True, schedule_for((0,)), rain_pause_exempt=True
+        )
+        self.controller.apply(self.zones, MONDAY)
+        self.controller.set_rain_pause(True, MONDAY)
+        self.assertFalse(self.backend.states[0])
+        self.assertTrue(self.backend.states[1])
+        self.assertTrue(self.backend.states[7])
+        self.assertIn(1, self.controller.runs)
+        self.controller.stop(1, MONDAY)
+        self.controller.start_manual(1, MONDAY)
+        self.assertEqual(self.controller.runs[1].source, "Manual")
+        with self.assertRaisesRegex(RuntimeError, "Rain Pause"):
+            self.controller.start_manual(0, MONDAY)
+
+    def test_making_running_exempt_zone_included_stops_it_during_pause(self) -> None:
+        self.zones[1] = Zone(
+            "Exempt", True, schedule_for((0,)), rain_pause_exempt=True
+        )
+        self.controller.apply(self.zones, MONDAY)
+        self.controller.set_rain_pause(True, MONDAY)
+        self.assertTrue(self.backend.states[1])
+        self.zones[1] = replace(self.zones[1], rain_pause_exempt=False)
+        self.controller.apply(self.zones, MONDAY)
+        self.assertFalse(self.backend.states[1])
+        self.assertNotIn(1, self.controller.runs)
 
     def test_paused_slot_is_skipped_but_other_slot_still_runs(self) -> None:
         self.zones[0] = Zone(
@@ -636,6 +692,56 @@ class ControllerTests(unittest.TestCase):
 
 
 class MasterPumpTests(unittest.TestCase):
+    def test_exempt_zone_runs_without_pump_and_does_not_keep_it_on(self) -> None:
+        self.zones[1] = replace(self.zones[1], pump_exempt=True)
+        self.controller.apply(self.zones, MONDAY)
+        self.controller.start_manual(1, MONDAY)
+        self.assertFalse(self.controller.pump_on)
+        self.controller.start_manual(0, MONDAY)
+        self.assertTrue(self.controller.pump_on)
+        self.controller.stop(0, MONDAY)
+        self.assertFalse(self.controller.pump_on)
+        self.assertTrue(self.backend.states[1])
+
+    def test_changing_exclusion_updates_pump_without_interrupting_run(self) -> None:
+        self.controller.start_manual(0, MONDAY)
+        run = self.controller.runs[0]
+        self.zones[0] = replace(self.zones[0], pump_exempt=True)
+        self.controller.apply(self.zones, MONDAY)
+        self.assertFalse(self.controller.pump_on)
+        self.assertIs(self.controller.runs[0], run)
+        self.zones[0] = replace(self.zones[0], pump_exempt=False)
+        self.controller.apply(self.zones, MONDAY)
+        self.assertTrue(self.controller.pump_on)
+        self.assertIs(self.controller.runs[0], run)
+
+    def test_exempt_routine_and_rain_pause_are_independent(self) -> None:
+        self.zones[0] = Zone(
+            "Independent", True, schedule_for((0,)),
+            rain_pause_exempt=True, pump_exempt=True,
+        )
+        self.controller.apply(self.zones, MONDAY)
+        self.assertIn(0, self.controller.runs)
+        self.assertFalse(self.controller.pump_on)
+        self.controller.set_rain_pause(True, MONDAY)
+        self.assertIn(0, self.controller.runs)
+        self.assertFalse(self.controller.pump_on)
+
+    def test_pump_exclusion_change_failure_shuts_down_and_latches_closed(self) -> None:
+        self.controller.start_manual(0, MONDAY)
+        self.zones[0] = replace(self.zones[0], pump_exempt=True)
+
+        def fail_pump_off(channel: int, energized: bool) -> None:
+            if channel == 7:
+                raise OSError("Pump failed")
+            self.backend.states[channel] = energized
+
+        self.write.side_effect = fail_pump_off
+        with self.assertRaises(ExceptionGroup):
+            self.controller.apply(self.zones, MONDAY)
+        self.assertTrue(self.controller.closed)
+        self.assertFalse(self.backend.states[0])
+
     def setUp(self) -> None:
         self.zones = default_zones()
         self.backend = FakeRelays()

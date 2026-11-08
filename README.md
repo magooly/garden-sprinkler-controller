@@ -1,10 +1,11 @@
 # Garden Sprinkler Controller
 
 A dark-mode CustomTkinter desktop app for seven independently named sprinkler
-zones plus a channel 8 master pump, connected directly to the
-**Waveshare Modbus POE ETH Relay (B)**.
+zones plus a channel 8 master pump, with an optional second eight-channel
+**Waveshare Modbus POE ETH Relay (B)** for independent channels 9-16.
 The headless controller runs as a Linux user service, including while logged
 out. The desktop app connects locally to that service; it never owns the relays.
+An optional phone web interface can be reached privately over Tailscale.
 
 ## Setup and launch
 
@@ -73,6 +74,121 @@ are validated and written using atomic replacement. Missing settings start with
 eight disabled routines. Invalid existing settings produce an error and are
 never silently overwritten.
 
+## Optional phone control over Tailscale
+
+The optional phone interface lets you check channel status, start a manual
+10-minute run, stop an active channel, or stop all watering from a mobile
+browser. It does not replace the background controller. The web server talks
+to that controller over its existing private local socket and binds only to
+`127.0.0.1`; it cannot be opened directly to the LAN or internet.
+
+Install and sign in to Tailscale on the controller PC and Android phone using
+your tailnet account. Tailscale Serve requires HTTPS certificates to be enabled
+for the tailnet; its first-use flow can prompt you to enable them. Keep the
+tailnet access policy restricted to people and devices you trust.
+
+From the project folder, create the additional web password and start the
+optional user service:
+
+```sh
+mkdir -p ~/.config/garden-sprinkler-controller ~/.config/systemd/user
+chmod 700 ~/.config/garden-sprinkler-controller
+python3 -c 'import secrets; print(secrets.token_urlsafe(36))' > ~/.config/garden-sprinkler-controller/phone-password
+chmod 600 ~/.config/garden-sprinkler-controller/phone-password
+cat ~/.config/garden-sprinkler-controller/phone-password
+cp garden-sprinkler-phone.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now garden-sprinkler-phone.service
+```
+
+The password file must be owned by your account, have mode `0600`, and contain
+at least 4 characters. A long generated password is recommended; a short PIN
+is easier to guess and should only be used with trusted Tailscale devices.
+After five incorrect attempts within five minutes, new sign-ins are blocked
+until the failed attempts age out of that window. This limit is shared across
+all phones; already signed-in sessions continue to work.
+The `cat` command prints the generated password so you
+can save it in a password manager and enter it on the phone; keep it private.
+The web interface also requires this password even when accessed from the
+tailnet.
+
+To change it, edit `~/.config/garden-sprinkler-controller/phone-password`,
+keep its permissions at `0600`, and run
+`systemctl --user restart garden-sprinkler-phone.service`. This signs out
+existing phone sessions without restarting the sprinkler controller.
+
+Publish the loopback-only web server to your tailnet with Tailscale Serve:
+
+```sh
+tailscale serve --bg 8765
+tailscale serve status
+```
+
+Use the HTTPS `https://<computer>.<tailnet>.ts.net` URL shown by the status
+command in Chrome on the Android phone, with Tailscale connected. The browser
+will ask for the phone-control password. Tailscale Serve is tailnet-only; do
+not use Tailscale Funnel or configure router port forwarding for this service.
+
+Manual runs retain the controller's existing 10-minute limit. Channel 8's
+master pump remains automatic and cannot be manually switched independently.
+The phone interface is unavailable when the PC or its Tailscale connection is
+offline, but this does not stop the sprinkler controller or its schedules.
+To disable phone access, run `tailscale serve reset` and then
+`systemctl --user disable --now garden-sprinkler-phone.service`.
+
+## Optional second relay board (channels 9-16)
+
+The desktop's **Channels 1-8 / Channels 9-16** selector switches between banks.
+Without a second board configured, channels 9-16 are labelled **Board 2 not
+configured** and cannot be run or edited. No second-board network requests are
+sent, and the original board continues operating normally.
+
+To enable them, give a second compatible eight-channel board its own IP address,
+check it read-only with `.venv/bin/python waveshare_relay.py --host 192.168.0.100`
+(replace this example IP with the actual address), then run:
+
+```sh
+systemctl --user edit garden-sprinkler.service
+```
+
+Add an override, retaining any existing primary-board/configuration arguments:
+
+```ini
+[Service]
+ExecStart=
+ExecStart=%h/Documents/garden-sprinkler-controller/.venv/bin/python %h/Documents/garden-sprinkler-controller/service.py --second-host 192.168.0.100
+TimeoutStopSec=60
+```
+
+Optional arguments are `--second-port` (4196), `--second-slave-id` (1), and
+`--second-timeout` (1 second). Defaults are independent of the primary board's
+options. Then restart the service and reopen the desktop:
+
+```sh
+systemctl --user daemon-reload
+systemctl --user restart garden-sprinkler.service
+systemctl --user status garden-sprinkler.service --no-pager
+```
+
+App channels 9-16 map to physical relays 1-8 on the second board. They support
+names, schedules, autosave, manual operation, and Rain Pause exemptions just
+like other zones, but **never operate channel 8's master pump**. Channel 8 serves
+only zones 1-7. Daily and weekly overviews include configured second-board channels.
+New second-board schedules start disabled. Settings for either board count
+are saved in version 7, including per-zone master pump exclusions.
+
+To disable the second board, stop the service while it is still reachable
+(so its outputs can be switched OFF), remove its `--second-*` arguments, and
+restart. Stored names and schedules for channels 9-16 are preserved but ignored
+until configured again. Restoring the second board can immediately resume its
+active saved schedules. Removing configuration does not switch off an unreachable
+or disconnected board.
+
+A configured board failure is **not** treated as an absent optional board:
+the existing fail-safe policy stops scheduling and attempts OFF on both boards.
+Check the hardware and logs before restarting. Device ownership locks cover
+both endpoints, preventing another service instance from owning either board.
+
 ## Your Waveshare relay
 
 The supplied device-settings screenshot confirms:
@@ -119,9 +235,9 @@ Open the service-connected desktop:
 ```
 
 The service connects to `192.168.0.99`, port `4196`, slave ID `1`. Service startup
-sends OFF commands to all eight relays and verifies each state, then starts any
-saved routines that are scheduled now, unless Rain Pause is enabled. A routine
-can therefore energize a valve immediately on service start when not paused.
+sends OFF commands to all configured relays and verifies each state, then starts any
+saved routines that are scheduled now, except zones included in Rain Pause.
+Exempt zones can therefore energize a valve immediately on service start.
 The **Read Relay Status** button queries and displays the
 current physical states through the service without changing them.
 
@@ -152,7 +268,7 @@ The app shows the service fault. Output state is labelled
 unknown when a fault occurs.
 STOP ALL remains available to retry OFF commands. Requests are synchronous:
 the GUI may pause during network operations; a failed all-channel OFF sequence
-can take up to eight transaction timeouts, plus connection overhead. A successful
+can take up to sixteen transaction timeouts with two boards, plus connection overhead. A successful
 write also requires a separate readback transaction.
 
 ## Using the controller
@@ -182,7 +298,8 @@ write also requires a separate readback transaction.
   heights, scroll the configuration panel to reach lower fields;
   the watering controls and Rain Pause remain visible outside that panel.
 - Select each garden zone (1-7) on the left, edit its **Relay / Garden Name** at the
-  top of the settings panel (up to 40 characters), then press **Save Settings**.
+  top of the settings panel (up to 40 characters); valid changes save automatically
+  about one second after you stop editing.
   The custom name appears beside that relay in the left-hand list and is saved
   separately for each relay.
 - Enable its routine, then set up to **four independent watering windows for
@@ -196,7 +313,8 @@ write also requires a separate readback transaction.
   enter them in any order, but do not overlap windows within one zone. Windows
   cannot cross midnight. Click a **Start** heading to pause or resume that
   numbered window for the selected zone across all weekdays; the smaller
-  **Paused** marker appears below paused headings. Changes take effect when saved.
+  **Paused** marker appears below paused headings. Valid changes save automatically
+  about one second after you stop editing.
   Red borders identify the time fields for overlapping windows. Clicking a
   conflicting Stop field opens an acknowledgment popup with the conflicting groups.
   Enabled routines need at least
@@ -204,24 +322,55 @@ write also requires a separate readback transaction.
 - To reuse a day's schedule, choose that weekday in the menu above the schedule
   and check **Copy selected day's times to all days**. This copies all four windows
   once; each day remains independently editable afterward.
-- Older version 1, 2 and 3 settings are migrated in memory, preserving existing
+- Older version 1, 2, 3 and 4 settings are migrated in memory, preserving existing
   weekdays and times in their original windows and leaving new windows blank.
-  The upgraded version 4 settings are written on the next save.
-- Validation updates while typing. **Save Settings** saves and applies **all
-  seven garden zones and the preserved channel 8 settings**.
-  Unsaved edits survive switching between zones but do not alter
-  the running schedule. Closing prompts to save or discard them.
+  Existing zones remain included in Rain Pause. Version 5 and 6 settings also
+  load without losing either board's configuration. Master pump participation
+  is unchanged by migration; version 7 is written on the next save.
+- Validation updates while typing. Valid edits are saved and applied
+  automatically about one second after you stop editing, across **all stored zones
+  and the preserved channel 8 settings**. Incomplete or invalid settings are
+  not saved; fix the validation issue to resume autosaving. The **Save Settings**
+  button remains available to save immediately. Closing prompts to save or
+  discard any remaining unsaved changes.
+- **Timetables** saves and loads named schedule profiles, such as **Summer** and
+  **Winter**. Choose **Save current as...**, enter a name (1-40 characters), and
+  confirm before replacing an existing profile. Valid pending edits are saved
+  first; invalid edits must be fixed before saving or loading a profile.
+  Profiles contain every stored channel's weekday times, routine enabled state,
+  and paused-window flags. They do **not** change zone names, relay/board
+  configuration, Rain Pause or pump exclusions, or global Rain Pause.
+  Select a profile and choose **Load selected timetable**. After confirmation,
+  settings are saved and applied immediately: scheduled relays may start or
+  stop, but existing manual/test runs retain their timers. The current timetable
+  is saved automatically as **Before last load**; loading that recovery profile
+  swaps it with the current timetable, allowing you to undo the load.
+  The Timetable button, footer, and dialog show the selected profile and **modified** when its
+  timetable has changed. Long names are shortened on the button; the dialog
+  shows the full name. Normal autosave does not overwrite named profiles;
+  save under the same name explicitly to update one. Profiles require the same
+  **stored** channel count (8 or 16) as the current settings. Preserved channel 8
+  schedules and unconfigured second-board schedules are included but remain
+  inactive. Switching seasons is manual, not automatic.
+  Profiles are stored beside the settings file as
+  `settings.json.timetables.json`; include it with the settings and Rain Pause
+  files when backing up or moving computers. A missing file means no profiles;
+  a corrupt file prevents startup rather than silently discarding profiles.
 - Red indicates a commanded/confirmed energized relay, bright green an enabled
   schedule that is active at the current time, and grey no current watering
-  window. Sidebar status uses the
-  **saved/applied** routine, not unsaved edits.
+  window. Sidebar status uses the **saved/applied** routine.
 - **RUN ZONE** waters the selected zone for up to **10 minutes**, regardless
-  of whether a routine is enabled, unless Rain Pause is on. Its button becomes
-  **STOP THIS ZONE** whenever that zone is watering.
-- **RAIN PAUSE** in the left sidebar immediately sends OFF to all eight relays
-  and blocks scheduled and manual watering until switched off. It saves
-  automatically, independently of unsaved schedule edits, and survives restart.
-  Schedules remain unchanged. Turning it off asks for confirmation: a currently
+  of whether a routine is enabled. During Rain Pause it can run only for zones
+  marked with an **X** in the left sidebar. Its button becomes **STOP THIS ZONE**
+  whenever that zone is watering.
+- **RAIN PAUSE** in the left sidebar stops scheduled and manual watering for
+  included zones. Click **+** beside a zone number to exempt that zone; an **X**
+  marks an exempt zone and turns red while Rain Pause is on. Exempt zones keep
+  their schedules and can be watered manually during Rain Pause. Click **X**
+  again to include a zone. Zone exemptions save automatically with other valid
+  settings. Rain Pause itself saves immediately; pending valid edits are saved
+  first, and invalid edits must be fixed before enabling Rain Pause. Pause state
+  survives restart. Turning it off asks for confirmation: a currently
   active saved routine may start immediately for its remaining time. Previous
   STOP THIS ZONE/STOP ALL suppression still applies; an interrupted manual
   run does not restart.
@@ -232,9 +381,10 @@ write also requires a separate readback transaction.
   a save or relay failure displays an error and stops scheduling.
 - **STOP THIS ZONE** and **STOP ALL** act immediately and suppress the currently
   active automatic watering window(s) until they end. Later scheduled windows
-  that day are unaffected. Another manual run can still be started.
+  that day are unaffected. Another manual run can still be started, unless
+  Rain Pause is on for that zone.
   Suppression is not persisted: restarting the service or PC during a saved
-  window starts that routine again unless Rain Pause is enabled. Closing or
+  window starts that routine again unless Rain Pause is enabled for that zone. Closing or
   reopening the desktop does not clear suppression.
 - A manual watering run replaces that zone's current scheduled run; when the
   timed override ends, the routine does not resume in the same window.
@@ -244,14 +394,26 @@ write also requires a separate readback transaction.
 ## Channel 8 master pump
 
 Channel 8 is labelled **Master Pump**. It automatically switches ON whenever
-any garden zone (1-7) is running, whether scheduled or manually. It has
+any non-excluded garden zone (1-7) is running, whether scheduled or manually. It has
 no independent schedule or watering control. Its red sidebar dot indicates
 the commanded/confirmed pump ON state.
 
+Beside each zone's Rain Pause control is a separate **P** pump control.
+For channels 1-7, click it to switch between **P** (uses the pump) and
+**P-** (excluded from the pump). A saved exclusion is highlighted amber.
+This setting autosaves independently of the Rain Pause exclusion: an excluded
+zone still runs its schedule and manual watering, but does not start or keep
+the pump running. If another non-excluded zone is running, the pump stays on.
+Changing only the pump exclusion during a run updates pump demand without
+restarting or cancelling the zone. Channel 8 and channels 9-16 have no pump
+exclusion control; channels 9-16 are already independent of the pump.
+
 The app opens the first zone valve before starting the pump. The pump stays ON
-while other zones are running and stops before the last valve closes. Startup,
-STOP ALL, Rain Pause, fault shutdown, and normal app closure attempt pump OFF
-first, then all seven valves. There are no added valve-travel or pump delays;
+while non-excluded zones on channels 1-7 are running and stops before their last valve closes.
+Startup, STOP ALL, fault shutdown, and normal service shutdown attempt pump OFF
+first, then all configured relays. Rain Pause keeps the pump on only when an
+Rain Pause-exempt, pump-using zone on channels 1-7 is running.
+There are no added valve-travel or pump delays;
 command order is not proof that a physical valve has finished moving.
 Failed ON commands trigger an all-output OFF attempt and stop scheduling.
 Communication failures can prevent OFF commands from reaching the device.
@@ -282,10 +444,10 @@ deadline, whichever occurs first. Manual/test durations use a monotonic clock.
 This prevents a backwards wall-clock adjustment from extending an active run.
 Clock changes and daylight-saving transitions can shorten or skip watering; this
 is not a timezone-aware scheduling service. Multiple zones may run simultaneously;
-the master pump follows their combined demand. There is no sequential queuing
+the master pump follows the combined demand of channels 1-7 only. There is no sequential queuing
 or flow/pressure monitoring.
 
-Normal service shutdown sends OFF to all eight outputs. Closing the desktop
+Normal service shutdown sends OFF to all configured outputs. Closing the desktop
 leaves watering running. A killed service process, network
 failure, sleeping computer, or frozen event loop cannot guarantee shutdown.
 **Timers are software-only; they do not program a hardware auto-off or watchdog.**

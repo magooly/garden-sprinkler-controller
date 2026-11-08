@@ -2,6 +2,7 @@
 
 import os
 import tempfile
+import time
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -16,7 +17,7 @@ from controller import (
 from test_controller import schedule_for
 from waveshare_relay import WaveshareRelays
 from service_client import ServiceClient
-from test_service import RunningService
+from test_service import FakeDevice, RunningService
 
 
 @unittest.skipUnless(os.environ.get("DISPLAY"), "Requires a graphical display")
@@ -41,6 +42,7 @@ class RainPauseGuiTests(unittest.TestCase):
         self.time = self.enterContext(patch("app.datetime"))
         self.time.now.return_value = datetime(2026, 10, 26, 6, 0)
         self.app = SprinklerApp(self.path, WaveshareRelays())
+        self.app.AUTOSAVE_DELAY_MS = 60_000
         self.addCleanup(self.close_app)
 
     def close_app(self) -> None:
@@ -91,6 +93,10 @@ class RainPauseGuiTests(unittest.TestCase):
             self.assertEqual(len(weekly.cells), 14)
             self.app.show_weekly_overview()
             self.assertIs(self.app.weekly_overview, weekly)
+            with patch("app.messagebox.showerror"):
+                self.pause()
+            self.assertFalse(self.app.controller.rain_paused)
+            self.app.fields[1].schedule[0][1].set("0630")
             self.pause()
             self.assertIn("RAIN PAUSE", weekly.summary.cget("text"))
         finally:
@@ -144,12 +150,12 @@ class RainPauseGuiTests(unittest.TestCase):
         self.pause()
         self.assertEqual(self.app.zone_dots[0].cget("text_color"), GREY)
 
-    def test_pause_disables_controls_and_preserves_unsaved_edits(self) -> None:
+    def test_pause_saves_pending_edits_before_changing_pause_state(self) -> None:
         self.app.fields[0].name.set("Unsaved name")
         self.pause()
         self.assertTrue(load_rain_pause(self.path))
-        self.assertTrue(self.app.dirty)
-        self.assertEqual(load_zones(self.path)[0].name, "Lawn")
+        self.assertFalse(self.app.dirty)
+        self.assertEqual(load_zones(self.path)[0].name, "Unsaved name")
         self.assertFalse(self.app.controller.runs)
         self.assertEqual(self.app.manual_button.cget("state"), "disabled")
         self.assertIn("RAIN PAUSE", self.app.system_status.cget("text"))
@@ -161,6 +167,212 @@ class RainPauseGuiTests(unittest.TestCase):
         self.assertTrue(self.app.save())
         self.assertTrue(load_rain_pause(self.path))
         self.assertFalse(self.app.controller.runs)
+
+    def test_valid_changes_are_debounced_and_autosaved(self) -> None:
+        self.app.AUTOSAVE_DELAY_MS = 20
+        self.app.fields[1].name.set("Auto-saved zone")
+        self.assertTrue(self.app.dirty)
+        self.assertIsNotNone(self.app.autosave_timer)
+        deadline = time.monotonic() + 2
+        while self.app.dirty and time.monotonic() < deadline:
+            self.app.update()
+            time.sleep(0.01)
+        self.assertFalse(self.app.dirty)
+        self.assertEqual(load_zones(self.path)[1].name, "Auto-saved zone")
+        self.assertIn("Auto-saved", self.app.system_status.cget("text"))
+
+    def test_second_bank_is_disabled_until_a_second_board_is_configured(self) -> None:
+        self.app.board_selector.set("Channels 9-16")
+        self.app.show_board("Channels 9-16")
+        self.app.update()
+        for channel in range(8, 16):
+            self.assertEqual(self.app.zone_buttons[channel].cget("state"), "disabled")
+            self.assertIn("not configured", self.app.zone_buttons[channel].cget("text"))
+            self.assertEqual(self.app.rain_pause_exempt_buttons[channel].cget("state"), "disabled")
+        self.assertNotEqual(self.app.zone_buttons[0].cget("state"), "disabled")
+        self.app.select_zone(8)
+        self.assertEqual(self.app.selected, 0)
+
+    def test_second_board_desktop_save_manual_and_overviews(self) -> None:
+        secondary = FakeDevice()
+        secondary.host = "192.0.2.2"
+        with tempfile.TemporaryDirectory() as directory, RunningService(Path(directory), secondary) as running:
+            other = SprinklerApp(running.config, ServiceClient(running.path))
+            try:
+                other.select_zone(15)
+                self.assertEqual(other.selected, 15)
+                self.assertEqual(other.board_selector.get(), "Channels 9-16")
+                other.fields[15].name.set("Second board end")
+                self.assertTrue(other.save())
+                self.assertEqual(load_zones(running.config)[15].name, "Second board end")
+                other.manual()
+                self.assertTrue(secondary.states[7])
+                self.assertFalse(running.device.states[7])
+                other.show_weekly_overview()
+                self.assertEqual(len(other.weekly_overview.cells), 105)
+            finally:
+                other.dirty = False
+                other.on_close()
+
+    def test_invalid_changes_are_not_autosaved(self) -> None:
+        original = load_zones(self.path)
+        self.app.fields[0].schedule[0][0].set("")
+        self.assertTrue(self.app.dirty)
+        self.assertIsNone(self.app.autosave_timer)
+        time.sleep(0.05)
+        self.app.update()
+        self.assertTrue(self.app.dirty)
+        self.assertEqual(load_zones(self.path), original)
+        self.assertIn("invalid settings not saved", self.app.system_status.cget("text"))
+
+    def test_profiles_save_load_confirm_and_restore_previous_timetable(self) -> None:
+        self.assertTrue(self.app.save_profile("Summer"))
+        self.app.fields[0].enabled.set(False)
+        self.assertTrue(self.app.save())
+        self.assertIn("Summer (modified)", self.app.system_status.cget("text"))
+        self.assertTrue(self.app.save_profile("Winter"))
+        with patch("app.messagebox.askyesno", return_value=False):
+            self.assertFalse(self.app.load_profile("Summer"))
+        self.assertFalse(self.app.controller.zones[0].enabled)
+        with patch("app.messagebox.askyesno", return_value=True):
+            self.assertTrue(self.app.load_profile("Summer"))
+        self.assertTrue(self.app.fields[0].enabled.get())
+        self.assertTrue(load_zones(self.path)[0].enabled)
+        self.assertFalse(self.app.dirty)
+        with patch("app.messagebox.askyesno", return_value=True):
+            self.assertTrue(self.app.load_profile("Before last load"))
+        self.assertFalse(self.app.fields[0].enabled.get())
+
+    def test_service_profiles_load_and_sync_all_schedule_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, RunningService(Path(directory)) as running:
+            other = SprinklerApp(running.config, ServiceClient(running.path))
+            try:
+                self.assertTrue(other.save_profile("Winter"))
+                other.fields[0].enabled.set(True)
+                other.fields[0].schedule[0][0].set("0600")
+                other.fields[0].schedule[0][1].set("0620")
+                other.fields[0].paused_windows[1].set(True)
+                other.fields[0].rain_pause_exempt.set(True)
+                other.fields[0].pump_exempt.set(True)
+                self.assertTrue(other.save_profile("Summer"))
+                with patch("app.messagebox.askyesno", return_value=True):
+                    self.assertTrue(other.load_profile("Winter"))
+                self.assertFalse(other.fields[0].enabled.get())
+                self.assertEqual(other.fields[0].schedule[0][0].get(), "")
+                self.assertFalse(other.fields[0].paused_windows[1].get())
+                self.assertTrue(other.fields[0].rain_pause_exempt.get())
+                self.assertTrue(other.fields[0].pump_exempt.get())
+                self.assertEqual(ServiceClient(running.path).timetables["selected"], "Winter")
+            finally:
+                other.dirty = False
+                other.on_close()
+
+    def test_profile_autosave_preserves_named_snapshot_and_ignores_name_edits(self) -> None:
+        self.app.AUTOSAVE_DELAY_MS = 20
+        self.assertTrue(self.app.save_profile("Summer"))
+        self.app.fields[0].name.set("Renamed")
+        self.app.fields[0].pump_exempt.set(True)
+        self.assertFalse(self.app.timetable_status()["modified"])
+        self.app.fields[0].enabled.set(False)
+        self.assertTrue(self.app.timetable_status()["modified"])
+        time.sleep(0.03)
+        self.app.update()
+        self.assertFalse(self.app.dirty)
+        with patch("app.messagebox.askyesno", return_value=True):
+            self.assertTrue(self.app.load_profile("Summer"))
+        self.assertTrue(self.app.fields[0].enabled.get())
+        self.assertEqual(self.app.fields[0].name.get(), "Renamed")
+        self.assertTrue(self.app.fields[0].pump_exempt.get())
+
+    def test_invalid_profile_actions_and_cancelled_overwrite_do_not_save_edits(self) -> None:
+        self.assertTrue(self.app.save_profile("Summer"))
+        self.app.fields[0].name.set("Pending")
+        with patch("app.messagebox.showerror") as error:
+            for name in (" ", "x" * 41, "Before last load"):
+                self.assertFalse(self.app.save_profile(name))
+            self.assertEqual(error.call_count, 3)
+        with patch("app.messagebox.askyesno", return_value=False):
+            self.assertFalse(self.app.save_profile("Summer"))
+        self.assertEqual(load_zones(self.path)[0].name, "Lawn")
+        self.app.fields[0].schedule[0][1].set("")
+        with patch("app.messagebox.showerror"), patch("app.messagebox.askyesno", return_value=True):
+            self.assertFalse(self.app.save_profile("Winter"))
+            self.assertFalse(self.app.load_profile("Summer"))
+        self.assertEqual(self.app.timetable_status()["names"], ["Summer"])
+
+    def test_profile_dialog_reuses_window_and_refreshes_pending_changes(self) -> None:
+        self.assertTrue(self.app.save_profile("Summer"))
+        self.app.show_profiles()
+        window = self.app.profile_window
+        self.app.show_profiles()
+        self.assertIs(self.app.profile_window, window)
+        self.app.fields[0].enabled.set(False)
+        labels = [widget for widget in window.winfo_children() if isinstance(widget, ctk.CTkLabel)]
+        self.assertIn("Selected: Summer (modified)", [label.cget("text") for label in labels])
+        window.destroy()
+        self.app._refresh()
+
+    def test_timetable_button_displays_selection_and_modified_state(self) -> None:
+        button = self.app.profiles_button
+        self.assertEqual(button.cget("text"), "Timetables")
+        self.assertTrue(self.app.save_profile("Summer"))
+        self.assertEqual(button.cget("text"), "Timetable: Summer")
+        self.app.fields[0].name.set("Renamed")
+        self.assertEqual(button.cget("text"), "Timetable: Summer")
+        self.app.fields[0].enabled.set(False)
+        self.assertEqual(button.cget("text"), "Timetable: Summer (modified)")
+        self.assertTrue(self.app.save())
+        self.assertEqual(button.cget("text"), "Timetable: Summer (modified)")
+        with patch("app.messagebox.askyesno", return_value=True):
+            self.assertTrue(self.app.load_profile("Summer"))
+        self.assertEqual(button.cget("text"), "Timetable: Summer")
+        self.assertTrue(self.app.save_profile("A very long timetable name"))
+        self.app.fields[0].enabled.set(False)
+        self.assertEqual(button.cget("text"), "Timetable: A very long t... (modified)")
+        self.app.geometry("940x620")
+        self.app.update()
+        self.assertLessEqual(
+            button.winfo_rootx() + button.winfo_width(),
+            button.master.winfo_rootx() + button.master.winfo_width(),
+        )
+        self.app.show_profiles()
+        labels = [
+            widget.cget("text") for widget in self.app.profile_window.winfo_children()
+            if isinstance(widget, ctk.CTkLabel)
+        ]
+        self.assertIn("Selected: A very long timetable name (modified)", labels)
+        self.app.profile_window.destroy()
+
+    def test_pump_exclusion_autosaves_without_stopping_zone(self) -> None:
+        self.app.AUTOSAVE_DELAY_MS = 20
+        control = self.app.pump_exempt_buttons[0]
+        self.assertEqual(control.cget("text"), "P")
+        control.invoke()
+        deadline = time.monotonic() + 2
+        while self.app.dirty and time.monotonic() < deadline:
+            self.app.update()
+            time.sleep(0.01)
+        self.assertFalse(self.app.dirty)
+        self.assertTrue(load_zones(self.path)[0].pump_exempt)
+        self.assertEqual(control.cget("text"), "P-")
+        self.assertIn(0, self.app.controller.runs)
+        self.assertFalse(self.app.controller.pump_on)
+        self.assertFalse(self.app.fields[0].rain_pause_exempt.get())
+        self.assertEqual(self.app.pump_exempt_buttons[7].cget("state"), "disabled")
+
+    def test_exempt_zone_control_saves_and_marks_the_zone_red_during_pause(self) -> None:
+        control = self.app.rain_pause_exempt_buttons[0]
+        self.assertEqual(control.cget("text"), "+")
+        control.invoke()
+        self.assertTrue(self.app.fields[0].rain_pause_exempt.get())
+        self.assertEqual(control.cget("text"), "X")
+        self.assertTrue(self.app.dirty)
+        self.assertTrue(self.app.save())
+        self.pause()
+        self.assertEqual(control.cget("text"), "X")
+        self.assertEqual(control.cget("text_color"), RUNNING_RED)
+        self.assertIn(0, self.app.controller.runs)
+        self.assertEqual(self.app.manual_button.cget("state"), "normal")
 
     def test_start_header_pauses_and_saves_that_window_number(self) -> None:
         times = next(
@@ -374,8 +586,10 @@ class RainPauseGuiTests(unittest.TestCase):
                     self.app.manual_button,
                     self.app.stop_all_button, self.app.save_button,
                     self.app.overview_button,
-                    self.app.weekly_button,
-                    self.app.rain_pause_switch, *self.app.zone_buttons,
+                    self.app.weekly_button, self.app.profiles_button,
+                    self.app.rain_pause_switch, *self.app.zone_buttons[:8],
+                    *self.app.rain_pause_exempt_buttons[:8],
+                    *self.app.pump_exempt_buttons[:8], self.app.board_selector,
                 ):
                     self.assertGreaterEqual(widget.winfo_rooty(), self.app.winfo_rooty())
                     self.assertLessEqual(

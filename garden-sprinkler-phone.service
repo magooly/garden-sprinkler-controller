@@ -1,0 +1,20 @@
+[Unit]
+Description=Garden sprinkler phone control web interface
+After=garden-sprinkler.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Documents/garden-sprinkler-controller
+ExecStart=%h/Documents/garden-sprinkler-controller/.venv/bin/python %h/Documents/garden-sprinkler-controller/phone_server.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=default.target

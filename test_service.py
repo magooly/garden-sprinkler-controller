@@ -39,17 +39,18 @@ class FakeDevice(WaveshareRelays):
 
 
 class RunningService(AbstractContextManager):
-    def __init__(self, directory: Path) -> None:
+    def __init__(self, directory: Path, secondary: FakeDevice | None = None) -> None:
         self.config = directory / "settings.json"
         self.path = directory / "control.sock"
         self.device = FakeDevice()
+        self.secondary = secondary
         self.stop = threading.Event()
         self.errors: list[Exception] = []
 
     def __enter__(self) -> "RunningService":
         def run() -> None:
             try:
-                serve(self.config, self.device, self.path, self.stop)
+                serve(self.config, self.device, self.path, self.stop, self.secondary)
             except Exception as error:
                 # Surface every background-thread failure in the owning test.
                 self.errors.append(error)
@@ -97,6 +98,174 @@ class ServiceTests(unittest.TestCase):
         self.service.dispatch({"command": "rain_pause", "paused": True})
         self.assertFalse(any(self.device.states))
 
+    def test_profiles_preserve_rain_pause_and_reject_stale_loads(self) -> None:
+        self.service.dispatch({
+            "command": "profile_save", "name": "Summer", "revision": self.service.revision,
+        })
+        winter = list(self.zones)
+        winter[0] = Zone("Renamed", rain_pause_exempt=True, pump_exempt=True)
+        self.service.dispatch({
+            "command": "save", "settings": encode_zones(winter), "revision": self.service.revision,
+        })
+        stale = self.service.revision
+        result = self.service.dispatch({
+            "command": "profile_load", "name": "Summer", "revision": stale,
+        })
+        zone = self.service.controller.zones[0]
+        self.assertTrue(result["rain_paused"])
+        self.assertEqual(zone.name, "Renamed")
+        self.assertTrue(zone.pump_exempt)
+        self.assertTrue(zone.rain_pause_exempt)
+        self.assertTrue(zone.enabled)
+        self.assertTrue(self.device.states[0])
+        self.assertFalse(self.device.states[7])
+        with self.assertRaisesRegex(ValueError, "another app"):
+            self.service.dispatch({
+                "command": "profile_load", "name": "Before last load", "revision": stale,
+            })
+        self.assertIn("Before last load", result["timetables"]["names"])
+
+    def test_second_board_routes_all_channels_without_operating_the_pump(self) -> None:
+        secondary = FakeDevice()
+        secondary.host = "192.0.2.2"
+        service = Service(self.path, self.device, secondary)
+        service.dispatch({"command": "rain_pause", "paused": False})
+        service.dispatch({"command": "stop_all"})
+        for channel in range(8, 16):
+            service.dispatch({"command": "manual", "channel": channel})
+            self.assertTrue(secondary.states[channel - 8])
+            self.assertFalse(self.device.states[7])
+        service.dispatch({"command": "manual", "channel": 1})
+        self.assertTrue(self.device.states[7])
+        service.dispatch({"command": "stop", "channel": 1})
+        self.assertFalse(self.device.states[7])
+        self.assertTrue(all(secondary.states))
+        service.dispatch({"command": "stop_all"})
+        self.assertFalse(any(secondary.states))
+        self.assertEqual(service.status()["channel_count"], 16)
+
+    def test_profile_load_stops_routine_but_preserves_manual_run(self) -> None:
+        self.service.dispatch({
+            "command": "profile_save", "name": "Summer", "revision": self.service.revision,
+        })
+        self.service.dispatch({
+            "command": "save", "settings": encode_zones(default_zones()),
+            "revision": self.service.revision,
+        })
+        self.service.dispatch({
+            "command": "profile_save", "name": "Winter", "revision": self.service.revision,
+        })
+        self.service.dispatch({"command": "rain_pause", "paused": False})
+        self.service.dispatch({"command": "manual", "channel": 1})
+        manual = self.service.controller.runs[1]
+        for name, on in (("Summer", True), ("Winter", False)):
+            self.service.dispatch({
+                "command": "profile_load", "name": name, "revision": self.service.revision,
+            })
+            self.assertEqual(self.device.states[0], on)
+            self.assertIs(self.service.controller.runs[1], manual)
+            self.assertTrue(self.device.states[1])
+
+    def test_corrupt_profiles_prevent_startup_before_hardware_writes(self) -> None:
+        self.service.timetables.path.write_text("{invalid")
+        device = FakeDevice()
+        with self.assertRaises(ValueError):
+            Service(self.path, device)
+        self.assertEqual(device.calls, [])
+
+    def test_failed_profile_load_reports_fault_and_retains_recovery(self) -> None:
+        self.service.dispatch({
+            "command": "profile_save", "name": "Summer", "revision": self.service.revision,
+        })
+        winter = default_zones()
+        self.service.dispatch({
+            "command": "save", "settings": encode_zones(winter), "revision": self.service.revision,
+        })
+        with patch("service.save_zones", side_effect=OSError("Disk full")):
+            result = self.service.dispatch({
+                "command": "profile_load", "name": "Summer", "revision": self.service.revision,
+            })
+        self.assertIn("Disk full", result["fault"])
+        self.assertTrue(self.service.controller.closed)
+        self.assertFalse(any(self.device.states))
+        self.assertEqual(load_zones(self.path), winter)
+        self.assertTrue(result["timetables"]["modified"])
+        self.assertEqual(self.service.timetables.load("Before last load", winter), winter)
+
+    def test_removing_second_board_preserves_settings_but_blocks_its_outputs(self) -> None:
+        zones = default_zones(16)
+        zones[8] = Zone("Second", True, self.zones[0].schedule, rain_pause_exempt=True)
+        save_zones(self.path, zones)
+        service = Service(self.path, self.device)
+        service.tick()
+        self.assertEqual(service.status()["channel_count"], 8)
+        self.assertNotIn(8, service.controller.runs)
+        self.assertEqual(load_zones(self.path), zones)
+        with self.assertRaisesRegex(ValueError, "not configured"):
+            service.dispatch({"command": "manual", "channel": 8})
+        self.assertFalse(service.fault)
+
+    def test_second_board_settings_round_trip_and_manual_deadline(self) -> None:
+        secondary = FakeDevice()
+        secondary.host = "192.0.2.2"
+        service = Service(self.path, self.device, secondary)
+        zones = list(service.controller.zones)
+        zones[15] = Zone("Independent", rain_pause_exempt=True)
+        service.dispatch({
+            "command": "save", "revision": service.revision,
+            "settings": encode_zones(zones),
+        })
+        self.assertEqual(encode_zones(load_zones(self.path))["version"], 7)
+        service.dispatch({"command": "manual", "channel": 15})
+        self.assertTrue(secondary.states[7])
+        deadline = service.controller.runs[15].deadline
+        service.controller.clock = lambda: deadline
+        service.tick()
+        self.assertFalse(secondary.states[7])
+        self.assertNotIn(15, service.controller.runs)
+        self.assertFalse(self.device.states[7])
+        service.controller.close(datetime.now())
+        restarted = Service(self.path, self.device, secondary)
+        self.assertEqual(restarted.controller.zones, zones)
+
+    def test_second_board_schedules_rain_pause_and_failure_shutdown(self) -> None:
+        secondary = FakeDevice()
+        secondary.host = "192.0.2.2"
+        zones = default_zones(16)
+        zones[8] = Zone("Second", True, self.zones[0].schedule, rain_pause_exempt=True)
+        zones[9] = Zone("Included", True, self.zones[0].schedule)
+        save_zones(self.path, zones)
+        service = Service(self.path, self.device, secondary)
+        service.tick()
+        self.assertTrue(secondary.states[0])
+        self.assertFalse(secondary.states[1])
+        self.assertFalse(self.device.states[7])
+        service.dispatch({"command": "rain_pause", "paused": False})
+        self.assertTrue(secondary.states[1])
+        service.dispatch({"command": "rain_pause", "paused": True})
+        self.assertTrue(secondary.states[0])
+        self.assertFalse(secondary.states[1])
+        secondary.fail = True
+        with self.assertLogs(level="ERROR"):
+            service.dispatch({"command": "manual", "channel": 8})
+        self.assertTrue(service.fault)
+        self.assertTrue(service.controller.closed)
+        self.assertFalse(any(self.device.states))
+
+    def test_exempt_zone_manual_watering_is_allowed_during_rain_pause(self) -> None:
+        zones = list(self.service.controller.zones)
+        zones[1] = Zone("Exempt", rain_pause_exempt=True)
+        result = self.service.dispatch({
+            "command": "save", "revision": self.service.revision,
+            "settings": encode_zones(zones),
+        })
+        self.assertTrue(result["rain_paused"])
+        self.service.dispatch({"command": "manual", "channel": 1})
+        self.assertTrue(self.device.states[1])
+        self.assertTrue(self.device.states[7])
+        with self.assertRaisesRegex(ValueError, "Rain Pause"):
+            self.service.dispatch({"command": "manual", "channel": 0})
+
     def test_save_optimistic_revision_prevents_lost_changes(self) -> None:
         revision = self.service.revision
         zones = default_zones()
@@ -111,6 +280,19 @@ class ServiceTests(unittest.TestCase):
                 {"command": "save", "revision": revision, "settings": encode_zones(self.zones)}
             )
         self.assertEqual(load_zones(self.path)[1].name, "New name")
+
+    def test_pump_exclusion_is_persisted_and_returned_to_desktops(self) -> None:
+        zones = list(self.zones)
+        zones[1] = Zone("Independent", rain_pause_exempt=True, pump_exempt=True)
+        result = self.service.dispatch({
+            "command": "save", "revision": self.service.revision,
+            "settings": encode_zones(zones),
+        })
+        self.assertTrue(load_zones(self.path)[1].pump_exempt)
+        self.assertTrue(result["settings"]["zones"][1]["pump_exempt"])
+        self.service.dispatch({"command": "manual", "channel": 1})
+        self.assertTrue(self.device.states[1])
+        self.assertFalse(self.device.states[7])
 
     def test_old_service_settings_error_explains_restart_without_applying(self) -> None:
         client = ServiceClient.__new__(ServiceClient)
@@ -255,6 +437,19 @@ class SocketTests(unittest.TestCase):
                   threading.Event())
         self.assertEqual(len(self.running.device.calls), calls)
         self.assertTrue(self.running.path.exists())
+
+    def test_an_existing_primary_cannot_be_claimed_as_a_second_board(self) -> None:
+        primary = FakeDevice()
+        primary.host = "192.0.2.3"
+        calls = len(self.running.device.calls)
+        with self.assertRaisesRegex(RuntimeError, "Another controller"):
+            serve(
+                self.running.config.with_name("other.json"), primary,
+                self.running.path.with_name("other.sock"), threading.Event(),
+                self.running.device,
+            )
+        self.assertFalse(primary.calls)
+        self.assertEqual(len(self.running.device.calls), calls)
 
     def test_graceful_shutdown_turns_pump_off_first(self) -> None:
         client = ServiceClient(self.running.path)

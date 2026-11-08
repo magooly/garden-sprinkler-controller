@@ -18,10 +18,11 @@ import threading
 import uuid
 
 from controller import (
-    Controller, decode_zones, encode_zones, load_rain_pause, load_zones,
+    Controller, decode_zones, default_zones, encode_zones, load_rain_pause, load_zones,
     save_rain_pause, save_zones,
 )
-from waveshare_relay import DEFAULT_HOST, DEFAULT_PORT, WaveshareRelays
+from waveshare_relay import DEFAULT_HOST, DEFAULT_PORT, RelayBoards, WaveshareRelays
+from timetable_profiles import TimetableProfiles
 
 MAX_MESSAGE = 65536
 DEFAULT_CONFIG = Path.home() / ".config/garden-sprinkler-controller/settings.json"
@@ -39,11 +40,18 @@ def error_details(error: Exception) -> str:
 
 
 class Service:
-    def __init__(self, config: Path, relay: WaveshareRelays) -> None:
+    def __init__(
+        self, config: Path, relay: WaveshareRelays, secondary: WaveshareRelays | None = None,
+    ) -> None:
         self.config = config
-        self.relay = relay
+        self.relay = RelayBoards(relay, secondary)
+        zones = load_zones(config)
+        if secondary is not None and len(zones) == 8:
+            zones.extend(default_zones(16)[8:])
+        self.timetables = TimetableProfiles(config)
         self.controller = Controller(
-            load_zones(config), relay, rain_paused=load_rain_pause(config)
+            zones, self.relay, rain_paused=load_rain_pause(config),
+            channel_count=self.relay.channel_count,
         )
         self.revision = uuid.uuid4().hex
         self.fault = ""
@@ -77,6 +85,12 @@ class Service:
             "host": self.relay.host,
             "port": self.relay.port,
             "slave_id": self.relay.slave_id,
+            "channel_count": controller.channel_count,
+            "timetables": self.timetables.status(controller.zones),
+            "boards": [
+                {"host": device.host, "port": device.port, "slave_id": device.slave_id}
+                for device in self.relay.devices
+            ],
             "runs": [
                 {"channel": channel, "source": run.source,
                  "remaining": max(0, run.deadline - controller.clock())}
@@ -100,13 +114,22 @@ class Service:
             raise ValueError("Service fault: " + self.fault + ". Check hardware and restart the service.")
         now = datetime.now()
         try:
-            if command == "save":
+            if command in ("save", "profile_save", "profile_load"):
                 if request.get("revision") != self.revision:
                     raise ValueError(
                         "Settings changed in another app or the service restarted. "
                         "Close and reopen this window before saving; your edits have not been applied."
                     )
-                zones = decode_zones(request.get("settings"))
+                if command == "profile_save":
+                    self.timetables.save(request.get("name"), self.controller.zones)
+                    self.revision = uuid.uuid4().hex
+                    return self.status()
+                zones = (
+                    self.timetables.load(request.get("name"), self.controller.zones)
+                    if command == "profile_load" else decode_zones(request.get("settings"))
+                )
+                if len(zones) != len(self.controller.zones):
+                    raise ValueError("Zone count changed; reopen the desktop before editing.")
                 save_zones(self.config, zones)
                 self.revision = uuid.uuid4().hex
                 self.controller.apply(zones, now)
@@ -120,11 +143,14 @@ class Service:
                 self.controller.set_rain_pause(paused, now)
             elif command in ("manual", "test", "stop"):
                 channel = request.get("channel")
-                if type(channel) is not int or channel not in range(8):
-                    raise ValueError("Channel must be a number from 0 through 7.")
+                if type(channel) is not int or channel not in range(self.controller.channel_count):
+                    raise ValueError("Channel is not configured; configure the second board for channels 9-16.")
                 if channel == self.controller.master_channel:
                     raise ValueError("The master pump is controlled automatically.")
-                if command != "stop" and self.controller.rain_paused:
+                if (
+                    command != "stop" and self.controller.rain_paused
+                    and not self.controller.zones[channel].rain_pause_exempt
+                ):
                     raise ValueError("Rain Pause is enabled.")
                 if command == "manual":
                     self.controller.start_manual(channel, now)
@@ -150,7 +176,7 @@ def exchange(path: Path, request: dict[str, object]) -> dict:
     if len(data) > MAX_MESSAGE:
         raise ValueError("Control request is too large.")
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-        connection.settimeout(2 if request.get("command") == "status" else 25)
+        connection.settimeout(2 if request.get("command") == "status" else 50)
         connection.connect(str(path))
         connection.sendall(data)
         with connection.makefile("rb") as reader:
@@ -197,15 +223,20 @@ class ControlServer(socketserver.UnixStreamServer):
         self.timeout = 0.25
 
 
-def serve(config: Path, relay: WaveshareRelays, path: Path, stop: threading.Event) -> None:
+def serve(
+    config: Path, relay: WaveshareRelays, path: Path, stop: threading.Event,
+    secondary: WaveshareRelays | None = None,
+) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     # Both locks are acquired before any hardware commands. Different socket or
     # config arguments must not create competing owners of this relay device.
-    identity = hashlib.sha256(f"{relay.host}:{relay.port}".encode()).hexdigest()[:16]
-    lock_paths = (
-        default_socket().parent / f"relay-{identity}.lock",
-        config.with_name(config.name + ".service.lock"),
-    )
+    boards = RelayBoards(relay, secondary)
+    lock_paths = sorted({
+        default_socket().parent / (
+            "relay-" + hashlib.sha256(f"{device.host}:{device.port}".encode()).hexdigest()[:16] + ".lock"
+        ) for device in boards.devices
+    })
+    lock_paths.append(config.with_name(config.name + ".service.lock"))
     with ExitStack() as stack:
         for lock_path in lock_paths:
             lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -218,7 +249,7 @@ def serve(config: Path, relay: WaveshareRelays, path: Path, stop: threading.Even
             if not path.is_socket():
                 raise RuntimeError(f"Refusing to replace a non-socket file: {path}")
             path.unlink()
-        service = Service(config, relay)
+        service = Service(config, relay, secondary)
         try:
             with ControlServer(path, service) as server:
                 path.chmod(0o600)
@@ -242,6 +273,10 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--slave-id", type=int, default=1)
     parser.add_argument("--timeout", type=float, default=1)
+    parser.add_argument("--second-host", help="Second board IP/host; omit to disable channels 9-16")
+    parser.add_argument("--second-port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--second-slave-id", type=int, default=1)
+    parser.add_argument("--second-timeout", type=float, default=1)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     stop = threading.Event()
@@ -250,7 +285,10 @@ def main() -> None:
     try:
         serve(args.config.expanduser(),
               WaveshareRelays(args.host, args.port, args.slave_id, args.timeout),
-              args.socket.expanduser(), stop)
+              args.socket.expanduser(), stop,
+              None if args.second_host is None else WaveshareRelays(
+                  args.second_host, args.second_port, args.second_slave_id, args.second_timeout
+              ))
     except (OSError, RuntimeError, ValueError, ExceptionGroup):
         logging.exception("Controller service stopped; outputs may be unknown")
         raise SystemExit(1)

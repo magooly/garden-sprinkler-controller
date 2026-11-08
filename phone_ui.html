@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#17221d">
+  <title>Garden Sprinklers</title>
+  <link rel="stylesheet" href="/app.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <p class="eyebrow">GARDEN CONTROL</p>
+        <h1>Sprinklers</h1>
+      </div>
+      <button id="logout" class="quiet hidden" type="button">Sign out</button>
+    </header>
+
+    <section id="login-panel" class="panel">
+      <h2>Sign in</h2>
+      <p>Enter the phone-control password configured on the sprinkler computer.</p>
+      <p id="login-message" class="notice" role="alert" aria-live="polite"></p>
+      <form id="login-form">
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" autocomplete="current-password" required>
+        <button class="primary" type="submit">Sign in</button>
+      </form>
+    </section>
+
+    <section id="controls" class="hidden">
+      <div id="notice" class="notice" role="status" aria-live="polite"></div>
+      <div class="toolbar">
+        <span id="updated">Loading status…</span>
+        <button id="stop-all" class="danger" type="button">STOP ALL</button>
+      </div>
+      <div id="channels" class="channels"></div>
+      <p class="footnote">Manual runs stop automatically after 10 minutes. The master pump is automatic.</p>
+    </section>
+  </main>
+</body>
+</html>

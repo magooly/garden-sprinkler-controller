@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Callable, Mapping, Protocol
 
 ZONE_COUNT = 8
+MAX_ZONE_COUNT = 16
 # Set to None to restore the original eight independent zones, including the
 # preserved channel 8 name/schedule. Channel numbers here are zero-based.
 MASTER_PUMP_CHANNEL: int | None = 7
@@ -93,6 +94,8 @@ class Zone:
         default_factory=empty_schedule
     )
     paused_windows: tuple[bool, ...] = (False,) * WINDOW_COUNT
+    rain_pause_exempt: bool = False
+    pump_exempt: bool = False
 
     def validate(self) -> None:
         if not isinstance(self.name, str) or not self.name.strip():
@@ -101,6 +104,10 @@ class Zone:
             raise ValueError("Zone names must be 40 characters or fewer.")
         if type(self.enabled) is not bool:
             raise ValueError("Routine enabled must be true or false.")
+        if type(self.rain_pause_exempt) is not bool:
+            raise ValueError("Rain Pause exemption must be true or false.")
+        if type(self.pump_exempt) is not bool:
+            raise ValueError("Master pump exemption must be true or false.")
         if (
             not isinstance(self.paused_windows, tuple)
             or len(self.paused_windows) != WINDOW_COUNT
@@ -158,17 +165,17 @@ class Zone:
         ))
 
 
-def default_zones() -> list[Zone]:
+def default_zones(count: int = ZONE_COUNT) -> list[Zone]:
     names = ("Front Lawn", "Back Yard", "Veggies", "Flower Bed")
     return [
         Zone(name=names[index] if index < len(names) else f"Zone {index + 1} (Unused)")
-        for index in range(ZONE_COUNT)
+        for index in range(count)
     ]
 
 
 def validate_zones(zones: list[Zone]) -> None:
-    if len(zones) != ZONE_COUNT:
-        raise ValueError(f"Exactly {ZONE_COUNT} zones are required.")
+    if len(zones) not in (ZONE_COUNT, MAX_ZONE_COUNT):
+        raise ValueError("Exactly 8 or 16 zones are required.")
     for index, zone in enumerate(zones):
         try:
             zone.validate()
@@ -183,11 +190,13 @@ def load_zones(path: Path) -> list[Zone]:
 
 
 def decode_zones(data: object) -> list[Zone]:
-    if not isinstance(data, dict) or type(data.get("version")) is not int or data["version"] not in (1, 2, 3, 4):
-        raise ValueError("Unsupported settings format; expected version 1, 2, 3, or 4.")
+    if not isinstance(data, dict) or type(data.get("version")) is not int or data["version"] not in (1, 2, 3, 4, 5, 6, 7):
+        raise ValueError("Unsupported settings format; expected version 1, 2, 3, 4, 5, 6, or 7.")
     records = data.get("zones")
     if not isinstance(records, list):
         raise ValueError("Settings must contain a list of zones.")
+    if data["version"] < 6 and len(records) != ZONE_COUNT:
+        raise ValueError("Legacy settings must contain exactly 8 zones.")
     zones = []
     for record in records:
         if not isinstance(record, dict):
@@ -208,9 +217,14 @@ def decode_zones(data: object) -> list[Zone]:
             schedule = legacy_schedule(tuple(record["days"]), record["start"], record["stop"])
         else:
             expected_fields = (
-                {"name", "enabled", "schedule", "paused_windows"}
-                if data["version"] == 4 else {"name", "enabled", "schedule"}
+                {"name", "enabled", "schedule", "paused_windows", "rain_pause_exempt"}
+                if data["version"] >= 5 else (
+                    {"name", "enabled", "schedule", "paused_windows"}
+                    if data["version"] == 4 else {"name", "enabled", "schedule"}
+                )
             )
+            if data["version"] >= 7:
+                expected_fields.add("pump_exempt")
             if set(record) != expected_fields:
                 raise ValueError("Zone settings contain unexpected or missing fields.")
             if not isinstance(record["schedule"], list):
@@ -224,7 +238,7 @@ def decode_zones(data: object) -> list[Zone]:
             padding = ("",) * (WINDOW_COUNT * 2 - expected_times)
             schedule = tuple(tuple(row) + padding for row in record["schedule"])
         paused_windows = (False,) * WINDOW_COUNT
-        if data["version"] == 4:
+        if data["version"] >= 4:
             values = record["paused_windows"]
             if (
                 not isinstance(values, list) or len(values) != WINDOW_COUNT
@@ -232,9 +246,16 @@ def decode_zones(data: object) -> list[Zone]:
             ):
                 raise ValueError("Each zone paused_windows value must contain four booleans.")
             paused_windows = tuple(values)
+        rain_pause_exempt = False
+        if data["version"] >= 5:
+            rain_pause_exempt = record["rain_pause_exempt"]
+            if type(rain_pause_exempt) is not bool:
+                raise ValueError("Each zone rain_pause_exempt value must be true or false.")
         zones.append(Zone(
             name=record["name"], enabled=record["enabled"], schedule=schedule,
             paused_windows=paused_windows,
+            rain_pause_exempt=rain_pause_exempt,
+            pump_exempt=record["pump_exempt"] if data["version"] >= 7 else False,
         ))
     validate_zones(zones)
     return zones
@@ -248,13 +269,15 @@ def save_zones(path: Path, zones: list[Zone]) -> None:
 def encode_zones(zones: list[Zone]) -> dict[str, object]:
     validate_zones(zones)
     return {
-        "version": 4,
+        "version": 7,
         "zones": [
             {
                 "name": zone.name.strip(),
                 "enabled": zone.enabled,
                 "schedule": [list(day) for day in zone.schedule],
                 "paused_windows": list(zone.paused_windows),
+                "rain_pause_exempt": zone.rain_pause_exempt,
+                "pump_exempt": zone.pump_exempt,
             }
             for zone in zones
         ],
@@ -324,8 +347,12 @@ class Controller:
         clock: Callable[[], float] = time.monotonic,
         *,
         rain_paused: bool = False,
+        channel_count: int | None = None,
     ) -> None:
         validate_zones(zones)
+        self.channel_count = len(zones) if channel_count is None else channel_count
+        if self.channel_count not in (8, 16) or self.channel_count > len(zones):
+            raise ValueError("Configured channel count must be 8 or 16 and fit the zone settings.")
         self.zones = list(zones)
         self.backend = backend
         self.clock = clock
@@ -346,7 +373,7 @@ class Controller:
             raise ExceptionGroup("Some relays could not be initialized OFF", errors)
 
     def _current_windows(self, channel: int, now: datetime) -> tuple[tuple[date, str, str], ...]:
-        if channel == self.master_channel:
+        if channel == self.master_channel or channel >= self.channel_count:
             return ()
         return tuple(
             (now.date(), start, stop)
@@ -361,21 +388,29 @@ class Controller:
 
     def _off(self, channel: int) -> None:
         if channel in self.runs:
-            if self.master_channel is not None and self.pump_on and len(self.runs) == 1:
+            if self._uses_pump(channel) and self.pump_on and not any(
+                other != channel and self._uses_pump(other) for other in self.runs
+            ):
                 self.backend.set_relay(self.master_channel, False)
                 self.pump_on = False
             self.backend.set_relay(channel, False)
             del self.runs[channel]
 
     def _shutdown_channels(self) -> tuple[int, ...]:
-        channels = tuple(channel for channel in range(ZONE_COUNT) if channel != self.master_channel)
+        channels = tuple(channel for channel in range(self.channel_count) if channel != self.master_channel)
         return channels if self.master_channel is None else (self.master_channel, *channels)
+
+    def _uses_pump(self, channel: int) -> bool:
+        return (
+            self.master_channel is not None and channel < self.master_channel
+            and not self.zones[channel].pump_exempt
+        )
 
     def _on(self, channel: int, run: Run, now: datetime) -> None:
         try:
             self.backend.set_relay(channel, True)
             self.runs[channel] = run
-            if self.master_channel is not None and not self.pump_on:
+            if self._uses_pump(channel) and self.master_channel is not None and not self.pump_on:
                 self.backend.set_relay(self.master_channel, True)
                 self.pump_on = True
         except (OSError, RuntimeError) as exc:
@@ -404,10 +439,12 @@ class Controller:
     def start_manual(self, channel: int, now: datetime, *, test: bool = False) -> None:
         if self.closed:
             raise RuntimeError("Controller is closed.")
-        if self.rain_paused:
-            raise RuntimeError("Rain Pause is enabled. All watering is disabled.")
+        if type(channel) is not int or channel not in range(self.channel_count):
+            raise ValueError("Relay channel is not configured.")
         if channel == self.master_channel:
             raise RuntimeError("The master pump is controlled automatically by garden zones.")
+        if self.rain_paused and not self.zones[channel].rain_pause_exempt:
+            raise RuntimeError("Rain Pause is enabled. All watering is disabled.")
         duration = TEST_SECONDS if test else MANUAL_SECONDS
         active_windows = self._current_windows(channel, now)
         self._on(channel, Run("Test" if test else "Manual", self.clock() + duration), now)
@@ -427,20 +464,45 @@ class Controller:
 
     def apply(self, zones: list[Zone], now: datetime) -> None:
         validate_zones(zones)
+        if len(zones) != len(self.zones):
+            raise ValueError("Zone count changed; reopen the desktop before editing.")
         # A changed routine cancels its scheduled run; manual/test runs are independent.
         for channel, zone in enumerate(zones):
-            if replace(zone, name=self.zones[channel].name) != self.zones[channel]:
+            previous = self.zones[channel]
+            if replace(zone, name=previous.name, pump_exempt=previous.pump_exempt) != previous:
                 run = self.runs.get(channel)
-                if run is not None and run.source == "Routine":
+                if run is not None and (
+                    run.source == "Routine"
+                    or (self.rain_paused and previous.rain_pause_exempt
+                        and not zone.rain_pause_exempt)
+                ):
                     self._off(channel)
         self.zones = list(zones)
+        if self.master_channel is not None:
+            pump_needed = any(self._uses_pump(channel) for channel in self.runs)
+            if pump_needed != self.pump_on:
+                try:
+                    self.backend.set_relay(self.master_channel, pump_needed)
+                    self.pump_on = pump_needed
+                except (OSError, RuntimeError) as exc:
+                    self.closed = True
+                    try:
+                        self.stop_all(now, suppress=False)
+                    except ExceptionGroup as shutdown:
+                        raise ExceptionGroup(
+                            "Pump update failed; shutdown also failed",
+                            [exc, *shutdown.exceptions],
+                        ) from exc
+                    raise
         self.tick(now)
 
     def tick(self, now: datetime) -> None:
-        if self.closed or self.rain_paused:
+        if self.closed:
             return
         monotonic_now = self.clock()
         for channel, zone in enumerate(self.zones):
+            if self.rain_paused and not zone.rain_pause_exempt:
+                continue
             if channel in self.blocked:
                 self.blocked[channel] = {
                     window for window in self.blocked[channel] if window[0] == now.date()
@@ -480,7 +542,29 @@ class Controller:
             raise RuntimeError("Controller is closed.")
         self.rain_paused = paused
         if paused:
-            self.stop_all(now, suppress=False)
+            errors: list[Exception] = []
+            exempt_run_active = any(
+                self._uses_pump(channel) and zone.rain_pause_exempt
+                and channel in self.runs
+                for channel, zone in enumerate(self.zones)
+            )
+            for channel in self._shutdown_channels():
+                if channel == self.master_channel:
+                    if exempt_run_active:
+                        continue
+                elif self.zones[channel].rain_pause_exempt:
+                    continue
+                try:
+                    self.backend.set_relay(channel, False)
+                    if channel == self.master_channel:
+                        self.pump_on = False
+                    else:
+                        self.runs.pop(channel, None)
+                except (OSError, RuntimeError) as exc:
+                    errors.append(exc)
+            if errors:
+                raise ExceptionGroup("Some relays could not be switched off", errors)
+            self.tick(now)
         else:
             self.tick(now)
 

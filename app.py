@@ -10,11 +10,13 @@ from datetime import datetime
 from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox
+from typing import Callable
 
 import customtkinter as ctk
 
 from controller import (
     DAY_NAMES,
+    MAX_ZONE_COUNT,
     WINDOW_COUNT,
     Controller,
     Zone,
@@ -31,6 +33,7 @@ from waveshare_relay import WaveshareRelays
 from service import DEFAULT_CONFIG, default_socket
 from service_client import ServiceClient
 from schedule_overview import ScheduleOverview, WeeklyOverview
+from timetable_profiles import RECOVERY_PROFILE, TimetableProfiles, profile_name, timetable
 
 GREEN = "#37cc87"
 RUNNING_RED = "#ff2020"
@@ -90,6 +93,8 @@ class ZoneFields:
     enabled: tk.BooleanVar
     schedule: list[list[tk.StringVar]]
     paused_windows: list[tk.BooleanVar]
+    rain_pause_exempt: tk.BooleanVar
+    pump_exempt: tk.BooleanVar
 
     def read(self) -> Zone:
         return Zone(
@@ -100,10 +105,14 @@ class ZoneFields:
                 for day in self.schedule
             ),
             tuple(paused.get() for paused in self.paused_windows),
+            self.rain_pause_exempt.get(),
+            self.pump_exempt.get(),
         )
 
 
 class SprinklerApp(ctk.CTk):
+    AUTOSAVE_DELAY_MS = 1000
+
     def __init__(
         self,
         settings_path: Path,
@@ -117,7 +126,9 @@ class SprinklerApp(ctk.CTk):
         self.settings_path = settings_path
         self.selected = 0
         self.timer: str | None = None
+        self.autosave_timer: str | None = None
         self.dirty = False
+        self.save_status = "Ready"
         self.faulted = False
         self.syncing = False
         self.service_error = ""
@@ -125,11 +136,14 @@ class SprinklerApp(ctk.CTk):
         self.remote = isinstance(backend, ServiceClient)
         self.overview: ScheduleOverview | None = None
         self.weekly_overview: WeeklyOverview | None = None
+        self.profile_window: ctk.CTkToplevel | None = None
+        self.profile_refresh: Callable[[], None] | None = None
         self.relay = backend
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         try:
             zones = backend.zones if isinstance(backend, ServiceClient) else load_zones(settings_path)
             rain_paused = backend.rain_paused if isinstance(backend, ServiceClient) else load_rain_pause(settings_path)
+            self.timetables = None if self.remote else TimetableProfiles(settings_path)
         except (OSError, ValueError) as exc:
             messagebox.showerror(
                 "Cannot load settings",
@@ -168,6 +182,8 @@ class SprinklerApp(ctk.CTk):
                     for day in zone.schedule
                 ],
                 [tk.BooleanVar(self, paused) for paused in zone.paused_windows],
+                tk.BooleanVar(self, zone.rain_pause_exempt),
+                tk.BooleanVar(self, zone.pump_exempt),
             )
             for zone in zones
         ]
@@ -177,6 +193,8 @@ class SprinklerApp(ctk.CTk):
             for variable in (
                 fields.name,
                 fields.enabled,
+                fields.rain_pause_exempt,
+                fields.pump_exempt,
                 *(time for day in fields.schedule for time in day),
                 *fields.paused_windows,
             ):
@@ -191,7 +209,7 @@ class SprinklerApp(ctk.CTk):
         header = ctk.CTkFrame(self, fg_color="#172638", corner_radius=0)
         header.grid(row=0, column=0, columnspan=2, sticky="ew")
         ctk.CTkLabel(
-            header, text="GARDEN / Sprinkler Controller", font=("", 20, "bold")
+            header, text="16 Station Relay Controller", font=("", 20, "bold")
         ).pack(side="left", padx=20, pady=8)
         self.connection_label = ctk.CTkLabel(
             header,
@@ -207,15 +225,23 @@ class SprinklerApp(ctk.CTk):
         )
         self.connection_button.pack(side="right", padx=8)
 
-        sidebar = ctk.CTkFrame(self, width=235, corner_radius=0)
+        sidebar = ctk.CTkFrame(self, width=250, corner_radius=0)
         sidebar.grid(row=1, column=0, sticky="nsew", padx=(0, 12))
-        sidebar.grid_columnconfigure(1, weight=1)
+        sidebar.grid_columnconfigure(3, weight=1)
         ctk.CTkLabel(sidebar, text="RELAY ZONES", font=("", 14, "bold")).grid(
-            row=0, column=0, columnspan=2, padx=20, pady=(10, 6), sticky="w"
+            row=0, column=0, columnspan=4, padx=20, pady=(10, 6), sticky="w"
         )
         self.zone_buttons: list[ctk.CTkButton] = []
         self.zone_dots: list[ctk.CTkLabel] = []
-        for channel in range(8):
+        self.rain_pause_exempt_buttons: list[ctk.CTkButton] = []
+        self.pump_exempt_buttons: list[ctk.CTkButton] = []
+        self.board_selector = ctk.CTkSegmentedButton(
+            sidebar, values=["Channels 1-8", "Channels 9-16"],
+            command=self.show_board,
+        )
+        self.board_selector.grid(row=1, column=0, columnspan=4, padx=8, pady=4)
+        self.board_selector.set("Channels 1-8")
+        for channel in range(MAX_ZONE_COUNT):
             dot = ctk.CTkLabel(
                 sidebar,
                 text="\u25cf",
@@ -223,36 +249,61 @@ class SprinklerApp(ctk.CTk):
                 width=24,
                 font=("", 22, "bold"),
             )
-            dot.grid(row=channel + 1, column=0, padx=(15, 0))
+            dot.grid(row=channel % 8 + 2, column=0, padx=(12, 0))
+            exempt_button = ctk.CTkButton(
+                sidebar,
+                text="+",
+                width=22,
+                height=30,
+                fg_color="transparent",
+                hover_color="#35465a",
+                text_color=GREY,
+                command=lambda index=channel: self.toggle_rain_pause_exemption(index),
+            )
+            exempt_button.grid(row=channel % 8 + 2, column=1, padx=(2, 2), pady=3)
+            pump_button = ctk.CTkButton(
+                sidebar, text="P", width=28, height=30,
+                fg_color="transparent", hover_color="#35465a", text_color=GREY,
+                command=lambda index=channel: self.toggle_pump_exemption(index),
+            )
+            pump_button.grid(row=channel % 8 + 2, column=2, padx=2, pady=3)
             button = ctk.CTkButton(
                 sidebar,
                 text="",
                 anchor="w",
-                width=200,
+                width=156,
                 height=35,
                 command=lambda index=channel: self.select_zone(index),
             )
-            button.grid(row=channel + 1, column=1, padx=(8, 15), pady=3, sticky="ew")
+            button.grid(row=channel % 8 + 2, column=3, padx=(2, 8), pady=3, sticky="ew")
             self.zone_buttons.append(button)
             self.zone_dots.append(dot)
+            self.rain_pause_exempt_buttons.append(exempt_button)
+            self.pump_exempt_buttons.append(pump_button)
+            if channel >= 8:
+                for widget in (dot, exempt_button, pump_button, button):
+                    widget.grid_remove()
         ctk.CTkLabel(
             sidebar,
-            text="Red: watering\nBright green: scheduled now\nGrey: inactive",
+            text="Click + to exempt; red X stays active in Rain Pause\n"
+            "P: uses pump / P-: excluded from pump\n"
+            "Red dot: watering / Green: scheduled / Grey: inactive",
             text_color=GREY,
             justify="left",
-        ).grid(row=9, column=0, columnspan=2, padx=20, pady=10, sticky="w")
+            wraplength=220,
+        ).grid(row=10, column=0, columnspan=4, padx=14, pady=10, sticky="w")
         self.rain_pause_var = tk.BooleanVar(self, self.controller.rain_paused)
         self.rain_pause_switch = ctk.CTkSwitch(
             sidebar, text="RAIN PAUSE", variable=self.rain_pause_var,
             command=self.toggle_rain_pause, progress_color="#87734e",
         )
         self.rain_pause_switch.grid(
-            row=10, column=0, columnspan=2, padx=20, pady=(8, 4), sticky="w"
+            row=11, column=0, columnspan=4, padx=20, pady=(8, 4), sticky="w"
         )
         ctk.CTkLabel(
-            sidebar, text="All watering OFF while enabled.\nRemembered after restart.",
+            sidebar, text="Included zones OFF; X zones stay active.\nRemembered after restart.",
             text_color=GREY, justify="left",
-        ).grid(row=11, column=0, columnspan=2, padx=20, pady=(0, 12), sticky="w")
+        ).grid(row=12, column=0, columnspan=4, padx=20, pady=(0, 12), sticky="w")
 
         panel = ctk.CTkFrame(self, fg_color="transparent")
         panel.grid(row=1, column=1, sticky="nsew", padx=(8, 20), pady=8)
@@ -277,6 +328,10 @@ class SprinklerApp(ctk.CTk):
             overview_controls, text="Weekly Overview", command=self.show_weekly_overview, width=150,
         )
         self.weekly_button.pack(side="left")
+        self.profiles_button = ctk.CTkButton(
+            overview_controls, text="Timetables", command=self.show_profiles, width=250,
+        )
+        self.profiles_button.pack(side="left", padx=(8, 0))
         self.editor = ctk.CTkScrollableFrame(panel)
         self.editor.grid(row=2, column=0, sticky="nsew")
         self.editor.grid_columnconfigure(0, weight=1)
@@ -321,9 +376,144 @@ class SprinklerApp(ctk.CTk):
 
     def overview_snapshot(self) -> tuple[list[Zone], int | None, bool, bool, bool]:
         return (
-            [fields.read() for fields in self.fields], self.controller.master_channel,
+            [fields.read() for fields in self.fields[:self.controller.channel_count]],
+            self.controller.master_channel,
             self.dirty, self.controller.rain_paused, self.faulted,
         )
+
+    def timetable_status(self) -> dict:
+        if isinstance(self.controller, ServiceClient):
+            status = self.controller.timetables or {"names": [], "selected": "", "modified": False}
+        else:
+            assert self.timetables is not None
+            status = self.timetables.status(self.controller.zones)
+        if self.dirty and status["selected"]:
+            try:
+                modified = timetable([fields.read() for fields in self.fields]) != timetable(self.controller.zones)
+            except ValueError:
+                modified = True
+            status = {**status, "modified": status["modified"] or modified}
+        return status
+
+    def show_profiles(self) -> None:
+        if self.profile_window is not None and self.profile_window.winfo_exists():
+            self.profile_window.deiconify()
+            self.profile_window.lift()
+            return
+        window = ctk.CTkToplevel(self)
+        self.profile_window = window
+        window.title("Timetable profiles")
+        window.geometry("480x260")
+        ctk.CTkLabel(
+            window, text="Save the current timetable as Summer, Winter, or another name.\n"
+            "Profiles change schedules only; hardware and exclusions stay unchanged.",
+            wraplength=440, justify="left",
+        ).pack(padx=16, pady=12)
+        choice = tk.StringVar(window, "")
+        menu = ctk.CTkOptionMenu(window, variable=choice, values=["No saved profiles"])
+        menu.pack(padx=16, pady=8)
+        label = ctk.CTkLabel(window, text="", wraplength=440)
+        label.pack(padx=16, pady=4)
+
+        def refresh() -> None:
+            status = self.timetable_status()
+            names = status["names"]
+            menu.configure(values=names or ["No saved profiles"])
+            if choice.get() not in names:
+                choice.set(status["selected"] or (names[0] if names else "No saved profiles"))
+            label.configure(
+                text=("Selected: " + status["selected"]
+                      + (" (modified)" if status["modified"] else ""))
+                if status["selected"] else "No named timetable selected",
+            )
+
+        def save_as() -> None:
+            name = ctk.CTkInputDialog(text="Timetable name:", title="Save timetable").get_input()
+            if name is not None and self.save_profile(name):
+                refresh()
+
+        def load() -> None:
+            if self.load_profile(choice.get()):
+                refresh()
+
+        ctk.CTkButton(window, text="Save current as...", command=save_as).pack(pady=4)
+        ctk.CTkButton(window, text="Load selected timetable", command=load).pack(pady=4)
+        self.profile_refresh = refresh
+        refresh()
+
+    def save_profile(self, name: str) -> bool:
+        try:
+            name = profile_name(name)
+            if name == RECOVERY_PROFILE:
+                raise ValueError(f'"{RECOVERY_PROFILE}" is reserved for automatic recovery.')
+        except ValueError as exc:
+            messagebox.showerror("Cannot save timetable", str(exc), parent=self)
+            return False
+        if name in self.timetable_status()["names"] and not messagebox.askyesno(
+            "Replace timetable?", f'Replace the saved timetable "{name}"?', parent=self,
+        ):
+            return False
+        if self.dirty and not self.save():
+            return False
+        try:
+            if isinstance(self.controller, ServiceClient):
+                self.controller.revision = self.edit_revision
+                self.controller.save_profile(name)
+                self.edit_revision = self.controller.revision
+            else:
+                assert self.timetables is not None
+                self.timetables.save(name, self.controller.zones)
+        except ValueError as exc:
+            messagebox.showerror("Cannot save timetable", str(exc), parent=self)
+            return False
+        except (OSError, RuntimeError, ExceptionGroup) as exc:
+            self._fault("Cannot save timetable", exc)
+            return False
+        self._refresh()
+        return True
+
+    def load_profile(self, name: str) -> bool:
+        if not messagebox.askyesno(
+            "Load timetable?",
+            f'Load "{name}" across all stored channels?\n\n'
+            "Scheduled relays may start or stop immediately. Rain Pause stays unchanged.\n"
+            f'The current timetable will be saved as "{RECOVERY_PROFILE}".',
+            parent=self,
+        ):
+            return False
+        if self.dirty and not self.save():
+            return False
+        try:
+            if isinstance(self.controller, ServiceClient):
+                self.controller.revision = self.edit_revision
+                self.controller.load_profile(name)
+                self.edit_revision = self.controller.revision
+            else:
+                assert self.timetables is not None
+                zones = self.timetables.load(name, self.controller.zones)
+                save_zones(self.settings_path, zones)
+                self.controller.apply(zones, datetime.now())
+        except ValueError as exc:
+            messagebox.showerror("Cannot load timetable", str(exc), parent=self)
+            return False
+        except (OSError, RuntimeError, ExceptionGroup) as exc:
+            self._fault("Cannot load timetable", exc)
+            return False
+        self.syncing = True
+        try:
+            for fields, zone in zip(self.fields, self.controller.zones):
+                fields.enabled.set(zone.enabled)
+                for variables, row in zip(fields.schedule, zone.schedule):
+                    for variable, value in zip(variables, row):
+                        variable.set(value)
+                for variable, value in zip(fields.paused_windows, zone.paused_windows):
+                    variable.set(value)
+        finally:
+            self.syncing = False
+        self._update_window_pause_labels()
+        self._validate()
+        self._refresh()
+        return True
 
     def show_weekly_overview(self) -> None:
         if self.weekly_overview is not None and self.weekly_overview.winfo_exists():
@@ -345,7 +535,39 @@ class SprinklerApp(ctk.CTk):
             self.select_zone, datetime.now().weekday(),
         )
 
+    def toggle_rain_pause_exemption(self, channel: int) -> None:
+        if (channel >= self.controller.channel_count
+                or channel == self.controller.master_channel or self.faulted):
+            return
+        variable = self.fields[channel].rain_pause_exempt
+        variable.set(not variable.get())
+
+    def show_board(self, board: str) -> None:
+        first = 8 if board == "Channels 9-16" else 0
+        for channel in range(MAX_ZONE_COUNT):
+            for widget in (
+                self.zone_buttons[channel], self.zone_dots[channel],
+                self.rain_pause_exempt_buttons[channel],
+                self.pump_exempt_buttons[channel],
+            ):
+                if first <= channel < first + 8:
+                    widget.grid()
+                else:
+                    widget.grid_remove()
+
+    def toggle_pump_exemption(self, channel: int) -> None:
+        master = self.controller.master_channel
+        if self.faulted or master is None or channel not in range(master):
+            return
+        variable = self.fields[channel].pump_exempt
+        variable.set(not variable.get())
+
     def select_zone(self, channel: int) -> None:
+        if channel >= self.controller.channel_count:
+            return
+        board = "Channels 1-8" if channel < 8 else "Channels 9-16"
+        self.board_selector.set(board)
+        self.show_board(board)
         self.selected = channel
         for widget in self.editor.winfo_children():
             widget.destroy()
@@ -357,7 +579,7 @@ class SprinklerApp(ctk.CTk):
             ).grid(row=0, column=0, padx=20, pady=(20, 10), sticky="w")
             ctk.CTkLabel(
                 self.editor,
-                text="Automatically ON whenever a garden zone (1-7) is watering.\n"
+                text="Automatically ON when a non-excluded zone (1-7) is watering.\n"
                 "The valve opens before the pump starts. The pump stops before\n"
                 "the last valve closes. No independent schedule or manual watering.\n\n"
                 "The previous channel 8 name and schedule are preserved but ignored.",
@@ -484,7 +706,8 @@ class SprinklerApp(ctk.CTk):
             self.editor,
             text="Enter 815, 0815, or 08:15 (24-hour time). Leave a pair blank to skip it. "
             "Windows may be entered in any order but cannot overlap. Click a Start heading "
-            "to pause/resume that window number for this zone across all weekdays; save to apply. "
+            "to pause/resume that window number for this zone across all weekdays; changes "
+            "save automatically about one second after you stop editing. "
             "Red borders identify overlapping groups. Click a conflicting Stop field for details.",
             text_color=GREY,
             anchor="w",
@@ -497,9 +720,29 @@ class SprinklerApp(ctk.CTk):
         if self.syncing:
             return
         self.dirty = True
+        self.save_status = "Unsaved changes"
         self._update_window_pause_labels()
         self._validate()
+        self._schedule_autosave()
         self._refresh()
+
+    def _schedule_autosave(self) -> None:
+        if self.autosave_timer is not None:
+            self.after_cancel(self.autosave_timer)
+            self.autosave_timer = None
+        if self.dirty and not self.faulted:
+            try:
+                validate_zones([fields.read() for fields in self.fields])
+            except ValueError:
+                return
+            self.autosave_timer = self.after(
+                self.AUTOSAVE_DELAY_MS, self._autosave
+            )
+
+    def _autosave(self) -> None:
+        self.autosave_timer = None
+        if self.dirty and not self.faulted:
+            self.save(automatic=True)
 
     def _toggle_window_pause(self, window: int) -> None:
         paused = self.fields[self.selected].paused_windows[window]
@@ -589,18 +832,65 @@ class SprinklerApp(ctk.CTk):
 
     def _refresh(self) -> None:
         now = datetime.now()
-        for channel, zone in enumerate(self.controller.zones):
+        profile_status = self.timetable_status()
+        if (
+            self.profile_window is not None and self.profile_window.winfo_exists()
+            and self.profile_refresh is not None
+        ):
+            self.profile_refresh()
+        selected_profile = profile_status["selected"] if profile_status else ""
+        profile_button_text = "Timetables"
+        if selected_profile:
+            display_profile = selected_profile if len(selected_profile) <= 16 else selected_profile[:13] + "..."
+            profile_button_text = f"Timetable: {display_profile}"
+            if profile_status["modified"]:
+                profile_button_text += " (modified)"
+        self.profiles_button.configure(
+            text=profile_button_text, state="disabled" if self.faulted else "normal",
+        )
+        for channel in range(MAX_ZONE_COUNT):
+            if channel >= self.controller.channel_count:
+                self.zone_buttons[channel].configure(
+                    text=f"{channel + 1}  Board 2 not configured", state="disabled",
+                    fg_color="transparent",
+                )
+                self.zone_dots[channel].configure(text_color=GREY)
+                self.rain_pause_exempt_buttons[channel].configure(text="-", state="disabled")
+                self.pump_exempt_buttons[channel].configure(text="-", state="disabled")
+                continue
+            zone = self.controller.zones[channel]
             master = channel == self.controller.master_channel
             active = self.controller.pump_on if master else channel in self.controller.runs
             color = RUNNING_RED if active else (
-                SCHEDULED_GREEN if not master and not self.controller.rain_paused and zone.scheduled(now) else GREY
+                SCHEDULED_GREEN
+                if not master and (not self.controller.rain_paused or zone.rain_pause_exempt)
+                and zone.scheduled(now) else GREY
             )
             self.zone_dots[channel].configure(text_color=color)
             name = "Master Pump" if master else self.fields[channel].name.get().strip() or "(Unnamed)"
             display_name = name if len(name) <= 21 else name[:20] + "..."
             self.zone_buttons[channel].configure(
                 text=f"{channel + 1}  {display_name}",
+                state="normal",
                 fg_color="#254e73" if channel == self.selected else "transparent",
+            )
+            exempt = self.fields[channel].rain_pause_exempt.get() and not master
+            active_exemption = zone.rain_pause_exempt and not master
+            pump_option = (
+                self.controller.master_channel is not None
+                and channel < self.controller.master_channel
+            )
+            self.pump_exempt_buttons[channel].configure(
+                text=("P-" if self.fields[channel].pump_exempt.get() else "P")
+                if pump_option else "-",
+                text_color="#ffcb70" if zone.pump_exempt and pump_option else GREY,
+                state="normal" if pump_option and not self.faulted else "disabled",
+            )
+            self.rain_pause_exempt_buttons[channel].configure(
+                text="-" if master else "X" if exempt else "+",
+                text_color=RUNNING_RED
+                if self.controller.rain_paused and active_exemption else GREY,
+                state="disabled" if master or self.faulted else "normal",
             )
         self.heading.configure(text=f"ZONE {self.selected + 1} CONFIGURATION")
         run = self.controller.runs.get(self.selected)
@@ -614,7 +904,7 @@ class SprinklerApp(ctk.CTk):
         if master_selected:
             text = "MASTER PUMP / " + ("ON" if self.controller.pump_on else "OFF") + " / Automatic"
         if self.controller.rain_paused:
-            text = "RAIN PAUSE / All watering OFF"
+            text = "RAIN PAUSE / Exempt zones may water"
         if self.faulted:
             text = ("SERVICE UNAVAILABLE / status unknown" if self.service_error else
                     "FAULT / output state unknown - check device")
@@ -631,15 +921,30 @@ class SprinklerApp(ctk.CTk):
             text="STOP THIS ZONE" if run else "RUN ZONE (10 min max)",
             fg_color=RED if run else "#1f6aa5",
             hover_color="#92313c" if run else "#144870",
-            state="disabled" if self.faulted or self.controller.rain_paused or master_selected else "normal",
+            state="disabled" if self.faulted or master_selected
+            or (self.controller.rain_paused and not run
+                and not self.controller.zones[self.selected].rain_pause_exempt)
+            else "normal",
         )
         count = len(self.controller.runs) + int(self.controller.pump_on)
+        if self.dirty:
+            try:
+                validate_zones([fields.read() for fields in self.fields])
+            except ValueError:
+                save_status = "Unsaved changes / invalid settings not saved"
+            else:
+                save_status = "Unsaved changes / auto-saving shortly" if self.autosave_timer else "Unsaved changes"
+        else:
+            save_status = self.save_status
+        if selected_profile:
+            modified = profile_status["modified"]
+            save_status += f" / {selected_profile}" + (" (modified)" if modified else "")
         self.system_status.configure(
             text=("System: SERVICE UNAVAILABLE - status unknown" if self.service_error
                   else "System: FAULT - output state unknown") if self.faulted else (
-                ("RAIN PAUSE / All watering OFF" if self.controller.rain_paused
+                ("RAIN PAUSE / Exempt zones may water" if self.controller.rain_paused
                  else f"RELAY / {count} relays on")
-                + (" / Unsaved changes" if self.dirty else " / Ready")
+                + " / " + save_status
             )
         )
         if self.faulted:
@@ -648,8 +953,12 @@ class SprinklerApp(ctk.CTk):
                 "HARDWARE FAULT - output state unknown"
             )
         else:
+            endpoints = (
+                " / ".join(f"{board['host']}:{board['port']}" for board in self.controller.boards)
+                if isinstance(self.controller, ServiceClient) else f"{self.relay.host}:{self.relay.port}"
+            )
             self.connection_label.configure(
-                text=f"{'SERVICE' if self.remote else 'WAVESHARE RELAY'} - {self.relay.host}:{self.relay.port}"
+                text=f"{'SERVICE' if self.remote else 'WAVESHARE RELAY'} - {endpoints}"
             )
         self.connection_button.configure(
             state="disabled" if self.faulted else "normal",
@@ -663,6 +972,10 @@ class SprinklerApp(ctk.CTk):
 
     def toggle_rain_pause(self) -> None:
         paused = self.rain_pause_var.get()
+        if paused and self.dirty and not self.save():
+            self.rain_pause_var.set(False)
+            self._refresh()
+            return
         if not paused and not messagebox.askyesno(
             "Resume watering?",
             "Turn off Rain Pause and resume normal scheduling?\n\n"
@@ -701,7 +1014,10 @@ class SprinklerApp(ctk.CTk):
             parent=self,
         )
 
-    def save(self) -> bool:
+    def save(self, *, automatic: bool = False) -> bool:
+        if self.autosave_timer is not None:
+            self.after_cancel(self.autosave_timer)
+            self.autosave_timer = None
         try:
             zones = [fields.read() for fields in self.fields]
             if isinstance(self.controller, ServiceClient):
@@ -710,12 +1026,15 @@ class SprinklerApp(ctk.CTk):
                 save_zones(self.settings_path, zones)
             self.controller.apply(zones, datetime.now())
         except ValueError as exc:
+            self.save_status = "Save failed"
             messagebox.showerror("Cannot save/apply settings", str(exc), parent=self)
+            self._refresh()
             return False
         except (OSError, RuntimeError, ExceptionGroup) as exc:
             self._fault("Cannot save/apply settings", exc)
             return False
         self.dirty = False
+        self.save_status = "Auto-saved" if automatic else "Saved"
         if isinstance(self.controller, ServiceClient):
             self.edit_revision = self.controller.revision
         self._refresh()
@@ -798,6 +1117,10 @@ class SprinklerApp(ctk.CTk):
                                 fields.name.set(zone.name)
                             if fields.enabled.get() != zone.enabled:
                                 fields.enabled.set(zone.enabled)
+                            if fields.rain_pause_exempt.get() != zone.rain_pause_exempt:
+                                fields.rain_pause_exempt.set(zone.rain_pause_exempt)
+                            if fields.pump_exempt.get() != zone.pump_exempt:
+                                fields.pump_exempt.set(zone.pump_exempt)
                             for variables, row in zip(fields.schedule, zone.schedule):
                                 for variable, value in zip(variables, row):
                                     if variable.get() != value:
@@ -818,6 +1141,9 @@ class SprinklerApp(ctk.CTk):
             self.timer = self.after(250, self._tick)
 
     def on_close(self) -> None:
+        if self.autosave_timer is not None:
+            self.after_cancel(self.autosave_timer)
+            self.autosave_timer = None
         if self.dirty and not self.faulted:
             choice = messagebox.askyesnocancel(
                 "Unsaved changes", "Save settings before closing?", parent=self

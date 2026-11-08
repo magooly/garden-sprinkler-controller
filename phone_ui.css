@@ -1,0 +1,188 @@
+:root {
+  color-scheme: dark;
+  font-family: system-ui, sans-serif;
+  background: #101713;
+  color: #eef4ef;
+  font-synthesis: none;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+}
+
+main {
+  width: min(100% - 28px, 620px);
+  margin: 0 auto;
+  padding: 18px 0 34px;
+}
+
+header,
+.toolbar,
+.channel-heading,
+.channel-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+header {
+  margin: 8px 0 22px;
+}
+
+.eyebrow {
+  margin: 0 0 3px;
+  color: #9cb4a2;
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+}
+
+h1 {
+  margin: 0;
+  font-size: 1.8rem;
+}
+
+h2 {
+  margin: 0 0 8px;
+}
+
+.panel,
+.channel {
+  border: 1px solid #304239;
+  border-radius: 14px;
+  background: #19241e;
+}
+
+.panel {
+  padding: 20px;
+}
+
+.panel p,
+.footnote {
+  color: #b7c8bc;
+  line-height: 1.5;
+}
+
+form {
+  display: grid;
+  gap: 12px;
+  margin-top: 18px;
+}
+
+input,
+button {
+  min-height: 48px;
+  border-radius: 10px;
+  font: inherit;
+}
+
+input {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid #506657;
+  background: #101713;
+  color: #fff;
+}
+
+button {
+  padding: 10px 15px;
+  border: 0;
+  font-weight: 750;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
+}
+
+.primary {
+  background: #5da86e;
+  color: #07140a;
+}
+
+.danger {
+  background: #bd4d46;
+  color: #fff;
+}
+
+.quiet {
+  min-height: 40px;
+  border: 1px solid #506657;
+  background: transparent;
+  color: #dce8df;
+}
+
+.toolbar {
+  margin: 12px 0;
+  color: #b7c8bc;
+  font-size: 0.88rem;
+}
+
+.toolbar button {
+  flex: 0 0 auto;
+}
+
+.channels {
+  display: grid;
+  gap: 10px;
+}
+
+.channel {
+  padding: 14px;
+}
+
+.channel-heading {
+  align-items: flex-start;
+  margin-bottom: 12px;
+}
+
+.channel h2 {
+  margin: 0;
+  font-size: 1rem;
+  overflow-wrap: anywhere;
+}
+
+.channel-number,
+.channel-state {
+  color: #b7c8bc;
+  font-size: 0.82rem;
+}
+
+.channel-state {
+  margin: 5px 0 0;
+}
+
+.channel-actions button {
+  flex: 1;
+}
+
+.notice {
+  display: none;
+  margin: 12px 0;
+  padding: 12px;
+  border-radius: 10px;
+  background: #49302a;
+  color: #ffe2dc;
+  overflow-wrap: anywhere;
+}
+
+.notice.visible {
+  display: block;
+}
+
+.footnote {
+  margin: 18px 2px 0;
+  font-size: 0.88rem;
+}
+
+.hidden {
+  display: none !important;
+}

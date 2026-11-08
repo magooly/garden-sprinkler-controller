@@ -122,6 +122,35 @@ class WaveshareRelays:
             )
 
 
+class RelayBoards:
+    """Route app channels to up to two independently addressed eight-coil boards."""
+
+    def __init__(self, primary: WaveshareRelays, secondary: WaveshareRelays | None = None) -> None:
+        if secondary is not None and (primary.host, primary.port) == (secondary.host, secondary.port):
+            raise ValueError("The second board must have a different host or port.")
+        self.primary = primary
+        self.secondary = secondary
+        self.host = primary.host
+        self.port = primary.port
+        self.slave_id = primary.slave_id
+        self.channel_count = 8 if secondary is None else 16
+
+    @property
+    def devices(self) -> tuple[WaveshareRelays, ...]:
+        return (self.primary,) if self.secondary is None else (self.primary, self.secondary)
+
+    def set_relay(self, channel: int, energized: bool) -> None:
+        if type(channel) is not int or channel not in range(self.channel_count):
+            raise ValueError("Relay channel is not configured.")
+        device = self.primary if channel < 8 else self.secondary
+        if device is None:
+            raise ValueError("The second relay board is not configured.")
+        device.set_relay(channel % 8, energized)
+
+    def read_states(self) -> tuple[bool, ...]:
+        return tuple(state for device in self.devices for state in device.read_states())
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Read-only Waveshare relay status / slave discovery. No writes are sent."
