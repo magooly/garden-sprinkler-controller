@@ -10,7 +10,10 @@ from unittest.mock import patch
 
 import customtkinter as ctk
 
-from app import GREY, RUNNING_RED, SCHEDULED_GREEN, SprinklerApp, display_time, overlap_notices
+from app import (
+    GREY, RUNNING_RED, SCHEDULED_GREEN, SprinklerApp, display_time,
+    overlap_notices,
+)
 from controller import (
     Zone, default_zones, load_rain_pause, load_zones, rain_pause_path, save_zones,
 )
@@ -22,13 +25,354 @@ from test_service import FakeDevice, RunningService
 
 @unittest.skipUnless(os.environ.get("DISPLAY"), "Requires a graphical display")
 class RainPauseGuiTests(unittest.TestCase):
+    def test_unassigned_tapo_channel_is_editable_but_cannot_run(self) -> None:
+        import json
+        from tapo_plugs import mapping_path
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "settings.json"
+            mapping_path(config).write_text(json.dumps({"version": 1, "plugs": [None] * 8}))
+            with RunningService(Path(directory)) as running:
+                other = SprinklerApp(running.config, ServiceClient(running.path))
+                try:
+                    other.select_zone(8)
+                    other.update()
+                    self.assertIn("UNASSIGNED", other.status.cget("text"))
+                    self.assertEqual(other.manual_button.cget("state"), "disabled")
+                    self.assertEqual(other.duration_menu.cget("state"), "disabled")
+                    self.assertEqual(other.zone_buttons[8].cget("state"), "normal")
+                    self.assertIn("Unassigned", other.zone_buttons[8].cget("text"))
+                    other.fields[8].schedule[0][0].set("0900")
+                    other.fields[8].schedule[0][1].set("0910")
+                    other.show_overview()
+                    other.overview.day.set("Mon")
+                    other.overview.refresh()
+                    other.show_weekly_overview()
+                    self.assertEqual([row.channel for row in other.overview.rows], [8])
+                    self.assertEqual({channel for channel, _day in other.weekly_overview.cells}, set(range(8, 16)))
+                    other.geometry("940x620")
+                    other.update()
+                    self.assertLessEqual(
+                        other.manual_button.winfo_rooty() + other.manual_button.winfo_height(),
+                        other.winfo_rooty() + other.winfo_height(),
+                    )
+                    other.fields[8].name.set("Shed Fan")
+                    self.assertTrue(other.save())
+                    self.assertEqual(other.controller.zones[8].name, "Shed Fan")
+                    self.assertNotIn(8, other.controller.runs)
+                finally:
+                    other.dirty = False
+                    other.on_close()
+
+    def test_restore_rejects_settings_changed_during_confirmation(self) -> None:
+        from dataclasses import replace
+        with tempfile.TemporaryDirectory() as directory, RunningService(Path(directory)) as running:
+            other = SprinklerApp(running.config, ServiceClient(running.path))
+            path = Path(directory) / "backup.json"
+            password = "four unrelated backup words"
+            import json
+            path.write_text(json.dumps(other.controller.backup("backup_export", password=password)["archive"]))
+
+            def confirm(*_args, **_kwargs):
+                client = ServiceClient(running.path)
+                zones = list(client.zones)
+                zones[1] = replace(zones[1], name="Changed elsewhere")
+                client.apply(zones, datetime.now())
+                other._tick()
+                return True
+
+            try:
+                with patch("app.filedialog.askopenfilename", return_value=str(path)), \
+                        patch.object(other, "_backup_password", return_value=password), \
+                        patch("app.messagebox.askyesno", side_effect=confirm), \
+                        patch("app.messagebox.showerror") as error:
+                    other.restore_backup()
+                self.assertIn("Settings changed", error.call_args.args[1])
+                self.assertEqual(load_zones(running.config)[1].name, "Changed elsewhere")
+            finally:
+                other.on_close()
+
+    def test_continuous_reminder_is_informational(self) -> None:
+        self.app.select_zone(1)
+        self.app.fields[1].pump_exempt.set(True)
+        self.app.fields[1].continuous_reminder_minutes.set("1")
+        self.assertTrue(self.app.save())
+        with patch.object(self.app.controller, "clock", return_value=100):
+            self.app.controller.start_manual(1, self.time.now(), continuous=True)
+        with patch.object(self.app.controller, "clock", return_value=159):
+            self.app._refresh()
+            self.assertNotIn("REMINDERS", self.app.running_text)
+        with patch.object(self.app.controller, "clock", return_value=160):
+            self.app._refresh()
+            self.assertIn("continuous run reached 1 minutes", self.app.running_text)
+            self.assertIn("Reminder", self.app.running_button.cget("text"))
+            self.assertIn(1, self.app.controller.runs)
+
+    def test_backup_restore_validates_and_confirms_before_applying(self) -> None:
+        import json
+        import system_backup
+        password = "four unrelated backup words"
+        with tempfile.TemporaryDirectory() as directory, RunningService(Path(directory)) as running:
+            other = SprinklerApp(running.config, ServiceClient(running.path))
+            try:
+                path = Path(directory) / "backup.sprinkler-backup"
+                with patch("app.filedialog.asksaveasfilename", return_value=str(path)), \
+                        patch.object(other, "_backup_password", return_value=password), \
+                        patch("app.messagebox.showinfo"):
+                    other.export_backup()
+                payload = system_backup.decrypt(json.loads(path.read_text()), password)
+                self.assertEqual(payload["settings"]["zones"][1]["name"], other.controller.zones[1].name)
+                payload["settings"]["zones"][1]["name"] = "Backup fan"
+                path.write_text(json.dumps(system_backup.encrypt(payload, password)))
+                with patch("app.filedialog.askopenfilename", return_value=str(path)), \
+                        patch.object(other, "_backup_password", return_value=password), \
+                        patch("app.messagebox.askyesno", return_value=False):
+                    other.restore_backup()
+                self.assertNotEqual(load_zones(running.config)[1].name, "Backup fan")
+                with patch("app.filedialog.askopenfilename", return_value=str(path)), \
+                        patch.object(other, "_backup_password", return_value=password), \
+                        patch("app.messagebox.askyesno", return_value=True), \
+                        patch("app.messagebox.showinfo"):
+                    other.restore_backup()
+                self.assertEqual(load_zones(running.config)[1].name, "Backup fan")
+                self.assertTrue(other.controller.operation_held)
+                self.assertEqual(other.manual_button.cget("state"), "disabled")
+                self.assertIn("SAFETY HOLD", other.status.cget("text"))
+            finally:
+                other.dirty = False
+                other.on_close()
+
+    def test_backup_password_dialog_confirms_and_shows_password(self) -> None:
+        observed = {}
+
+        def fill_dialog() -> None:
+            window = next(widget for widget in self.app.winfo_children() if isinstance(widget, ctk.CTkToplevel))
+            try:
+                entries = [widget for widget in window.winfo_children() if isinstance(widget, ctk.CTkEntry)]
+                entries[0].insert(0, "four unrelated backup words")
+                entries[1].insert(0, "wrong confirmation")
+                proceed = next(widget for widget in window.winfo_children()
+                               if isinstance(widget, ctk.CTkButton) and widget.cget("text") == "Continue")
+                proceed.invoke()
+                observed["mismatch"] = any(
+                    isinstance(widget, ctk.CTkLabel) and "do not match" in widget.cget("text")
+                    for widget in window.winfo_children()
+                )
+                show = next(widget for widget in window.winfo_children() if isinstance(widget, ctk.CTkCheckBox))
+                show.toggle()
+                observed["shown"] = all(entry.cget("show") == "" for entry in entries)
+                entries[1].delete(0, "end")
+                entries[1].insert(0, "four unrelated backup words")
+                proceed.invoke()
+            finally:
+                if window.winfo_exists():
+                    window.destroy()
+
+        self.app.after(100, fill_dialog)
+        self.assertEqual(self.app._backup_password(confirm=True), "four unrelated backup words")
+        self.assertEqual(observed, {"mismatch": True, "shown": True})
+
+    def test_running_summary_shows_all_runs_and_unknown_fault(self) -> None:
+        self.app.controller.start_manual(1, self.time.now(), duration_minutes=30)
+        self.app._refresh()
+        self.app.show_running()
+        self.app.update()
+        summary = self.app.running_summary.get("1.0", "end")
+        self.assertIn("Channel 1, Lawn - Routine - until about", summary)
+        self.assertIn("Channel 2,", summary)
+        self.assertIn("Manual - until about", summary)
+        self.app.faulted = True
+        self.app._refresh()
+        self.assertIn("Output states unknown", self.app.running_summary.get("1.0", "end"))
+        self.app.running_window.destroy()
+        self.app.faulted = False
+
+    def test_duration_summary_and_custom_visibility(self) -> None:
+        self.app.select_zone(1)
+        self.app.update()
+        runs_before = self.app.controller.runs.copy()
+        self.assertFalse(self.app.duration_entry.winfo_ismapped())
+        self.assertIn("10 minutes", self.app.duration_summary.cget("text"))
+        self.app.duration_menu._dropdown_callback("Custom")
+        self.app.update()
+        self.assertTrue(self.app.duration_entry.winfo_ismapped())
+        self.assertIn("custom minutes", self.app.duration_summary.cget("text"))
+        self.app.custom_duration.set("45")
+        self.assertIn("45 minutes", self.app.duration_summary.cget("text"))
+        self.app.duration_menu._dropdown_callback("30 min")
+        self.app.update()
+        self.assertFalse(self.app.duration_entry.winfo_ismapped())
+        self.assertIn("30 minutes", self.app.duration_summary.cget("text"))
+        self.assertEqual(self.app.controller.runs, runs_before)
+
+    def test_duration_menu_stays_open_across_refresh_and_avoids_stop_buttons(self) -> None:
+        self.app.select_zone(1)
+        self.app.update()
+        menu = self.app.duration_menu._dropdown_menu
+        self.app.duration_menu._open_dropdown_menu()
+        self.app.update()
+        try:
+            menu.activate(1)
+            self.app._refresh()
+            self.app.update()
+            self.assertEqual(menu.index("active"), 1)
+            menu.invoke(1)
+            self.assertEqual(self.app.manual_duration.get(), "30 min")
+            menu.activate(3)
+            self.app._refresh()
+            self.app.update()
+            self.assertEqual(menu.index("active"), 3)
+            menu.invoke(3)
+            self.assertEqual(self.app.manual_duration.get(), "Custom")
+            self.assertEqual(self.app.duration_entry.cget("state"), "normal")
+            self.assertLessEqual(
+                menu.winfo_rootx() + menu.winfo_width(),
+                self.app.manual_button.winfo_rootx(),
+            )
+            self.assertLessEqual(
+                menu.winfo_rootx() + menu.winfo_width(),
+                self.app.stop_all_button.winfo_rootx(),
+            )
+        finally:
+            menu.unpost()
+
+    def test_history_newest_visible_on_open_and_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, RunningService(Path(directory)) as running:
+            other = SprinklerApp(running.config, ServiceClient(running.path))
+            events = [
+                {"timestamp": "2026-11-10T12:49:16+10:00", "channel": 6,
+                 "name": f"Fan {index}", "event": "ON", "reason": "Manual"}
+                for index in range(25)
+            ]
+            events[-1] = {
+                "timestamp": "2026-11-10T12:18:09+10:00", "channel": None,
+                "name": "Controller", "event": "STARTED", "reason": "Startup",
+            }
+            try:
+                self.time.fromisoformat.side_effect = datetime.fromisoformat
+                with patch.object(other.controller, "history", return_value={
+                    "events": events, "offset": 0, "total": 25, "page_size": 25, "warning": "",
+                }):
+                    other.show_history()
+                    other.update()
+                    contents = next(
+                        widget for widget in other.history_window.winfo_children()
+                        if isinstance(widget, ctk.CTkTextbox)
+                    )
+                    self.assertTrue(contents.get("1.0", "end").startswith(
+                        "10/11 12:49 - Channel 7, Fan 0 - ON - Manual"
+                    ))
+                    self.assertIn("10/11 12:18 - System - STARTED - Startup",
+                                  contents.get("1.0", "end"))
+                    self.assertEqual(contents.yview()[0], 0.0)
+                    contents.yview_moveto(1)
+                    controls = next(
+                        widget for widget in other.history_window.winfo_children()
+                        if isinstance(widget, ctk.CTkFrame) and any(
+                            isinstance(child, ctk.CTkButton) and child.cget("text") == "Refresh"
+                            for child in widget.winfo_children()
+                        )
+                    )
+                    next(child for child in controls.winfo_children()
+                         if isinstance(child, ctk.CTkButton) and child.cget("text") == "Refresh").invoke()
+                    other.update()
+                    self.assertEqual(contents.yview()[0], 0.0)
+                    other.history_window.destroy()
+            finally:
+                other.on_close()
+
+    def test_custom_duration_accepts_keyboard_input_during_refresh(self) -> None:
+        self.app.select_zone(1)
+        self.app.update()
+        self.app.duration_menu._dropdown_callback("Custom")
+        self.app.update()
+        entry = self.app.duration_entry._entry
+        entry.focus_force()
+        self.app.update()
+        entry.event_generate("<KeyPress>", keysym="4")
+        self.app.update()
+        self.assertEqual(self.app.custom_duration.get(), "4")
+        self.app._refresh()
+        self.app.update()
+        entry.event_generate("<KeyPress>", keysym="5")
+        self.app.update()
+        self.assertEqual(self.app.custom_duration.get(), "45")
+
+    def test_selected_status_reports_next_schedule_and_unknown_fault(self) -> None:
+        self.app._refresh()
+        self.assertIn("Next scheduled start:", self.app.status.cget("text"))
+        self.app.faulted = True
+        self.app._refresh()
+        self.assertIn("unknown", self.app.status.cget("text"))
+        self.assertNotIn("Next scheduled start", self.app.status.cget("text"))
+        self.app.faulted = False
+
+    def test_history_window_shows_service_events(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, RunningService(Path(directory)) as running:
+            other = SprinklerApp(running.config, ServiceClient(running.path))
+            try:
+                other.manual()
+                other.show_history()
+                other.update()
+                boxes = [widget for widget in other.history_window.winfo_children()
+                         if isinstance(widget, ctk.CTkTextbox)]
+                self.assertEqual(len(boxes), 1)
+                self.assertIn("Manual", boxes[0].get("1.0", "end"))
+                other.history_window.destroy()
+            finally:
+                other.on_close()
+
+    def test_manual_timer_controls_and_saved_maximum(self) -> None:
+        self.app.select_zone(1)
+        self.app.fields[1].pump_exempt.set(True)
+        self.assertTrue(self.app.save())
+        self.assertIn("Until stopped", self.app.duration_menu.cget("values"))
+        self.app.fields[1].max_manual_minutes.set("30")
+        self.assertNotIn("Until stopped", self.app.duration_menu.cget("values"))
+        with patch("app.messagebox.showerror") as error:
+            self.app.manual()
+        self.assertIn("Save the manual maximum", error.call_args.args[1])
+        self.assertTrue(self.app.save())
+        self.app.manual_duration.set("Custom")
+        self.app._refresh()
+        self.assertEqual(self.app.duration_entry.cget("state"), "normal")
+        self.app.custom_duration.set("31")
+        with patch("app.messagebox.showerror") as error:
+            self.app.manual()
+        self.assertIn("maximum", error.call_args.args[1])
+        self.app.custom_duration.set("30")
+        self.app.manual()
+        self.assertEqual(self.app.controller.runs[1].source, "Manual")
+        self.assertGreater(self.app.controller.runs[1].deadline - self.app.controller.clock(), 1790)
+        self.app.manual()
+        self.assertNotIn(1, self.app.controller.runs)
+        self.app.fields[1].max_manual_minutes.set("0")
+        self.assertEqual(self.app.save_button.cget("state"), "disabled")
+        self.app.fields[1].max_manual_minutes.set("")
+        self.assertTrue(self.app.save())
+        self.app.manual_duration.set("Until stopped")
+        with patch("app.messagebox.askyesno", return_value=True):
+            self.app.manual()
+        self.assertIsNone(self.app.controller.runs[1].deadline)
+        self.app.manual()
+
+    def test_continuous_status_and_existing_stop_button(self) -> None:
+        self.app.fields[0].pump_exempt.set(True)
+        self.app.save()
+        self.app.controller.start_manual(0, self.time.now(), continuous=True)
+        self.app._refresh()
+        self.assertIn("Continuous / Until stopped", self.app.status.cget("text"))
+        self.assertEqual(self.app.manual_button.cget("text"), "STOP THIS ZONE")
+        self.app.manual()
+        self.assertNotIn(0, self.app.controller.runs)
+
     def setUp(self) -> None:
         original_destroy = SprinklerApp.destroy
 
         def destroy(app: SprinklerApp) -> None:
             # CustomTkinter leaves internal callbacks queued when a test root closes.
             for timer in app.tk.call("after", "info"):
-                app.after_cancel(timer)
+                app.tk.call("after", "cancel", timer)
             original_destroy(app)
 
         self.enterContext(patch.object(SprinklerApp, "destroy", new=destroy))
@@ -52,6 +396,143 @@ class RainPauseGuiTests(unittest.TestCase):
     def pause(self) -> None:
         self.app.rain_pause_var.set(True)
         self.app.toggle_rain_pause()
+
+    def test_schedule_day_and_week_views_only_change_visibility(self) -> None:
+        self.app.update()
+        self.assertEqual(self.app.schedule_day.get(), "Mon")
+        self.assertFalse(self.app.schedule_week_view)
+        original = [fields.read() for fields in self.app.fields]
+        for day in range(7):
+            self.assertEqual(
+                sum(entry.winfo_ismapped() for (index, _), entry in self.app.schedule_entries.items() if index == day),
+                8 if day == 0 else 0,
+            )
+        self.app.schedule_day_menu._dropdown_callback("Wed")
+        self.app.update()
+        self.assertEqual(
+            {day for (day, _), entry in self.app.schedule_entries.items() if entry.winfo_ismapped()},
+            {2},
+        )
+        self.app.schedule_view_button.invoke()
+        self.app.update()
+        self.assertEqual(self.app.schedule_view_button.cget("text"), "See one day view")
+        self.assertEqual(sum(entry.winfo_ismapped() for entry in self.app.schedule_entries.values()), 56)
+        self.app.select_zone(1)
+        self.app.update()
+        self.assertEqual(self.app.schedule_day.get(), "Wed")
+        self.assertTrue(self.app.schedule_week_view)
+        self.app.schedule_view_button.invoke()
+        self.app.select_zone(7)
+        self.app.select_zone(0)
+        self.app.update()
+        self.assertEqual(
+            {day for (day, _), entry in self.app.schedule_entries.items() if entry.winfo_ismapped()},
+            {2},
+        )
+        self.assertEqual([fields.read() for fields in self.app.fields], original)
+        self.assertFalse(self.app.dirty)
+        self.assertIsNone(self.app.autosave_timer)
+
+    def test_copy_day_uses_displayed_day_and_preserves_hidden_edits(self) -> None:
+        self.app.schedule_day_menu._dropdown_callback("Wed")
+        self.app.fields[0].schedule[2][0].set("08:15")
+        self.app.fields[0].schedule[2][1].set("08:40")
+        self.app.schedule_day_menu._dropdown_callback("Fri")
+        self.app.schedule_day_menu._dropdown_callback("Wed")
+        self.assertEqual(self.app.schedule_entries[2, 0].get(), "08:15")
+        self.app.copy_day_button.toggle()
+        for row in self.app.fields[0].schedule:
+            self.assertEqual([value.get() for value in row[:2]], ["08:15", "08:40"])
+        self.assertTrue(self.app.save())
+        self.assertEqual(load_zones(self.path)[0].schedule, (("08:15", "08:40") + ("",) * 6,) * 7)
+
+    def test_one_day_view_saves_six_rows_and_validates_hidden_days(self) -> None:
+        self.app.geometry("940x620")
+        self.app.update()
+        table = self.app.schedule_entries[0, 0].master
+        compact_height = table.winfo_height()
+        for control in (self.app.schedule_day_menu, self.app.schedule_view_button, self.app.copy_day_button):
+            self.assertLessEqual(
+                control.winfo_rootx() + control.winfo_width(),
+                self.app.winfo_rootx() + self.app.winfo_width(),
+            )
+        self.app.schedule_view_button.invoke()
+        self.app.update()
+        self.assertGreaterEqual(table.winfo_height() - compact_height, 6 * 26)
+        self.app.schedule_view_button.invoke()
+        self.app.fields[0].schedule[2][0].set("invalid")
+        self.app.update()
+        self.assertFalse(self.app.schedule_entries[2, 0].winfo_ismapped())
+        self.assertEqual(self.app.save_button.cget("state"), "disabled")
+        self.assertIsNone(self.app.autosave_timer)
+
+    def test_group_pause_button_stops_only_its_group_and_resume_waits(self) -> None:
+        self.app.update()
+        self.assertIn(0, self.app.controller.runs)
+        button = self.app.window_pause_buttons[0]
+        self.assertEqual(button.cget("text"), "Not Paused")
+        button.invoke()
+        self.assertTrue(self.app.save())
+        self.app.update()
+        self.assertNotIn(0, self.app.controller.runs)
+        self.assertEqual(button.cget("text"), "Paused")
+        self.assertEqual(button.cget("fg_color"), "#b63e4b")
+        self.assertEqual(self.app.manual_button.cget("state"), "normal")
+        button.invoke()
+        self.assertTrue(self.app.save())
+        self.app._tick()
+        self.assertNotIn(0, self.app.controller.runs)
+        self.assertEqual(self.app.manual_button.cget("state"), "normal")
+        self.assertEqual(button.cget("text"), "Not Paused")
+        self.assertFalse(any(self.app.fields[0].paused_windows[index].get() for index in (1, 2, 3)))
+        self.app.select_zone(7)
+        self.assertEqual(self.app.window_pause_buttons, [])
+
+    def test_linux_mouse_wheel_scrolls_editor_only(self) -> None:
+        self.app.geometry("940x620")
+        self.app.update()
+        viewport = self.app.editor.master
+        for channel in (0, 1):
+            self.app.select_zone(channel)
+            self.app.update()
+            entry = next(
+                widget for widget in self.app.editor.winfo_children()
+                if isinstance(widget, ctk.CTkEntry)
+            )
+            for target in (viewport, self.app.editor, entry._entry):
+                with self.subTest(channel=channel, target=str(target)):
+                    viewport.yview_moveto(0)
+                    self.app.update()
+                    target.event_generate("<Button-5>")
+                    self.app.update()
+                    self.assertGreater(viewport.yview()[0], 0)
+                    target.event_generate("<Button-4>")
+                    self.app.update()
+                    self.assertAlmostEqual(viewport.yview()[0], 0)
+
+            viewport.yview_moveto(0.5)
+            self.app.update()
+            position = viewport.yview()
+            for target in (self.app.manual_button, self.app.zone_buttons[channel]):
+                for event in ("<Button-4>", "<Button-5>"):
+                    target.event_generate(event)
+                    self.app.update()
+                    self.assertEqual(viewport.yview(), position)
+
+    def test_existing_mouse_wheel_and_scrollbar_still_scroll_editor(self) -> None:
+        self.app.geometry("940x620")
+        self.app.update()
+        viewport = self.app.editor.master
+        viewport.yview_moveto(0)
+        viewport.event_generate("<MouseWheel>", delta=-120)
+        self.app.update()
+        self.assertGreater(viewport.yview()[0], 0)
+        viewport.event_generate("<MouseWheel>", delta=120)
+        self.app.update()
+        self.assertAlmostEqual(viewport.yview()[0], 0)
+        self.app.editor._scrollbar.cget("command")("moveto", 1)
+        self.app.update()
+        self.assertAlmostEqual(viewport.yview()[1], 1)
 
     def test_weekly_overview_all_days_periods_warnings_and_navigation(self) -> None:
         for day in range(7):
@@ -202,6 +683,11 @@ class RainPauseGuiTests(unittest.TestCase):
                 other.select_zone(15)
                 self.assertEqual(other.selected, 15)
                 self.assertEqual(other.board_selector.get(), "Channels 9-16")
+                self.assertIsNone(other.pump_setting)
+                self.assertIn("Pump: independent", other.channel_summary.cget("text"))
+                other.rain_setting.toggle()
+                self.assertTrue(other.fields[15].rain_pause_exempt.get())
+                self.assertEqual(other.rain_pause_exempt_buttons[15].cget("text"), "R-")
                 other.fields[15].name.set("Second board end")
                 self.assertTrue(other.save())
                 self.assertEqual(load_zones(running.config)[15].name, "Second board end")
@@ -209,7 +695,74 @@ class RainPauseGuiTests(unittest.TestCase):
                 self.assertTrue(secondary.states[7])
                 self.assertFalse(running.device.states[7])
                 other.show_weekly_overview()
-                self.assertEqual(len(other.weekly_overview.cells), 105)
+                self.assertEqual(len(other.weekly_overview.cells), 56)
+                other.fields[0].schedule[0][0].set("0900")
+                other.fields[0].schedule[0][1].set("0910")
+                other.fields[15].schedule[0][0].set("1000")
+                other.fields[15].schedule[0][1].set("1010")
+                other.show_overview()
+                other.overview.day.set("Mon")
+                other.overview.refresh()
+                self.assertEqual([row.channel for row in other.overview.rows], [15])
+                self.assertIn("Channels 9-16", other.overview.summary.cget("text"))
+                self.assertIn("Channels 9-16", other.weekly_overview.summary.cget("text"))
+                other.overview.table.selection_set("0")
+                other.overview.open_selected()
+                self.assertEqual(other.selected, 15)
+                other.board_selector.set("Channels 1-8")
+                other.show_board("Channels 1-8")
+                self.assertEqual([row.channel for row in other.overview.rows], [0])
+                self.assertEqual({channel for channel, _day in other.weekly_overview.cells}, set(range(7)))
+                self.assertIn("Channels 1-8", other.weekly_overview.summary.cget("text"))
+                other.select_zone(15)
+                self.assertEqual([row.channel for row in other.overview.rows], [15])
+                self.assertEqual({channel for channel, _day in other.weekly_overview.cells}, set(range(8, 16)))
+                other.weekly_overview.open_channel(15)
+                self.assertEqual(other.selected, 15)
+            finally:
+                other.dirty = False
+                other.on_close()
+
+    def test_switching_banks_switches_schedule_editor_without_changing_times(self) -> None:
+        secondary = FakeDevice()
+        secondary.host = "192.0.2.2"
+        with tempfile.TemporaryDirectory() as directory, RunningService(Path(directory), secondary) as running:
+            other = SprinklerApp(running.config, ServiceClient(running.path))
+            try:
+                other.AUTOSAVE_DELAY_MS = 60_000
+                other.schedule_day_menu._dropdown_callback("Wed")
+                other.fields[0].schedule[2][0].set("08:00")
+                other.fields[0].schedule[2][1].set("08:10")
+                other.fields[8].schedule[2][0].set("09:00")
+                other.fields[8].schedule[2][1].set("09:10")
+                original = [fields.read() for fields in other.fields]
+                other.board_selector.set("Channels 9-16")
+                other.show_board("Channels 9-16")
+                other.update()
+                self.assertEqual(other.selected, 8)
+                self.assertEqual(other.heading.cget("text"), "ZONE 9 CONFIGURATION")
+                self.assertEqual(other.schedule_day.get(), "Wed")
+                self.assertEqual(other.schedule_entries[2, 0].get(), "09:00")
+                self.assertTrue(other.schedule_entries[2, 0].winfo_ismapped())
+                other.schedule_entries[2, 0].delete(0, "end")
+                other.schedule_entries[2, 0].insert(0, "09:01")
+                self.assertEqual(other.fields[8].schedule[2][0].get(), "09:01")
+                self.assertEqual(other.fields[0].read(), original[0])
+                other.select_zone(15)
+                other.show_board("Channels 9-16")
+                self.assertEqual(other.selected, 15)
+                other.schedule_view_button.invoke()
+                other.board_selector.set("Channels 1-8")
+                other.show_board("Channels 1-8")
+                other.update()
+                self.assertEqual(other.selected, 0)
+                self.assertEqual(other.schedule_entries[2, 0].get(), "08:00")
+                self.assertTrue(other.schedule_week_view)
+                self.assertEqual(sum(entry.winfo_ismapped() for entry in other.schedule_entries.values()), 56)
+                self.assertEqual(other.fields[8].schedule[2][0].get(), "09:01")
+                other.select_zone(12)
+                self.assertEqual(other.selected, 12)
+                self.assertEqual(other.board_selector.get(), "Channels 9-16")
             finally:
                 other.dirty = False
                 other.on_close()
@@ -224,6 +777,49 @@ class RainPauseGuiTests(unittest.TestCase):
         self.assertTrue(self.app.dirty)
         self.assertEqual(load_zones(self.path), original)
         self.assertIn("invalid settings not saved", self.app.system_status.cget("text"))
+
+    def test_timetable_dialog_tracks_bank_and_load_preserves_other_bank_edits(self) -> None:
+        secondary = FakeDevice()
+        secondary.host = "192.0.2.2"
+        with tempfile.TemporaryDirectory() as directory, RunningService(Path(directory), secondary) as running:
+            other = SprinklerApp(running.config, ServiceClient(running.path))
+            try:
+                self.assertTrue(other.save_profile("Garden"))
+                other.show_profiles()
+                window = other.profile_window
+                self.assertIn("Channels 1-8", window.title())
+                other.select_zone(8)
+                self.assertIn("Channels 9-16", window.title())
+                self.assertEqual(other.timetable_status()["names"], [])
+                other.fields[8].schedule[0][0].set("0900")
+                other.fields[8].schedule[0][1].set("0910")
+                self.assertTrue(other.save_profile("Fans"))
+                other.fields[8].schedule[0][0].set("1000")
+                other.fields[8].schedule[0][1].set("1010")
+                self.assertTrue(other.save_profile("Evening"))
+                other.fields[0].schedule[0][0].set("invalid")
+                primary = list(other.controller.zones[:8])
+                with patch("app.messagebox.askyesno", return_value=True) as confirm:
+                    self.assertTrue(other.load_profile("Fans"))
+                self.assertIn("channels 9-16 only", confirm.call_args.args[1])
+                self.assertEqual(other.controller.zones[:8], primary)
+                self.assertEqual(other.fields[0].schedule[0][0].get(), "invalid")
+                self.assertTrue(other.dirty)
+                self.assertEqual(other.fields[8].schedule[0][0].get(), "09:00")
+                self.assertFalse(other.timetable_status()["modified"])
+                with patch("app.messagebox.askyesno", return_value=True):
+                    self.assertTrue(other.load_profile("Before last load"))
+                self.assertEqual(other.fields[8].schedule[0][0].get(), "10:00")
+                other.select_zone(0)
+                self.assertIn("Channels 1-8", window.title())
+                self.assertEqual(other.timetable_status()["names"], ["Garden"])
+                self.assertEqual(other.timetable_status()["selected"], "Garden")
+                self.assertTrue(other.timetable_status()["modified"])
+                other.select_zone(8)
+                self.assertFalse(other.timetable_status()["modified"])
+            finally:
+                other.dirty = False
+                other.on_close()
 
     def test_profiles_save_load_confirm_and_restore_previous_timetable(self) -> None:
         self.assertTrue(self.app.save_profile("Summer"))
@@ -347,6 +943,7 @@ class RainPauseGuiTests(unittest.TestCase):
         self.app.AUTOSAVE_DELAY_MS = 20
         control = self.app.pump_exempt_buttons[0]
         self.assertEqual(control.cget("text"), "P")
+        self.assertEqual(control.cget("text_color"), GREY)
         control.invoke()
         deadline = time.monotonic() + 2
         while self.app.dirty and time.monotonic() < deadline:
@@ -355,44 +952,83 @@ class RainPauseGuiTests(unittest.TestCase):
         self.assertFalse(self.app.dirty)
         self.assertTrue(load_zones(self.path)[0].pump_exempt)
         self.assertEqual(control.cget("text"), "P-")
+        self.assertEqual(control.cget("text_color"), RUNNING_RED)
         self.assertIn(0, self.app.controller.runs)
         self.assertFalse(self.app.controller.pump_on)
         self.assertFalse(self.app.fields[0].rain_pause_exempt.get())
         self.assertEqual(self.app.pump_exempt_buttons[7].cget("state"), "disabled")
+        control.invoke()
+        self.assertTrue(self.app.save())
+        self.assertEqual(control.cget("text"), "P")
+        self.assertEqual(control.cget("text_color"), GREY)
+
+    def test_selected_channel_exclusion_controls_and_pending_summary(self) -> None:
+        self.assertIn("Lawn / Pump: uses pump / Rain Pause: stops", self.app.channel_summary.cget("text"))
+        self.assertEqual(self.app.pump_setting.cget("text"), "Master pump: uses pump")
+        self.assertEqual(self.app.rain_setting.cget("text"), "Rain Pause: stops this channel")
+        self.app.pump_setting.toggle()
+        self.app.rain_setting.toggle()
+        self.assertTrue(self.app.fields[0].pump_exempt.get())
+        self.assertTrue(self.app.fields[0].rain_pause_exempt.get())
+        self.assertEqual(self.app.pump_exempt_buttons[0].cget("text"), "P-")
+        self.assertEqual(self.app.rain_pause_exempt_buttons[0].cget("text"), "R-")
+        self.assertIn("Unsaved - not yet applied", self.app.channel_summary.cget("text"))
+        self.assertTrue(self.app.save())
+        self.assertIn("Pump: excluded / Rain Pause: continues", self.app.channel_summary.cget("text"))
+        self.assertNotIn("Unsaved", self.app.channel_summary.cget("text"))
+        self.app.pump_exempt_buttons[0].invoke()
+        self.assertEqual(self.app.pump_setting.cget("text"), "Master pump: uses pump")
+        self.app.rain_pause_exempt_buttons[0].invoke()
+        self.assertEqual(self.app.rain_setting.cget("text"), "Rain Pause: stops this channel")
+        self.app.faulted = True
+        self.app._refresh()
+        self.assertEqual(self.app.pump_setting.cget("state"), "disabled")
+        self.assertEqual(self.app.rain_setting.cget("state"), "disabled")
+        self.app.faulted = False
 
     def test_exempt_zone_control_saves_and_marks_the_zone_red_during_pause(self) -> None:
         control = self.app.rain_pause_exempt_buttons[0]
-        self.assertEqual(control.cget("text"), "+")
+        self.assertEqual(control.cget("text"), "R")
         control.invoke()
         self.assertTrue(self.app.fields[0].rain_pause_exempt.get())
-        self.assertEqual(control.cget("text"), "X")
+        self.assertEqual(control.cget("text"), "R-")
         self.assertTrue(self.app.dirty)
         self.assertTrue(self.app.save())
         self.pause()
-        self.assertEqual(control.cget("text"), "X")
+        self.assertEqual(control.cget("text"), "R-")
         self.assertEqual(control.cget("text_color"), RUNNING_RED)
         self.assertIn(0, self.app.controller.runs)
         self.assertEqual(self.app.manual_button.cget("state"), "normal")
+        control.invoke()
+        self.assertFalse(self.app.fields[0].rain_pause_exempt.get())
+        self.assertEqual(control.cget("text"), "R")
 
-    def test_start_header_pauses_and_saves_that_window_number(self) -> None:
+    def test_pause_button_sits_below_start_and_saves_that_group(self) -> None:
         times = next(
             widget for widget in self.app.editor.winfo_children()
             if int(widget.grid_info()["row"]) == 5
         )
         start_two = next(
             widget for widget in times.winfo_children()
-            if isinstance(widget, ctk.CTkButton) and widget.cget("text") == "Start 2"
+            if isinstance(widget, ctk.CTkLabel) and widget.cget("text") == "Start 2"
         )
-        start_two.invoke()
+        button = self.app.window_pause_buttons[1]
+        self.assertEqual(button.grid_info()["column"], start_two.grid_info()["column"])
+        self.assertEqual(int(button.grid_info()["row"]), int(start_two.grid_info()["row"]) + 1)
+        button.invoke()
         self.assertTrue(self.app.fields[0].paused_windows[1].get())
-        self.assertEqual(self.app.window_pause_labels[1].cget("text"), "Paused")
-        self.assertLess(
-            self.app.window_pause_labels[1].cget("font")[1],
-            start_two.cget("font")[1],
-        )
+        self.assertEqual(button.cget("text"), "Paused")
+        self.assertEqual(button.cget("fg_color"), "#b63e4b")
         self.assertTrue(self.app.dirty)
         self.assertTrue(self.app.save())
         self.assertTrue(load_zones(self.path)[0].paused_windows[1])
+        self.app.schedule_view_button.invoke()
+        self.assertEqual(self.app.window_pause_buttons[1].cget("text"), "Paused")
+        self.app.select_zone(1)
+        self.assertTrue(all(button.cget("text") == "Not Paused" for button in self.app.window_pause_buttons))
+        self.app.select_zone(0)
+        self.assertEqual(self.app.window_pause_buttons[1].cget("text"), "Paused")
+        self.assertEqual(len(self.app.window_pause_buttons), 4)
 
     def test_short_time_inputs_display_as_hhmm_and_use_narrow_fields(self) -> None:
         start = self.app.fields[0].schedule[0][0]
@@ -479,7 +1115,7 @@ class RainPauseGuiTests(unittest.TestCase):
         self.assertEqual(self.app.manual_button.cget("text"), "STOP THIS ZONE")
         self.app.manual_button.invoke()
         self.assertNotIn(0, self.app.controller.runs)
-        self.assertEqual(self.app.manual_button.cget("text"), "RUN ZONE (10 min max)")
+        self.assertEqual(self.app.manual_button.cget("text"), "RUN ZONE")
         self.app.manual_button.invoke()
         self.assertEqual(self.app.controller.runs[0].source, "Manual")
         self.assertEqual(self.app.manual_button.cget("text"), "STOP THIS ZONE")
@@ -578,13 +1214,14 @@ class RainPauseGuiTests(unittest.TestCase):
             other.on_close()
 
     def test_compact_layout_keeps_actions_visible_at_opening_and_minimum_sizes(self) -> None:
+        self.app.schedule_view_button.invoke()
         for size in ("940x760", "940x620"):
             with self.subTest(size=size):
                 self.app.geometry(size)
                 self.app.update()
                 for widget in (
                     self.app.manual_button,
-                    self.app.stop_all_button, self.app.save_button,
+                    self.app.stop_all_button, self.app.save_button, self.app.backup_button,
                     self.app.overview_button,
                     self.app.weekly_button, self.app.profiles_button,
                     self.app.rain_pause_switch, *self.app.zone_buttons[:8],
@@ -604,6 +1241,8 @@ class RainPauseGuiTests(unittest.TestCase):
                     self.app.editor.master.winfo_rooty() + self.app.editor.master.winfo_height(),
                     self.app.manual_button.winfo_rooty(),
                 )
+                self.app.editor.master.yview_moveto(1)
+                self.app.update()
                 table = next(
                     widget for widget in self.app.editor.winfo_children()
                     if int(widget.grid_info()["row"]) == 5
@@ -655,6 +1294,12 @@ class RainPauseGuiTests(unittest.TestCase):
                     self.app.validation.winfo_rooty() + self.app.validation.winfo_height(),
                     viewport.winfo_rooty() + viewport.winfo_height(),
                 )
+                for control in (self.app.pump_setting, self.app.rain_setting):
+                    self.assertGreaterEqual(control.winfo_rooty(), viewport.winfo_rooty())
+                    self.assertLessEqual(
+                        control.winfo_rooty() + control.winfo_height(),
+                        viewport.winfo_rooty() + viewport.winfo_height(),
+                    )
 
     def test_service_desktop_controls_and_close_do_not_reset_hardware(self) -> None:
         with tempfile.TemporaryDirectory() as directory, RunningService(Path(directory)) as running:

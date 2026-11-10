@@ -35,9 +35,56 @@
         <span id="updated">Loading status…</span>
         <button id="stop-all" class="danger" type="button">STOP ALL</button>
       </div>
+      <section class="panel running-summary">
+        <h2>Currently running</h2>
+        <div id="running-summary" role="status">Loading status…</div>
+      </section>
       <div id="channels" class="channels"></div>
-      <p class="footnote">Manual runs stop automatically after 10 minutes. The master pump is automatic.</p>
+      <section class="panel activity">
+        <h2>Activity history</h2>
+        <p>Controller-reported commands, not proof of physical operation.</p>
+        <label for="history-filter">Show</label>
+        <select id="history-filter"><option value="all">All activity</option></select>
+        <div id="history-status" role="status"></div>
+        <ol id="history-list"></ol>
+        <div class="history-actions">
+          <button id="history-newer" class="quiet" type="button">Newer</button>
+          <button id="history-older" class="quiet" type="button">Older</button>
+          <button id="history-refresh" class="quiet" type="button">Refresh</button>
+        </div>
+      </section>
+      <section class="panel activity">
+        <h2>Full system backup and restore</h2>
+        <p>Encrypted backup of all saved channels, timetables, Rain Pause, relay connections, Tapo assignments and credentials, the standard phone password, activity history and service configuration. Not an Ubuntu image. Active runs are never restored.</p>
+        <p>Choose a separate backup password of at least 12 characters. Store it in a password manager or a safe place separate from the backup. It is not your Tapo or phone password. Lost backup passwords cannot be recovered.</p>
+        <div class="history-actions">
+          <button id="backup-export" class="quiet" type="button" disabled>Export full backup</button>
+          <button id="backup-restore" class="quiet" type="button" disabled>Restore full backup</button>
+          <button id="resume-operation" class="danger hidden" type="button">Resume operation</button>
+          <input id="backup-file" class="hidden" type="file" accept=".sprinkler-backup,application/json">
+        </div>
+        <p id="backup-status" role="status"></p>
+      </section>
+      <p class="footnote">Timed runs stop automatically while the controller is working. RUN UNTIL STOPPED requires a saved master pump exclusion and no manual maximum; it has no time limit, even if your phone disconnects. Adding or lowering a manual maximum stops an active manual run. Rain Pause exemptions still apply. Manual runs stop on controller restart; communication failure can prevent an OFF command from reaching the relay. The master pump is automatic.</p>
     </section>
   </main>
+  <dialog id="backup-password-dialog">
+    <form id="backup-password-form">
+      <h2 id="backup-password-title">Backup password</h2>
+      <p>Use your separate backup password, not your Tapo or phone sign-in password. Lost backup passwords cannot be recovered.</p>
+      <label for="backup-password">Backup password</label>
+      <input id="backup-password" type="password" maxlength="1024" autocomplete="off" required>
+      <div id="backup-confirm-row">
+        <label for="backup-password-confirm">Enter the password again</label>
+        <input id="backup-password-confirm" type="password" maxlength="1024" autocomplete="off">
+      </div>
+      <label><input id="backup-password-show" type="checkbox"> Show password</label>
+      <p id="backup-password-error" role="alert"></p>
+      <div class="history-actions">
+        <button class="primary" type="submit">Continue</button>
+        <button id="backup-password-cancel" class="quiet" type="button">Cancel</button>
+      </div>
+    </form>
+  </dialog>
 </body>
 </html>

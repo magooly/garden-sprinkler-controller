@@ -15,6 +15,23 @@ body {
   min-width: 320px;
 }
 
+dialog {
+  width: min(94vw, 540px);
+  border: 1px solid #617968;
+  border-radius: 14px;
+  padding: 24px;
+  background: #19241e;
+  color: #eef4ef;
+}
+
+dialog::backdrop {
+  background: #000a;
+}
+
+dialog input[type="checkbox"] {
+  width: auto;
+}
+
 main {
   width: min(100% - 28px, 620px);
   margin: 0 auto;
@@ -76,13 +93,15 @@ form {
 }
 
 input,
+select,
 button {
   min-height: 48px;
   border-radius: 10px;
   font: inherit;
 }
 
-input {
+input,
+select {
   width: 100%;
   padding: 10px 12px;
   border: 1px solid #506657;
@@ -135,6 +154,15 @@ button:disabled {
   gap: 10px;
 }
 
+.running-summary {
+  margin-bottom: 12px;
+}
+
+.running-summary ul {
+  margin: 0;
+  padding-left: 1.25rem;
+}
+
 .channel {
   padding: 14px;
 }
@@ -156,12 +184,50 @@ button:disabled {
   font-size: 0.82rem;
 }
 
+.duration-controls {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  color: #b7c8bc;
+  font-size: 0.88rem;
+}
+
+.duration-controls select {
+  width: 100%;
+}
+
+.duration-summary {
+  grid-column: 1 / -1;
+}
+
+.reminder-controls {
+  margin: 12px 0 0;
+}
+
 .channel-state {
   margin: 5px 0 0;
 }
 
 .channel-actions button {
   flex: 1;
+}
+
+.channel-actions {
+  flex-wrap: wrap;
+}
+
+.channel-actions .continuous {
+  flex-basis: 100%;
+  background: #e5b663;
+  color: #221807;
+}
+
+.channel-actions .continuous.running {
+  background: #236ac0;
+  color: #fff;
+  opacity: 1;
 }
 
 .notice {
@@ -176,6 +242,21 @@ button:disabled {
 
 .notice.visible {
   display: block;
+}
+
+.activity {
+  margin-top: 16px;
+}
+
+.activity li {
+  margin-bottom: 8px;
+  overflow-wrap: anywhere;
+}
+
+.history-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
 .footnote {

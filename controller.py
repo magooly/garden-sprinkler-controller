@@ -8,7 +8,7 @@ import re
 import tempfile
 import time
 from dataclasses import dataclass, field, replace
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Callable, Mapping, Protocol
 
@@ -19,6 +19,7 @@ MAX_ZONE_COUNT = 16
 MASTER_PUMP_CHANNEL: int | None = 7
 MANUAL_SECONDS = 10 * 60
 TEST_SECONDS = 10 * 60
+MAX_MANUAL_MINUTES = 1440
 DAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 WINDOW_COUNT = 4
 
@@ -86,6 +87,24 @@ def overlapping_windows(row: tuple[str, ...]) -> tuple[tuple[int, int], ...]:
     return tuple(conflicts)
 
 
+def next_scheduled_start(zone: Zone, now: datetime) -> datetime | None:
+    if not zone.enabled:
+        return None
+    candidates = []
+    for offset in range(8):
+        day = now.date() + timedelta(days=offset)
+        row = zone.schedule[day.weekday()]
+        for slot, start in enumerate(row[::2]):
+            if start and not zone.paused_windows[slot]:
+                minute = parse_time(start)
+                candidate = datetime.combine(day, datetime.min.time()).replace(
+                    hour=minute // 60, minute=minute % 60,
+                )
+                if candidate > now:
+                    candidates.append(candidate)
+    return min(candidates) if candidates else None
+
+
 @dataclass(frozen=True)
 class Zone:
     name: str
@@ -96,6 +115,8 @@ class Zone:
     paused_windows: tuple[bool, ...] = (False,) * WINDOW_COUNT
     rain_pause_exempt: bool = False
     pump_exempt: bool = False
+    max_manual_minutes: int | None = None
+    continuous_reminder_minutes: int | None = None
 
     def validate(self) -> None:
         if not isinstance(self.name, str) or not self.name.strip():
@@ -108,6 +129,16 @@ class Zone:
             raise ValueError("Rain Pause exemption must be true or false.")
         if type(self.pump_exempt) is not bool:
             raise ValueError("Master pump exemption must be true or false.")
+        if self.max_manual_minutes is not None and (
+            type(self.max_manual_minutes) is not int
+            or not 1 <= self.max_manual_minutes <= MAX_MANUAL_MINUTES
+        ):
+            raise ValueError("Manual maximum must be blank or 1 to 1440 minutes.")
+        if self.continuous_reminder_minutes is not None and (
+            type(self.continuous_reminder_minutes) is not int
+            or not 1 <= self.continuous_reminder_minutes <= MAX_MANUAL_MINUTES
+        ):
+            raise ValueError("Continuous reminder must be blank or 1 to 1440 minutes.")
         if (
             not isinstance(self.paused_windows, tuple)
             or len(self.paused_windows) != WINDOW_COUNT
@@ -190,8 +221,8 @@ def load_zones(path: Path) -> list[Zone]:
 
 
 def decode_zones(data: object) -> list[Zone]:
-    if not isinstance(data, dict) or type(data.get("version")) is not int or data["version"] not in (1, 2, 3, 4, 5, 6, 7):
-        raise ValueError("Unsupported settings format; expected version 1, 2, 3, 4, 5, 6, or 7.")
+    if not isinstance(data, dict) or type(data.get("version")) is not int or data["version"] not in (1, 2, 3, 4, 5, 6, 7, 8, 9):
+        raise ValueError("Unsupported settings format; expected version 1 through 9.")
     records = data.get("zones")
     if not isinstance(records, list):
         raise ValueError("Settings must contain a list of zones.")
@@ -225,6 +256,10 @@ def decode_zones(data: object) -> list[Zone]:
             )
             if data["version"] >= 7:
                 expected_fields.add("pump_exempt")
+            if data["version"] >= 8:
+                expected_fields.add("max_manual_minutes")
+            if data["version"] >= 9:
+                expected_fields.add("continuous_reminder_minutes")
             if set(record) != expected_fields:
                 raise ValueError("Zone settings contain unexpected or missing fields.")
             if not isinstance(record["schedule"], list):
@@ -256,6 +291,8 @@ def decode_zones(data: object) -> list[Zone]:
             paused_windows=paused_windows,
             rain_pause_exempt=rain_pause_exempt,
             pump_exempt=record["pump_exempt"] if data["version"] >= 7 else False,
+            max_manual_minutes=record["max_manual_minutes"] if data["version"] >= 8 else None,
+            continuous_reminder_minutes=record["continuous_reminder_minutes"] if data["version"] >= 9 else None,
         ))
     validate_zones(zones)
     return zones
@@ -269,7 +306,7 @@ def save_zones(path: Path, zones: list[Zone]) -> None:
 def encode_zones(zones: list[Zone]) -> dict[str, object]:
     validate_zones(zones)
     return {
-        "version": 7,
+        "version": 9,
         "zones": [
             {
                 "name": zone.name.strip(),
@@ -278,6 +315,8 @@ def encode_zones(zones: list[Zone]) -> dict[str, object]:
                 "paused_windows": list(zone.paused_windows),
                 "rain_pause_exempt": zone.rain_pause_exempt,
                 "pump_exempt": zone.pump_exempt,
+                "max_manual_minutes": zone.max_manual_minutes,
+                "continuous_reminder_minutes": zone.continuous_reminder_minutes,
             }
             for zone in zones
         ],
@@ -335,8 +374,9 @@ class RelayBackend(Protocol):
 @dataclass(frozen=True)
 class Run:
     source: str
-    deadline: float
+    deadline: float | None
     window_key: tuple[date, str, str] | None = None
+    started: float | None = None
 
 
 class Controller:
@@ -348,20 +388,29 @@ class Controller:
         *,
         rain_paused: bool = False,
         channel_count: int | None = None,
+        activity: Callable[[int | None, str, str, str], None] | None = None,
+        available_channels: frozenset[int] | None = None,
     ) -> None:
         validate_zones(zones)
         self.channel_count = len(zones) if channel_count is None else channel_count
         if self.channel_count not in (8, 16) or self.channel_count > len(zones):
             raise ValueError("Configured channel count must be 8 or 16 and fit the zone settings.")
+        self.available_channels = (
+            frozenset(range(self.channel_count)) if available_channels is None else available_channels
+        )
+        if not self.available_channels.issubset(range(self.channel_count)) or not frozenset(range(8)).issubset(self.available_channels):
+            raise ValueError("Available channels must include the primary board and fit the configured count.")
         self.zones = list(zones)
         self.backend = backend
         self.clock = clock
         self.runs: dict[int, Run] = {}
         self.blocked: dict[int, set[tuple[date, str, str]]] = {}
         self.closed = False
+        self.operation_held = False
         self.rain_paused = rain_paused
         self.master_channel = MASTER_PUMP_CHANNEL
         self.pump_on = False
+        self.activity = activity
         errors: list[Exception] = []
         for channel in self._shutdown_channels():
             try:
@@ -373,7 +422,7 @@ class Controller:
             raise ExceptionGroup("Some relays could not be initialized OFF", errors)
 
     def _current_windows(self, channel: int, now: datetime) -> tuple[tuple[date, str, str], ...]:
-        if channel == self.master_channel or channel >= self.channel_count:
+        if channel == self.master_channel or channel not in self.available_channels:
             return ()
         return tuple(
             (now.date(), start, stop)
@@ -386,18 +435,32 @@ class Controller:
         if window is not None:
             blocked.setdefault(channel, set()).add(window)
 
-    def _off(self, channel: int) -> None:
+    def _record(self, channel: int | None, event: str, reason: str) -> None:
+        if self.activity is not None:
+            name = "Controller" if channel is None else (
+                "Master Pump" if channel == self.master_channel else self.zones[channel].name
+            )
+            self.activity(channel, name, event, reason)
+
+    def _off(self, channel: int, reason: str) -> None:
         if channel in self.runs:
+            pump_stopped = False
             if self._uses_pump(channel) and self.pump_on and not any(
                 other != channel and self._uses_pump(other) for other in self.runs
             ):
                 self.backend.set_relay(self.master_channel, False)
                 self.pump_on = False
-            self.backend.set_relay(channel, False)
+                pump_stopped = True
+            try:
+                self.backend.set_relay(channel, False)
+            finally:
+                if pump_stopped:
+                    self._record(self.master_channel, "OFF", reason)
             del self.runs[channel]
+            self._record(channel, "OFF", reason)
 
     def _shutdown_channels(self) -> tuple[int, ...]:
-        channels = tuple(channel for channel in range(self.channel_count) if channel != self.master_channel)
+        channels = tuple(channel for channel in sorted(self.available_channels) if channel != self.master_channel)
         return channels if self.master_channel is None else (self.master_channel, *channels)
 
     def _uses_pump(self, channel: int) -> bool:
@@ -409,15 +472,21 @@ class Controller:
     def _on(self, channel: int, run: Run, now: datetime) -> None:
         try:
             self.backend.set_relay(channel, True)
+            previous = self.runs.get(channel)
             self.runs[channel] = run
+            pump_started = False
             if self._uses_pump(channel) and self.master_channel is not None and not self.pump_on:
                 self.backend.set_relay(self.master_channel, True)
                 self.pump_on = True
+                pump_started = True
+            self._record(channel, "ON" if previous is None else "RUN UPDATED", run.source)
+            if pump_started:
+                self._record(self.master_channel, "ON", "Automatic pump demand")
         except (OSError, RuntimeError) as exc:
             # An uncertain valve/pump ON must never leave scheduling running.
             self.closed = True
             try:
-                self.stop_all(now, suppress=False)
+                self.stop_all(now, suppress=False, reason="Start failure")
             except ExceptionGroup as shutdown_error:
                 raise ExceptionGroup(
                     "Watering start failed; shutdown also failed",
@@ -425,29 +494,51 @@ class Controller:
                 ) from exc
             raise
 
-    def stop(self, channel: int, now: datetime) -> None:
+    def stop(self, channel: int, now: datetime, *, reason: str = "Stop channel") -> None:
         """Stop immediately and suppress only currently active schedule windows."""
         if channel == self.master_channel:
             raise RuntimeError("The master pump is controlled automatically by garden zones.")
         run = self.runs.get(channel)
-        self._off(channel)
+        self._off(channel, reason)
         if run is not None and run.source == "Routine":
             self._block(channel, run.window_key, self.blocked)
         for window in self._current_windows(channel, now):
             self._block(channel, window, self.blocked)
 
-    def start_manual(self, channel: int, now: datetime, *, test: bool = False) -> None:
+    def start_manual(
+        self, channel: int, now: datetime, *, test: bool = False, continuous: bool = False,
+        duration_minutes: int = 10,
+    ) -> None:
+        if test and continuous:
+            raise ValueError("A test run cannot be continuous.")
+        if type(duration_minutes) is not int or not 1 <= duration_minutes <= MAX_MANUAL_MINUTES:
+            raise ValueError("Manual duration must be 1 to 1440 minutes.")
         if self.closed:
             raise RuntimeError("Controller is closed.")
+        if self.operation_held:
+            raise ValueError("Operation is held after restore. Review devices and explicitly resume operation first.")
         if type(channel) is not int or channel not in range(self.channel_count):
             raise ValueError("Relay channel is not configured.")
+        if channel not in self.available_channels:
+            raise ValueError("This channel has no assigned output device.")
         if channel == self.master_channel:
             raise RuntimeError("The master pump is controlled automatically by garden zones.")
         if self.rain_paused and not self.zones[channel].rain_pause_exempt:
             raise RuntimeError("Rain Pause is enabled. All watering is disabled.")
-        duration = TEST_SECONDS if test else MANUAL_SECONDS
+        if continuous and self._uses_pump(channel):
+            raise ValueError("Continuous runs require the saved master pump exclusion to be enabled.")
+        maximum = self.zones[channel].max_manual_minutes
+        if continuous and maximum is not None:
+            raise ValueError("Until stopped is unavailable while a manual maximum is set.")
+        duration = TEST_SECONDS if test else duration_minutes * 60
+        if maximum is not None and not continuous and duration > maximum * 60:
+            raise ValueError(f"Manual duration exceeds this channel's {maximum}-minute maximum.")
         active_windows = self._current_windows(channel, now)
-        self._on(channel, Run("Test" if test else "Manual", self.clock() + duration), now)
+        self._on(channel, Run(
+            "Continuous" if continuous else "Test" if test else "Manual",
+            None if continuous else self.clock() + duration,
+            started=self.clock() if continuous else None,
+        ), now)
         for window in active_windows:
             self._block(channel, window, self.blocked)
 
@@ -458,7 +549,7 @@ class Controller:
         if run is not None:
             if run.source != "Test":
                 raise RuntimeError("Stop the current watering run before starting a test.")
-            self.stop(channel, now)
+            self.stop(channel, now, reason="Manual maximum changed")
         else:
             self.start_manual(channel, now, test=True)
 
@@ -466,17 +557,45 @@ class Controller:
         validate_zones(zones)
         if len(zones) != len(self.zones):
             raise ValueError("Zone count changed; reopen the desktop before editing.")
-        # A changed routine cancels its scheduled run; manual/test runs are independent.
+        # A changed routine cancels its scheduled run; manual runs are independent.
         for channel, zone in enumerate(zones):
             previous = self.zones[channel]
-            if replace(zone, name=previous.name, pump_exempt=previous.pump_exempt) != previous:
+            for slot, (was_paused, paused) in enumerate(zip(previous.paused_windows, zone.paused_windows)):
+                if was_paused and not paused:
+                    start, stop = zone.schedule[now.weekday()][slot * 2:slot * 2 + 2]
+                    if start and stop and parse_time(start) <= now.hour * 60 + now.minute < parse_time(stop):
+                        self._block(channel, (now.date(), start, stop), self.blocked)
+            run = self.runs.get(channel)
+            if (
+                run is not None and run.source in ("Manual", "Test", "Continuous")
+                and zone.max_manual_minutes is not None
+                and (previous.max_manual_minutes is None
+                     or zone.max_manual_minutes < previous.max_manual_minutes)
+            ):
+                self.stop(channel, now, reason="Pump exclusion removed")
+                continue
+            if run is not None and run.source == "Continuous" and channel < 8 and not zone.pump_exempt:
+                self.stop(channel, now)
+                continue
+            if replace(
+                zone, name=previous.name, pump_exempt=previous.pump_exempt,
+                max_manual_minutes=previous.max_manual_minutes,
+                continuous_reminder_minutes=previous.continuous_reminder_minutes,
+                paused_windows=previous.paused_windows,
+            ) != previous:
                 run = self.runs.get(channel)
                 if run is not None and (
                     run.source == "Routine"
                     or (self.rain_paused and previous.rain_pause_exempt
                         and not zone.rain_pause_exempt)
                 ):
-                    self._off(channel)
+                    self._off(channel, "Settings changed")
+            elif (
+                run is not None and run.source == "Routine" and run.window_key is not None
+                and previous.paused_windows != zone.paused_windows
+                and run.window_key[1:] not in zone.scheduled_windows(now)
+            ):
+                self._off(channel, "Schedule group paused")
         self.zones = list(zones)
         if self.master_channel is not None:
             pump_needed = any(self._uses_pump(channel) for channel in self.runs)
@@ -484,10 +603,11 @@ class Controller:
                 try:
                     self.backend.set_relay(self.master_channel, pump_needed)
                     self.pump_on = pump_needed
+                    self._record(self.master_channel, "ON" if pump_needed else "OFF", "Pump settings changed")
                 except (OSError, RuntimeError) as exc:
                     self.closed = True
                     try:
-                        self.stop_all(now, suppress=False)
+                        self.stop_all(now, suppress=False, reason="Pump failure")
                     except ExceptionGroup as shutdown:
                         raise ExceptionGroup(
                             "Pump update failed; shutdown also failed",
@@ -497,7 +617,7 @@ class Controller:
         self.tick(now)
 
     def tick(self, now: datetime) -> None:
-        if self.closed:
+        if self.closed or self.operation_held:
             return
         monotonic_now = self.clock()
         for channel, zone in enumerate(self.zones):
@@ -512,12 +632,12 @@ class Controller:
             windows = self._current_windows(channel, now)
             run = self.runs.get(channel)
             if run is not None:
-                if monotonic_now >= run.deadline or (
+                if (run.deadline is not None and monotonic_now >= run.deadline) or (
                     run.source == "Routine" and run.window_key not in windows
                 ):
                     if run.source == "Routine":
                         self._block(channel, run.window_key, self.blocked)
-                    self._off(channel)
+                    self._off(channel, "Schedule ended" if run.source == "Routine" else "Manual timer ended")
                 continue
             next_window = next(
                 (window for window in windows if window not in self.blocked.get(channel, set())),
@@ -543,6 +663,7 @@ class Controller:
         self.rain_paused = paused
         if paused:
             errors: list[Exception] = []
+            stopped: list[int] = []
             exempt_run_active = any(
                 self._uses_pump(channel) and zone.rain_pause_exempt
                 and channel in self.runs
@@ -557,26 +678,37 @@ class Controller:
                 try:
                     self.backend.set_relay(channel, False)
                     if channel == self.master_channel:
+                        if self.pump_on:
+                            stopped.append(channel)
                         self.pump_on = False
                     else:
+                        if channel in self.runs:
+                            stopped.append(channel)
                         self.runs.pop(channel, None)
                 except (OSError, RuntimeError) as exc:
                     errors.append(exc)
+            for channel in stopped:
+                self._record(channel, "OFF", "Rain Pause")
             if errors:
                 raise ExceptionGroup("Some relays could not be switched off", errors)
             self.tick(now)
         else:
             self.tick(now)
 
-    def stop_all(self, now: datetime, *, suppress: bool = True) -> None:
+    def stop_all(self, now: datetime, *, suppress: bool = True, reason: str = "Stop all") -> None:
         errors: list[Exception] = []
+        stopped: list[int] = []
         for channel in self._shutdown_channels():
             try:
                 # Send OFF even when local state already says OFF.
                 self.backend.set_relay(channel, False)
                 if channel == self.master_channel:
+                    if self.pump_on:
+                        stopped.append(channel)
                     self.pump_on = False
                 run = self.runs.get(channel)
+                if run is not None:
+                    stopped.append(channel)
                 if suppress and run is not None and run.source == "Routine":
                     self._block(channel, run.window_key, self.blocked)
                 if suppress:
@@ -585,9 +717,11 @@ class Controller:
                 self.runs.pop(channel, None)
             except (OSError, RuntimeError) as exc:
                 errors.append(exc)
+        for channel in stopped:
+            self._record(channel, "OFF", reason)
         if errors:
             raise ExceptionGroup("Some relays could not be switched off", errors)
 
     def close(self, now: datetime) -> None:
         self.closed = True
-        self.stop_all(now)
+        self.stop_all(now, reason="Controller shutdown")

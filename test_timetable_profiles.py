@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from controller import Zone, default_zones
 from test_controller import schedule_for
-from timetable_profiles import RECOVERY_PROFILE, TimetableProfiles
+from timetable_profiles import RECOVERY_PROFILE, TimetableProfiles, timetable
 
 
 class TimetableTests(unittest.TestCase):
@@ -39,17 +39,18 @@ class TimetableTests(unittest.TestCase):
             recovery = restarted.load(RECOVERY_PROFILE, loaded)
             self.assertEqual(recovery, winter)
 
-    def test_different_channel_count_rejected_without_replacing_recovery(self) -> None:
+    def test_eight_channel_profile_loads_into_primary_bank_after_expansion(self) -> None:
         self.store.save("Eight", default_zones())
-        original = self.store.path.read_bytes()
-        with self.assertRaisesRegex(ValueError, "channel count"):
-            self.store.load("Eight", default_zones(16))
-        self.assertEqual(self.store.path.read_bytes(), original)
+        zones = default_zones(16)
+        zones[8] = Zone("Lights", True, schedule_for((1,)))
+        loaded = self.store.load("Eight", zones)
+        self.assertEqual(loaded[8:], zones[8:])
+        self.assertEqual(self.store.status(loaded, 8)["names"], [])
 
     def test_invalid_file_is_not_silently_reset(self) -> None:
         self.store.save("Summer", default_zones())
         data = json.loads(self.store.path.read_text())
-        data["profiles"]["Summer"][0]["pump_exempt"] = True
+        data["groups"]["0"]["profiles"]["Summer"][0]["pump_exempt"] = True
         self.store.path.write_text(json.dumps(data))
         with self.assertRaises(ValueError):
             TimetableProfiles(self.path)
@@ -78,3 +79,61 @@ class TimetableTests(unittest.TestCase):
         for name in ("", " " * 3, "x" * 41, RECOVERY_PROFILE):
             with self.subTest(name=name), self.assertRaises(ValueError):
                 self.store.save(name, default_zones())
+
+    def test_banks_have_independent_names_selections_modified_state_and_recovery(self) -> None:
+        zones = default_zones(16)
+        zones[0] = Zone("Garden", True, schedule_for((0,)))
+        zones[8] = Zone("Fan", True, schedule_for((1,)))
+        self.store.save("Summer", zones, 0)
+        self.store.save("Summer", zones, 8)
+        changed = list(zones)
+        changed[0] = replace(changed[0], enabled=False)
+        changed[8] = replace(changed[8], enabled=False, name="New fan", pump_exempt=True)
+        self.store.save("Lights", changed, 8)
+        self.assertNotIn("Lights", self.store.status(changed, 0)["names"])
+        self.assertEqual(self.store.status(changed, 0)["selected"], "Summer")
+        loaded = self.store.load("Summer", changed, 8)
+        self.assertEqual(loaded[:8], changed[:8])
+        self.assertTrue(loaded[8].enabled)
+        self.assertEqual(loaded[8].name, "New fan")
+        self.assertTrue(loaded[8].pump_exempt)
+        self.assertTrue(self.store.status(loaded, 0)["modified"])
+        self.assertFalse(self.store.status(loaded, 8)["modified"])
+        loaded = self.store.load("Summer", loaded, 0)
+        self.assertEqual(loaded[8].schedule, zones[8].schedule)
+        restarted = TimetableProfiles(self.path)
+        restored = restarted.load(RECOVERY_PROFILE, loaded, 8)
+        self.assertTrue(restored[0].enabled)
+        self.assertFalse(restored[8].enabled)
+        restored = restarted.load(RECOVERY_PROFILE, restored, 0)
+        self.assertEqual(restored, changed)
+
+    def test_legacy_profiles_split_without_losing_names_or_eight_channel_profiles(self) -> None:
+        zones = default_zones(16)
+        zones[8] = Zone("Fan", True, schedule_for((1,)))
+        legacy = {
+            "version": 1, "selected": "Both",
+            "profiles": {"Both": timetable(zones), "Garden only": timetable(zones[:8])},
+        }
+        self.store.path.write_text(json.dumps(legacy))
+        store = TimetableProfiles(self.path)
+        self.assertEqual(store.status(zones, 0)["names"], ["Both", "Garden only"])
+        self.assertEqual(store.status(zones, 8)["names"], ["Both"])
+        self.assertFalse(store.status(zones, 8)["modified"])
+        store.save("New lights", zones, 8)
+        self.assertEqual(json.loads(store.path.read_text())["version"], 2)
+        reloaded = TimetableProfiles(self.path)
+        self.assertEqual(reloaded.status(zones, 0)["selected"], "Both")
+        self.assertIn("New lights", reloaded.status(zones, 8)["names"])
+        self.assertEqual(reloaded.load("Both", default_zones(16), 8)[8].schedule, zones[8].schedule)
+
+    def test_invalid_banks_do_not_write_or_change_recovery(self) -> None:
+        self.store.save("Summer", default_zones())
+        original = self.store.path.read_bytes()
+        for bank in (True, "8", 1, -8, 8, None):
+            with self.subTest(bank=bank):
+                with self.assertRaises(ValueError):
+                    self.store.save("Bad", default_zones(), bank)
+                with self.assertRaises(ValueError):
+                    self.store.load("Summer", default_zones(), bank)
+        self.assertEqual(self.store.path.read_bytes(), original)

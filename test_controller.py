@@ -49,6 +49,86 @@ def schedule_for(
     return tuple(schedule)
 
 
+class WindowPauseTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.zones = default_zones()
+        self.zones[0] = Zone("Lawn", True, schedule_for(
+            (0,), second=("07:00", "07:20"),
+        ))
+        self.relays = FakeRelays()
+        self.controller = Controller(self.zones, self.relays)
+
+    def test_pause_stops_only_its_group_and_leaves_manual_available(self) -> None:
+        self.controller.tick(MONDAY)
+        self.assertTrue(self.relays.states[0])
+        paused = list(self.zones)
+        paused[0] = replace(paused[0], paused_windows=(True, False, False, False))
+        self.controller.apply(paused, MONDAY)
+        self.assertFalse(any(self.relays.states))
+        self.controller.tick(MONDAY + timedelta(minutes=5))
+        self.assertNotIn(0, self.controller.runs)
+        self.controller.start_manual(0, MONDAY)
+        self.assertIn(0, self.controller.runs)
+        self.controller.stop(0, MONDAY)
+        self.controller.tick(MONDAY + timedelta(hours=1))
+        self.assertIn(0, self.controller.runs)
+
+    def test_pause_persists_and_resume_waits_for_next_start(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            paused = list(self.zones)
+            paused[0] = replace(paused[0], paused_windows=(True, False, False, False))
+            save_zones(path, paused)
+            restored = Controller(load_zones(path), self.relays)
+            restored.tick(MONDAY + timedelta(minutes=2))
+            self.assertNotIn(0, restored.runs)
+            restored.apply(self.zones, MONDAY + timedelta(minutes=3))
+            restored.tick(MONDAY + timedelta(minutes=4))
+            self.assertNotIn(0, restored.runs)
+            restored.tick(MONDAY + timedelta(hours=1))
+            self.assertIn(0, restored.runs)
+            restored.tick(MONDAY + timedelta(hours=2))
+            restored.tick(MONDAY + timedelta(days=7))
+            self.assertIn(0, restored.runs)
+
+    def test_other_groups_and_other_zones_are_unaffected(self) -> None:
+        self.zones[1] = replace(self.zones[0], name="Other")
+        controller = Controller(self.zones, self.relays)
+        controller.tick(MONDAY)
+        paused = list(self.zones)
+        paused[0] = replace(paused[0], paused_windows=(True, False, False, False))
+        controller.apply(paused, MONDAY)
+        self.assertFalse(self.relays.states[0])
+        self.assertTrue(self.relays.states[1])
+        self.assertTrue(self.relays.states[7])
+        self.assertNotIn(0, controller.runs)
+        controller.tick(MONDAY + timedelta(hours=1))
+        self.assertIn(0, controller.runs)
+
+    def test_group_pause_does_not_stop_manual_or_continuous_runs(self) -> None:
+        self.zones[0] = replace(self.zones[0], pump_exempt=True)
+        for continuous in (False, True):
+            with self.subTest(continuous=continuous):
+                controller = Controller(self.zones, self.relays)
+                controller.start_manual(0, MONDAY, continuous=continuous)
+                run = controller.runs[0]
+                paused = list(self.zones)
+                paused[0] = replace(paused[0], paused_windows=(True,) * 4)
+                controller.apply(paused, MONDAY)
+                self.assertTrue(self.relays.states[0])
+                self.assertIs(controller.runs[0], run)
+                controller.apply(self.zones, MONDAY)
+                self.assertIn(0, controller.runs)
+
+    def test_pausing_a_different_group_does_not_restart_the_active_group(self) -> None:
+        self.controller.tick(MONDAY)
+        run = self.controller.runs[0]
+        paused = list(self.zones)
+        paused[0] = replace(paused[0], paused_windows=(False, True, False, False))
+        self.controller.apply(paused, MONDAY)
+        self.assertIs(self.controller.runs[0], run)
+
+
 class ValidationTests(unittest.TestCase):
     def test_copy_selected_day_times_to_all_days(self) -> None:
         schedule = list(schedule_for((0, 1, 2, 3, 4, 5, 6)))
@@ -235,10 +315,11 @@ class PersistenceTests(unittest.TestCase):
         schedule = list(schedule_for((0, 2, 4), ("05:30", "05:50")))
         schedule[5] = ("0600", "0610", "1000", "1010", "1400", "1410", "1800", "1820")
         zones[0] = Zone("Front Lawn", True, tuple(schedule))
-        zones[1] = replace(zones[1], rain_pause_exempt=True, pump_exempt=True)
+        zones[1] = replace(zones[1], rain_pause_exempt=True, pump_exempt=True, max_manual_minutes=60,
+                           continuous_reminder_minutes=30)
         save_zones(self.path, zones)
         self.assertEqual(load_zones(self.path), zones)
-        self.assertEqual(json.loads(self.path.read_text())["version"], 7)
+        self.assertEqual(json.loads(self.path.read_text())["version"], 9)
 
     def test_invalid_save_preserves_file(self) -> None:
         zones = default_zones()
@@ -277,7 +358,10 @@ class PersistenceTests(unittest.TestCase):
                              ("paused_windows", [False, False, False]),
                              ("paused_windows", [False, False, "false", False]),
                              ("rain_pause_exempt", "false"), ("pump_exempt", "false"),
-                             ("pump_exempt", 1)):
+                             ("pump_exempt", 1), ("max_manual_minutes", True),
+                             ("max_manual_minutes", 0), ("max_manual_minutes", 1441),
+                             ("max_manual_minutes", "10"), ("continuous_reminder_minutes", 0),
+                             ("continuous_reminder_minutes", True), ("continuous_reminder_minutes", 1441)):
             data = json.loads(json.dumps(original))
             data["zones"][0][field] = value
             self.path.write_text(json.dumps(data))
@@ -321,13 +405,15 @@ class PersistenceTests(unittest.TestCase):
             self.assertEqual(zone.schedule, (tuple(row) + ("",) * 4,) * 7)
         self.assertEqual(self.path.read_text(), original)
         save_zones(self.path, zones)
-        self.assertEqual(json.loads(self.path.read_text())["version"], 7)
+        self.assertEqual(json.loads(self.path.read_text())["version"], 9)
         self.assertEqual(load_zones(self.path), zones)
 
     def test_version_three_settings_migrate_with_unpaused_windows(self) -> None:
         data = encode_zones(default_zones())
         data["version"] = 3
         for zone in data["zones"]:
+            del zone["continuous_reminder_minutes"]
+            del zone["max_manual_minutes"]
             del zone["paused_windows"]
             del zone["rain_pause_exempt"]
             del zone["pump_exempt"]
@@ -341,6 +427,8 @@ class PersistenceTests(unittest.TestCase):
         data = encode_zones(default_zones())
         data["version"] = 4
         for zone in data["zones"]:
+            del zone["continuous_reminder_minutes"]
+            del zone["max_manual_minutes"]
             del zone["rain_pause_exempt"]
             del zone["pump_exempt"]
         self.path.parent.mkdir()
@@ -354,13 +442,175 @@ class PersistenceTests(unittest.TestCase):
             data = encode_zones(default_zones(count))
             data["version"] = version
             for record in data["zones"]:
+                del record["continuous_reminder_minutes"]
+                del record["max_manual_minutes"]
                 del record["pump_exempt"]
             self.path.parent.mkdir(exist_ok=True)
             self.path.write_text(json.dumps(data))
             self.assertFalse(any(zone.pump_exempt for zone in load_zones(self.path)))
 
+    def test_version_seven_migrates_without_manual_limit(self) -> None:
+        data = encode_zones(default_zones())
+        data["version"] = 7
+        for zone in data["zones"]:
+            del zone["continuous_reminder_minutes"]
+            del zone["max_manual_minutes"]
+        self.path.parent.mkdir(exist_ok=True)
+        self.path.write_text(json.dumps(data))
+        self.assertTrue(all(zone.max_manual_minutes is None for zone in load_zones(self.path)))
+
+    def test_version_eight_migrates_without_reminders(self) -> None:
+        data = encode_zones(default_zones())
+        data["version"] = 8
+        for zone in data["zones"]:
+            del zone["continuous_reminder_minutes"]
+        self.path.parent.mkdir(exist_ok=True)
+        self.path.write_text(json.dumps(data))
+        self.assertTrue(all(zone.continuous_reminder_minutes is None for zone in load_zones(self.path)))
+
 
 class ControllerTests(unittest.TestCase):
+    def test_manual_durations_and_maximum_enforced(self) -> None:
+        self.zones[1] = replace(self.zones[1], pump_exempt=True, max_manual_minutes=30)
+        self.controller.apply(self.zones, MONDAY)
+        for duration in (0, 1441, True, 30.5, 31):
+            with self.subTest(duration=duration), self.assertRaises(ValueError):
+                self.controller.start_manual(1, MONDAY, duration_minutes=duration)
+        with self.assertRaisesRegex(ValueError, "Until stopped"):
+            self.controller.start_manual(1, MONDAY, continuous=True)
+        self.controller.start_manual(1, MONDAY, duration_minutes=30)
+        self.assertEqual(self.controller.runs[1].deadline, self.elapsed + 1800)
+        self.elapsed += 1799
+        self.controller.tick(MONDAY)
+        self.assertIn(1, self.controller.runs)
+        self.elapsed += 1
+        self.controller.tick(MONDAY)
+        self.assertNotIn(1, self.controller.runs)
+
+    def test_manual_duration_boundaries_and_test_run_limit(self) -> None:
+        for duration in (1, 1440):
+            with self.subTest(duration=duration):
+                self.controller.start_manual(1, MONDAY, duration_minutes=duration)
+                self.assertEqual(self.controller.runs[1].deadline, self.elapsed + duration * 60)
+                self.controller.stop(1, MONDAY)
+        self.zones[1] = replace(self.zones[1], max_manual_minutes=9)
+        self.controller.apply(self.zones, MONDAY)
+        with self.assertRaisesRegex(ValueError, "maximum"):
+            self.controller.start_manual(1, MONDAY, test=True)
+        self.assertNotIn(1, self.controller.runs)
+
+    def test_new_or_lower_manual_maximum_stops_manual_not_schedule(self) -> None:
+        self.zones[1] = replace(self.zones[1], pump_exempt=True)
+        self.controller.apply(self.zones, MONDAY)
+        self.controller.start_manual(1, MONDAY, continuous=True)
+        self.zones[1] = replace(self.zones[1], max_manual_minutes=20)
+        self.controller.apply(self.zones, MONDAY)
+        self.assertNotIn(1, self.controller.runs)
+        self.controller.start_manual(1, MONDAY, duration_minutes=10)
+        self.zones[1] = replace(self.zones[1], max_manual_minutes=5)
+        self.controller.apply(self.zones, MONDAY)
+        self.assertNotIn(1, self.controller.runs)
+        self.controller.tick(MONDAY)
+        self.assertEqual(self.controller.runs[0].source, "Routine")
+        self.zones[0] = replace(self.zones[0], max_manual_minutes=1)
+        self.controller.apply(self.zones, MONDAY)
+        self.assertEqual(self.controller.runs[0].source, "Routine")
+
+    def test_continuous_run_has_no_deadline_and_survives_day_changes(self) -> None:
+        self.zones[1] = replace(self.zones[1], pump_exempt=True)
+        self.controller.apply(self.zones, MONDAY)
+        self.controller.start_manual(1, MONDAY, continuous=True)
+        self.assertEqual(self.controller.runs[1].source, "Continuous")
+        self.assertIsNone(self.controller.runs[1].deadline)
+        self.elapsed += 3 * 24 * 60 * 60
+        self.controller.tick(MONDAY + timedelta(days=3))
+        self.assertTrue(self.backend.states[1])
+        self.assertFalse(self.controller.pump_on)
+        self.controller.stop(1, MONDAY + timedelta(days=3))
+        self.assertFalse(self.backend.states[1])
+        self.assertFalse(self.controller.pump_on)
+
+    def test_continuous_run_honours_exclusions_and_changes_to_them(self) -> None:
+        self.zones[1] = replace(self.zones[1], pump_exempt=True, rain_pause_exempt=True)
+        self.controller.apply(self.zones, MONDAY)
+        self.controller.set_rain_pause(True, MONDAY)
+        self.controller.start_manual(1, MONDAY, continuous=True)
+        self.controller.tick(MONDAY)
+        self.assertTrue(self.backend.states[1])
+        self.assertFalse(self.controller.pump_on)
+        self.zones[1] = replace(self.zones[1], pump_exempt=False)
+        self.controller.apply(self.zones, MONDAY)
+        self.assertNotIn(1, self.controller.runs)
+        self.assertFalse(self.backend.states[1])
+        self.assertFalse(self.controller.pump_on)
+        self.zones[1] = replace(self.zones[1], pump_exempt=True)
+        self.controller.apply(self.zones, MONDAY)
+        self.controller.start_manual(1, MONDAY, continuous=True)
+        self.zones[1] = replace(self.zones[1], rain_pause_exempt=False)
+        self.controller.apply(self.zones, MONDAY)
+        self.assertNotIn(1, self.controller.runs)
+        self.assertFalse(self.controller.pump_on)
+
+    def test_continuous_run_respects_rain_pause_stop_all_and_restart(self) -> None:
+        self.zones[1] = replace(self.zones[1], pump_exempt=True)
+        self.controller.apply(self.zones, MONDAY)
+        self.controller.start_manual(1, MONDAY, continuous=True)
+        self.controller.set_rain_pause(True, MONDAY)
+        self.assertNotIn(1, self.controller.runs)
+        with self.assertRaisesRegex(RuntimeError, "Rain Pause"):
+            self.controller.start_manual(1, MONDAY, continuous=True)
+        self.controller.set_rain_pause(False, MONDAY)
+        self.controller.start_manual(1, MONDAY, continuous=True)
+        self.controller.stop_all(MONDAY)
+        self.assertFalse(any(self.backend.states))
+        self.controller.start_manual(1, MONDAY, continuous=True)
+        self.controller.close(MONDAY)
+        restarted = Controller(self.zones, self.backend, lambda: self.elapsed)
+        restarted.tick(MONDAY)
+        self.assertNotIn(1, restarted.runs)
+        self.assertFalse(self.backend.states[1])
+        self.assertTrue(all(run.source == "Routine" for run in restarted.runs.values()))
+
+    def test_continuous_run_does_not_resume_suppressed_schedule_on_stop(self) -> None:
+        self.zones[1] = Zone("Lawn", True, schedule_for((0,)), pump_exempt=True)
+        self.controller.apply(self.zones, MONDAY)
+        self.controller.start_manual(1, MONDAY, continuous=True)
+        self.elapsed += 3600
+        self.controller.tick(MONDAY.replace(hour=7))
+        self.assertIn(1, self.controller.runs)
+        self.controller.stop(1, MONDAY)
+        self.controller.tick(MONDAY)
+        self.assertNotIn(1, self.controller.runs)
+
+    def test_removing_pump_exclusion_stops_continuous_without_resuming_routine(self) -> None:
+        self.zones[0] = Zone("Inactive")
+        self.zones[1] = Zone("Lights", True, schedule_for((0,)), pump_exempt=True)
+        self.controller.apply(self.zones, MONDAY)
+        self.controller.start_manual(1, MONDAY, continuous=True)
+        self.zones[1] = replace(self.zones[1], pump_exempt=False)
+        self.controller.apply(self.zones, MONDAY)
+        self.controller.tick(MONDAY)
+        self.assertNotIn(1, self.controller.runs)
+        self.assertFalse(self.backend.states[1])
+        self.assertFalse(self.controller.pump_on)
+        self.controller.start_manual(1, MONDAY)
+        self.assertTrue(self.controller.pump_on)
+
+    def test_continuous_rejects_master_test_and_faults_safely(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "master pump"):
+            self.controller.start_manual(7, MONDAY, continuous=True)
+        with self.assertRaisesRegex(ValueError, "test run"):
+            self.controller.start_manual(1, MONDAY, test=True, continuous=True)
+        with self.assertRaisesRegex(ValueError, "master pump exclusion"):
+            self.controller.start_manual(1, MONDAY, continuous=True)
+        self.assertNotIn(1, self.controller.runs)
+        self.zones[1] = replace(self.zones[1], pump_exempt=True)
+        self.controller.apply(self.zones, MONDAY)
+        with patch.object(self.backend, "set_relay", side_effect=OSError("Offline")):
+            with self.assertRaises(ExceptionGroup):
+                self.controller.start_manual(1, MONDAY, continuous=True)
+        self.assertTrue(self.controller.closed)
+
     def test_rain_pause_stops_all_sources_and_blocks_future_watering(self) -> None:
         self.zones[0] = Zone(
             "Lawn", True, schedule_for((0,), ("0600", "0620"), ("1700", "1720"))

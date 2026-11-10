@@ -1,6 +1,7 @@
 """Headless service and IPC tests: fake hardware, real local Unix sockets."""
 
 from contextlib import AbstractContextManager
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 import socket
@@ -17,6 +18,7 @@ from controller import (
 from service import Service, exchange, serve
 from service_client import ServiceClient
 from waveshare_relay import WaveshareRelays
+from test_controller import schedule_for
 
 
 class FakeDevice(WaveshareRelays):
@@ -78,6 +80,144 @@ class RunningService(AbstractContextManager):
 
 
 class ServiceTests(unittest.TestCase):
+    def test_continuous_reminder_reports_elapsed_without_stopping(self) -> None:
+        from dataclasses import replace
+        self.service.dispatch({"command": "rain_pause", "paused": False})
+        zones = list(self.service.controller.zones)
+        zones[1] = replace(zones[1], pump_exempt=True, continuous_reminder_minutes=2)
+        self.service.dispatch({"command": "save", "revision": self.service.revision, "settings": encode_zones(zones)})
+        self.service.controller.clock = lambda: 100.0
+        self.service.dispatch({"command": "continuous", "channel": 1})
+        self.service.controller.clock = lambda: 220.0
+        run = next(run for run in self.service.status()["runs"] if run["channel"] == 1)
+        self.assertEqual(run["elapsed"], 120.0)
+        self.assertTrue(self.device.states[1])
+        self.assertEqual(self.service.controller.runs[1].source, "Continuous")
+
+    def test_changing_only_reminder_does_not_stop_a_scheduled_run(self) -> None:
+        from dataclasses import replace
+        with patch("service.datetime") as clock:
+            clock.now.return_value = datetime(2026, 11, 10, 12, 0)
+            self.service.dispatch({"command": "rain_pause", "paused": False})
+            runs = self.service.controller.runs.copy()
+            self.assertIn(0, runs)
+            zones = list(self.service.controller.zones)
+            zones[0] = replace(zones[0], continuous_reminder_minutes=30)
+            self.service.dispatch({"command": "save", "revision": self.service.revision, "settings": encode_zones(zones)})
+            self.assertEqual(self.service.controller.runs, runs)
+
+    def test_history_storage_failure_does_not_stop_relay_control(self) -> None:
+        self.service.dispatch({"command": "rain_pause", "paused": False})
+        with patch.object(self.service.history, "_connect", side_effect=OSError("disk full")):
+            with self.assertLogs(level="ERROR"):
+                result = self.service.dispatch({"command": "manual", "channel": 1})
+        self.assertTrue(self.device.states[1])
+        self.assertFalse(result["fault"])
+        self.assertIn("disk full", result["history_warning"])
+        self.service.dispatch({"command": "stop", "channel": 1})
+
+    def test_history_records_timer_expiry_and_stop_all(self) -> None:
+        self.service.dispatch({"command": "rain_pause", "paused": False})
+        self.service.controller.clock = lambda: 10
+        self.service.dispatch({"command": "manual", "channel": 1, "duration_minutes": 1})
+        self.service.controller.clock = lambda: 70
+        self.service.tick()
+        self.service.dispatch({"command": "manual", "channel": 2})
+        self.service.dispatch({"command": "stop_all"})
+        events = self.service.dispatch({"command": "history"})["events"]
+        self.assertTrue(any(event["channel"] == 1 and event["reason"] == "Manual timer ended"
+                            for event in events))
+        self.assertTrue(any(event["channel"] == 2 and event["reason"] == "Stop all"
+                            for event in events))
+        self.assertTrue(any(event["event"] == "STOP ALL" for event in events))
+
+    def test_activity_records_starts_stops_rain_and_faults(self) -> None:
+        self.service.dispatch({"command": "rain_pause", "paused": False})
+        self.service.dispatch({"command": "manual", "channel": 1})
+        self.service.dispatch({"command": "stop", "channel": 1})
+        self.service.dispatch({"command": "manual", "channel": 2})
+        self.service.dispatch({"command": "rain_pause", "paused": True})
+        events = self.service.dispatch({"command": "history"})["events"]
+        self.assertTrue(any(event["channel"] == 1 and event["event"] == "ON"
+                            and event["reason"] == "Manual" for event in events))
+        self.assertTrue(any(event["channel"] == 1 and event["reason"] == "Stop channel"
+                            for event in events))
+        self.assertTrue(any(event["channel"] == 2 and event["reason"] == "Rain Pause"
+                            for event in events))
+        self.service.fail(OSError("relay offline"))
+        events = self.service.dispatch({"command": "history"})["events"]
+        self.assertTrue(any(event["event"] == "FAULT" and "relay offline" in event["reason"]
+                            for event in events))
+        self.assertTrue(self.service.status()["next_starts"][0])
+
+    def test_manual_timer_limit_and_legacy_default(self) -> None:
+        self.service.dispatch({"command": "rain_pause", "paused": False})
+        self.zones[1] = Zone("Fan", pump_exempt=True, max_manual_minutes=30)
+        self.service.dispatch({
+            "command": "save", "settings": encode_zones(self.zones),
+            "revision": self.service.revision,
+        })
+        self.assertTrue(self.service.status()["manual_timers_supported"])
+        self.service.dispatch({"command": "manual", "channel": 1})
+        self.assertLessEqual(self.service.status()["runs"][-1]["remaining"], 600)
+        self.service.dispatch({"command": "stop", "channel": 1})
+        with self.assertRaisesRegex(ValueError, "maximum"):
+            self.service.dispatch({"command": "manual", "channel": 1, "duration_minutes": 31})
+        with self.assertRaisesRegex(ValueError, "Until stopped"):
+            self.service.dispatch({"command": "continuous", "channel": 1})
+        self.service.dispatch({"command": "manual", "channel": 1, "duration_minutes": 30})
+        self.assertGreater(self.service.status()["runs"][-1]["remaining"], 1790)
+        self.assertFalse(self.service.fault)
+
+    def test_continuous_command_null_remaining_and_safety_guards(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Rain Pause"):
+            self.service.dispatch({"command": "continuous", "channel": 1})
+        with self.assertRaisesRegex(ValueError, "master pump"):
+            self.service.dispatch({"command": "continuous", "channel": 7})
+        self.service.dispatch({"command": "rain_pause", "paused": False})
+        calls = list(self.device.calls)
+        with self.assertRaisesRegex(ValueError, "master pump exclusion"):
+            self.service.dispatch({"command": "continuous", "channel": 1})
+        self.assertEqual(calls, self.device.calls)
+        self.assertFalse(self.service.fault)
+        self.zones[1] = Zone("Lights", pump_exempt=True)
+        self.service.dispatch({
+            "command": "save", "settings": encode_zones(self.zones),
+            "revision": self.service.revision,
+        })
+        result = self.service.dispatch({"command": "continuous", "channel": 1})
+        self.assertEqual(result["protocol"], 2)
+        self.assertTrue(result["continuous_supported"])
+        run = next(run for run in result["runs"] if run["channel"] == 1)
+        self.assertEqual(run["source"], "Continuous")
+        self.assertIsNone(run["remaining"])
+        self.assertGreaterEqual(run["elapsed"], 0)
+        self.service.controller.clock = lambda: 10**12
+        self.service.tick()
+        self.assertIn(1, self.service.controller.runs)
+        self.service.dispatch({"command": "stop", "channel": 1})
+        self.assertNotIn(1, self.service.controller.runs)
+
+    def test_second_board_continuous_does_not_use_master_pump(self) -> None:
+        secondary = FakeDevice()
+        secondary.host = "192.0.2.2"
+        service = Service(self.path, self.device, secondary)
+        service.dispatch({"command": "rain_pause", "paused": False})
+        service.dispatch({"command": "stop_all"})
+        service.dispatch({"command": "continuous", "channel": 15})
+        self.assertFalse(service.controller.pump_on)
+        service.dispatch({"command": "stop", "channel": 15})
+        zones = list(service.controller.zones)
+        zones[15] = Zone("Lights", pump_exempt=True)
+        service.dispatch({
+            "command": "save", "settings": encode_zones(zones), "revision": service.revision,
+        })
+        service.dispatch({"command": "continuous", "channel": 15})
+        self.assertTrue(secondary.states[7])
+        self.assertFalse(self.device.states[7])
+        service.dispatch({"command": "stop_all"})
+        self.assertFalse(any(secondary.states))
+
     def setUp(self) -> None:
         self.directory = self.enterContext(tempfile.TemporaryDirectory())
         self.path = Path(self.directory) / "settings.json"
@@ -97,6 +237,38 @@ class ServiceTests(unittest.TestCase):
         self.assertFalse(load_rain_pause(self.path))
         self.service.dispatch({"command": "rain_pause", "paused": True})
         self.assertFalse(any(self.device.states))
+
+    def test_group_pause_save_and_resume_skip_current_period(self) -> None:
+        self.service.dispatch({"command": "rain_pause", "paused": False})
+        self.assertIn(0, self.service.controller.runs)
+        zones = list(self.service.controller.zones)
+        zones[0] = replace(zones[0], paused_windows=(True, False, False, False))
+        self.service.dispatch({
+            "command": "save", "settings": encode_zones(zones),
+            "revision": self.service.revision,
+        })
+        self.assertNotIn(0, self.service.controller.runs)
+        self.assertTrue(load_zones(self.path)[0].paused_windows[0])
+        restored = Service(self.path, self.device)
+        restored.tick()
+        self.assertNotIn(0, restored.controller.runs)
+        zones[0] = replace(zones[0], paused_windows=(False,) * 4)
+        restored.dispatch({
+            "command": "save", "settings": encode_zones(zones),
+            "revision": restored.revision,
+        })
+        restored.tick()
+        self.assertNotIn(0, restored.controller.runs)
+        restored.dispatch({"command": "manual", "channel": 0})
+        self.assertIn(0, restored.controller.runs)
+
+    def test_legacy_whole_zone_pause_file_no_longer_blocks_runs(self) -> None:
+        self.path.with_name(self.path.name + ".zone-pauses.json").write_text(
+            '{"0": {"paused": true, "resume_after": null}}'
+        )
+        service = Service(self.path, self.device)
+        service.dispatch({"command": "rain_pause", "paused": False})
+        self.assertIn(0, service.controller.runs)
 
     def test_profiles_preserve_rain_pause_and_reject_stale_loads(self) -> None:
         self.service.dispatch({
@@ -124,6 +296,40 @@ class ServiceTests(unittest.TestCase):
                 "command": "profile_load", "name": "Before last load", "revision": stale,
             })
         self.assertIn("Before last load", result["timetables"]["names"])
+
+    def test_timetable_groups_only_change_the_target_bank_and_preserve_other_runs(self) -> None:
+        secondary = FakeDevice()
+        secondary.host = "192.0.2.2"
+        service = Service(self.path, self.device, secondary)
+        service.dispatch({"command": "rain_pause", "paused": False})
+        service.dispatch({"command": "stop_all"})
+        for bank in (0, 8):
+            service.dispatch({
+                "command": "profile_save", "name": "Summer", "bank": bank, "revision": service.revision,
+            })
+        zones = list(service.controller.zones)
+        zones[0] = replace(zones[0], enabled=False)
+        zones[8] = replace(zones[8], enabled=True, schedule=schedule_for((0,)))
+        service.dispatch({"command": "save", "settings": encode_zones(zones), "revision": service.revision})
+        service.dispatch({"command": "manual", "channel": 1})
+        run = service.controller.runs[1]
+        status = service.dispatch({
+            "command": "profile_load", "name": "Summer", "bank": 8, "revision": service.revision,
+        })
+        self.assertEqual(service.controller.zones[:8], zones[:8])
+        self.assertIs(service.controller.runs[1], run)
+        self.assertFalse(service.controller.zones[8].enabled)
+        self.assertIn("Before last load", status["timetable_groups"]["8"]["names"])
+        self.assertNotIn("Before last load", status["timetable_groups"]["0"]["names"])
+        with self.assertRaisesRegex(ValueError, "another app"):
+            service.dispatch({
+                "command": "profile_load", "name": "Summer", "bank": 8, "revision": "stale",
+            })
+        for bank in (True, 1, "8", 16):
+            with self.subTest(bank=bank), self.assertRaisesRegex(ValueError, "group"):
+                service.dispatch({
+                    "command": "profile_save", "name": "Bad", "bank": bank, "revision": service.revision,
+                })
 
     def test_second_board_routes_all_channels_without_operating_the_pump(self) -> None:
         secondary = FakeDevice()
@@ -215,7 +421,7 @@ class ServiceTests(unittest.TestCase):
             "command": "save", "revision": service.revision,
             "settings": encode_zones(zones),
         })
-        self.assertEqual(encode_zones(load_zones(self.path))["version"], 7)
+        self.assertEqual(encode_zones(load_zones(self.path))["version"], 9)
         service.dispatch({"command": "manual", "channel": 15})
         self.assertTrue(secondary.states[7])
         deadline = service.controller.runs[15].deadline
@@ -378,6 +584,28 @@ class ServiceTests(unittest.TestCase):
 
 
 class SocketTests(unittest.TestCase):
+    def test_continuous_run_desktop_sync_disconnect_stop_and_restart(self) -> None:
+        setup_client = ServiceClient(self.running.path)
+        zones = list(setup_client.zones)
+        zones[1] = Zone("Lights", pump_exempt=True)
+        setup_client.apply(zones, datetime.now())
+        exchange(self.running.path, {"command": "continuous", "channel": 1})
+        client = ServiceClient(self.running.path)
+        self.assertIsNone(client.runs[1].deadline)
+        self.assertEqual(client.runs[1].source, "Continuous")
+        client.close(datetime.now())
+        time.sleep(0.3)
+        self.assertTrue(self.running.device.states[1])
+        second = ServiceClient(self.running.path)
+        second.stop(1, datetime.now())
+        self.assertFalse(self.running.device.states[1])
+        exchange(self.running.path, {"command": "continuous", "channel": 1})
+        self.running.stop.set()
+        self.running.thread.join(5)
+        restarted = Service(self.running.config, self.running.device)
+        self.assertNotIn(1, restarted.controller.runs)
+        self.assertFalse(self.running.device.states[1])
+
     def setUp(self) -> None:
         self.directory = self.enterContext(tempfile.TemporaryDirectory())
         self.running = self.enterContext(RunningService(Path(self.directory)))
@@ -397,6 +625,23 @@ class SocketTests(unittest.TestCase):
         self.assertTrue(self.running.device.states[7])
         self.assertEqual(len(self.running.device.calls), calls)
 
+    def test_client_manual_timer_and_older_service_guard(self) -> None:
+        client = ServiceClient(self.running.path)
+        zones = list(client.zones)
+        zones[1] = Zone("Fan", pump_exempt=True, max_manual_minutes=30)
+        client.apply(zones, datetime.now())
+        client.start_manual(1, datetime.now(), duration_minutes=25)
+        self.assertGreater(client.runs[1].deadline - client.clock(), 1490)
+        self.assertTrue(self.running.device.states[1])
+        client.stop(1, datetime.now())
+        with self.assertRaisesRegex(ValueError, "maximum"):
+            client.start_manual(1, datetime.now(), duration_minutes=31)
+        self.assertFalse(self.running.device.states[1])
+        client.manual_timers_supported = False
+        with self.assertRaisesRegex(ValueError, "Restart"):
+            client.start_manual(1, datetime.now(), duration_minutes=30)
+        self.assertFalse(self.running.device.states[1])
+
     def test_commands_saves_and_state_roundtrip(self) -> None:
         client = ServiceClient(self.running.path)
         zones = default_zones()
@@ -413,6 +658,32 @@ class SocketTests(unittest.TestCase):
         client.start_manual(0, datetime.now())
         client.stop_all(datetime.now())
         self.assertFalse(any(self.running.device.states))
+
+    def test_full_backup_exceeds_old_socket_limit_and_restores_with_hold(self) -> None:
+        import json
+        from activity_history import ActivityHistory
+        import system_backup
+        password = "four unrelated backup words"
+        history = ActivityHistory(self.running.config)
+        connection = history._connect()
+        try:
+            with connection:
+                connection.executemany(
+                    "INSERT INTO events (timestamp, channel, name, event, reason) VALUES (?, ?, ?, ?, ?)",
+                    [("2026-11-10T00:00:00", 0, "Lawn", "ON", "x" * 300)] * 500,
+                )
+        finally:
+            connection.close()
+        client = ServiceClient(self.running.path)
+        archive = client.backup("backup_export", password=password)["archive"]
+        self.assertGreater(len(json.dumps(archive)), 65536)
+        preview = client.backup("backup_preview", archive=archive, password=password)
+        client.backup("backup_restore", archive=archive, password=password, revision=preview["revision"])
+        self.assertTrue(client.operation_held)
+        self.assertTrue(client.restore_restart_required)
+        self.assertTrue(system_backup.held(self.running.config))
+        with self.assertRaisesRegex(ValueError, "held"):
+            client.start_manual(1, datetime.now())
 
     def test_socket_is_private_and_invalid_request_is_explicit(self) -> None:
         self.assertEqual(self.running.path.stat().st_mode & 0o777, 0o600)

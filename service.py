@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from contextlib import ExitStack
 from datetime import datetime
+from dataclasses import replace
 import fcntl
 import hashlib
 import json
@@ -19,12 +20,17 @@ import uuid
 
 from controller import (
     Controller, decode_zones, default_zones, encode_zones, load_rain_pause, load_zones,
-    save_rain_pause, save_zones,
+    next_scheduled_start, save_rain_pause, save_zones,
 )
+from activity_history import ActivityHistory
 from waveshare_relay import DEFAULT_HOST, DEFAULT_PORT, RelayBoards, WaveshareRelays
 from timetable_profiles import TimetableProfiles
+from tapo_plugs import TapoRelays, mapping_path
 
-MAX_MESSAGE = 65536
+import sqlite3
+import system_backup
+
+MAX_MESSAGE = system_backup.MAX_TRANSPORT_BYTES
 DEFAULT_CONFIG = Path.home() / ".config/garden-sprinkler-controller/settings.json"
 
 
@@ -44,27 +50,41 @@ class Service:
         self, config: Path, relay: WaveshareRelays, secondary: WaveshareRelays | None = None,
     ) -> None:
         self.config = config
-        self.relay = RelayBoards(relay, secondary)
+        restore_held = system_backup.held(config)
+        self.restore_restart_required = False
+        self.recovery_backup = ""
+        self.history = ActivityHistory(config)
+        if secondary is not None and mapping_path(config).exists():
+            raise ValueError("Choose either Tapo plugs or a second Waveshare board for channels 9-16.")
+        self.relay = TapoRelays(relay, config) if mapping_path(config).exists() else RelayBoards(relay, secondary)
         zones = load_zones(config)
-        if secondary is not None and len(zones) == 8:
+        if self.relay.channel_count == 16 and len(zones) == 8:
             zones.extend(default_zones(16)[8:])
+            if isinstance(self.relay, TapoRelays):
+                for channel in range(8, 13):
+                    zones[channel] = replace(zones[channel], name=f"Tapo Plug {channel - 7}")
         self.timetables = TimetableProfiles(config)
         self.controller = Controller(
             zones, self.relay, rain_paused=load_rain_pause(config),
             channel_count=self.relay.channel_count,
+            activity=self.history.record,
+            available_channels=self.relay.available_channels if isinstance(self.relay, TapoRelays) else None,
         )
         self.revision = uuid.uuid4().hex
+        self.controller.operation_held = restore_held
         self.fault = ""
+        self.history.record(None, "Controller", "STARTED", "Startup; outputs initialized OFF")
 
     def fail(self, error: Exception) -> None:
         self.fault = error_details(error)
         logging.error("Scheduling stopped: %s", self.fault)
         self.controller.closed = True
         try:
-            self.controller.stop_all(datetime.now())
+            self.controller.stop_all(datetime.now(), reason="Controller fault")
         except ExceptionGroup as shutdown:
             self.fault += "; OFF failures: " + error_details(shutdown)
             logging.error("Shutdown failed: %s", error_details(shutdown))
+        self.history.record(None, "Controller", "FAULT", self.fault)
 
     def tick(self) -> None:
         try:
@@ -74,8 +94,25 @@ class Service:
 
     def status(self) -> dict[str, object]:
         controller = self.controller
+        now = datetime.now()
         return {
-            "protocol": 1,
+            "protocol": 2,
+            "full_backup_supported": True,
+            "operation_held": controller.operation_held,
+            "restore_restart_required": self.restore_restart_required,
+            "recovery_backup": self.recovery_backup,
+            "continuous_supported": True,
+            "manual_timers_supported": True,
+            "history_supported": True,
+            "history_filters_supported": True,
+            "continuous_reminders_supported": True,
+            "history_warning": self.history.error,
+            "next_starts": [
+                (start.isoformat(timespec="minutes") if start else None)
+                for channel, zone in enumerate(controller.zones[:controller.channel_count])
+                for start in [None if channel == controller.master_channel or channel not in controller.available_channels
+                              else next_scheduled_start(zone, now)]
+            ],
             "settings": encode_zones(controller.zones),
             "revision": self.revision,
             "rain_paused": controller.rain_paused,
@@ -86,14 +123,22 @@ class Service:
             "port": self.relay.port,
             "slave_id": self.relay.slave_id,
             "channel_count": controller.channel_count,
+            "available_channels": sorted(controller.available_channels),
+            "tapo": self.relay.status() if isinstance(self.relay, TapoRelays) else None,
             "timetables": self.timetables.status(controller.zones),
+            "timetable_groups": {
+                str(bank): self.timetables.status(controller.zones, bank)
+                for bank in range(0, controller.channel_count, 8)
+            },
             "boards": [
                 {"host": device.host, "port": device.port, "slave_id": device.slave_id}
                 for device in self.relay.devices
             ],
             "runs": [
                 {"channel": channel, "source": run.source,
-                 "remaining": max(0, run.deadline - controller.clock())}
+                 "remaining": None if run.deadline is None
+                 else max(0, run.deadline - controller.clock()),
+                 "elapsed": None if run.started is None else max(0, controller.clock() - run.started)}
                 for channel, run in controller.runs.items()
             ],
         }
@@ -104,28 +149,69 @@ class Service:
         command = request["command"]
         if command == "status":
             return self.status()
+        if command == "history":
+            return self.history.page(request.get("offset", 0), request.get("filter", "all"))
         if command == "stop_all":
             try:
                 self.controller.stop_all(datetime.now())
             except ExceptionGroup as error:
                 self.fail(error)
+            self.history.record(None, "Controller", "STOP ALL", "Requested")
             return self.status()
         if self.fault:
             raise ValueError("Service fault: " + self.fault + ". Check hardware and restart the service.")
         now = datetime.now()
         try:
-            if command in ("save", "profile_save", "profile_load"):
+            if command in ("backup_export", "backup_preview", "backup_restore"):
+                if self.restore_restart_required and command != "backup_preview":
+                    raise ValueError("Restart the controller service after restore before exporting or restoring another backup.")
+                if command == "backup_export":
+                    payload = system_backup.capture(self.config, self.relay, self.history, self.controller.zones)
+                    return {"archive": system_backup.encrypt(payload, request.get("password")),
+                            "summary": system_backup.summary(payload), "revision": self.revision}
+                payload = system_backup.decrypt(request.get("archive"), request.get("password"))
+                if command == "backup_preview":
+                    return {"summary": system_backup.summary(payload), "revision": self.revision}
+                if request.get("revision") != self.revision:
+                    raise ValueError("Settings changed. Preview the backup again before restoring.")
+                recovery = system_backup.encrypt(
+                    system_backup.capture(self.config, self.relay, self.history, self.controller.zones), request.get("password"),
+                )
+                path = system_backup.sidecar(self.config, ".before-restore-" + uuid.uuid4().hex + ".sprinkler-backup")
+                system_backup.write_private(path, json.dumps(recovery).encode("utf-8"))
+                system_backup.set_hold(self.config, True)
+                self.controller.operation_held = True
+                self.restore_restart_required = True
+                self.revision = uuid.uuid4().hex
+                self.controller.stop_all(now, suppress=False, reason="System restore")
+                system_backup.install(self.config, payload, self.history)
+                self.recovery_backup = str(path)
+                self.history.record(None, "Controller", "RESTORED", "Safety hold; explicit resume required after restart")
+                return self.status()
+            elif command == "resume_operation":
+                if self.restore_restart_required:
+                    raise ValueError("Restart the controller service and reopen the desktop before resuming.")
+                system_backup.set_hold(self.config, False)
+                self.controller.operation_held = False
+                self.history.record(None, "Controller", "RESUMED", "User confirmed restored devices and settings")
+                self.controller.tick(now)
+            elif self.controller.operation_held and (
+                self.restore_restart_required
+                or command not in ("save", "profile_save", "profile_load", "rain_pause", "read_states")
+            ):
+                raise ValueError("Operation is held after restore. Restart if required, review devices, then Resume operation.")
+            elif command in ("save", "profile_save", "profile_load"):
                 if request.get("revision") != self.revision:
                     raise ValueError(
                         "Settings changed in another app or the service restarted. "
                         "Close and reopen this window before saving; your edits have not been applied."
                     )
                 if command == "profile_save":
-                    self.timetables.save(request.get("name"), self.controller.zones)
+                    self.timetables.save(request.get("name"), self.controller.zones, request.get("bank", 0))
                     self.revision = uuid.uuid4().hex
                     return self.status()
                 zones = (
-                    self.timetables.load(request.get("name"), self.controller.zones)
+                    self.timetables.load(request.get("name"), self.controller.zones, request.get("bank", 0))
                     if command == "profile_load" else decode_zones(request.get("settings"))
                 )
                 if len(zones) != len(self.controller.zones):
@@ -141,10 +227,13 @@ class Service:
                     self.controller.rain_paused = True
                 save_rain_pause(self.config, paused)
                 self.controller.set_rain_pause(paused, now)
-            elif command in ("manual", "test", "stop"):
+                self.history.record(None, "Controller", "RAIN PAUSE", "Enabled" if paused else "Disabled")
+            elif command in ("manual", "continuous", "test", "stop"):
                 channel = request.get("channel")
                 if type(channel) is not int or channel not in range(self.controller.channel_count):
                     raise ValueError("Channel is not configured; configure the second board for channels 9-16.")
+                if channel not in self.controller.available_channels:
+                    raise ValueError("This channel has no assigned output device; configure its Tapo plug first.")
                 if channel == self.controller.master_channel:
                     raise ValueError("The master pump is controlled automatically.")
                 if (
@@ -152,20 +241,28 @@ class Service:
                     and not self.controller.zones[channel].rain_pause_exempt
                 ):
                     raise ValueError("Rain Pause is enabled.")
-                if command == "manual":
-                    self.controller.start_manual(channel, now)
+                if command in ("manual", "continuous"):
+                    duration = request.get("duration_minutes", 10)
+                    if command == "continuous" and "duration_minutes" in request:
+                        raise ValueError("Continuous runs cannot specify a duration.")
+                    self.controller.start_manual(
+                        channel, now, continuous=command == "continuous",
+                        duration_minutes=duration,
+                    )
                 elif command == "test":
                     run = self.controller.runs.get(channel)
                     if run and run.source != "Test":
                         raise ValueError("Stop the current watering run before testing.")
                     self.controller.toggle_test(channel, now)
                 else:
+                    if isinstance(self.relay, TapoRelays) and channel >= 8 and channel not in self.controller.runs:
+                        self.relay.set_relay(channel, False)
                     self.controller.stop(channel, now)
             elif command == "read_states":
                 return {"states": self.relay.read_states()}
             else:
                 raise ValueError(f"Unknown command: {command}")
-        except (OSError, RuntimeError, ExceptionGroup) as error:
+        except (OSError, RuntimeError, sqlite3.Error, ExceptionGroup) as error:
             self.fail(error)
         return self.status()
 
@@ -231,20 +328,31 @@ def serve(
     # Both locks are acquired before any hardware commands. Different socket or
     # config arguments must not create competing owners of this relay device.
     boards = RelayBoards(relay, secondary)
+    if mapping_path(config).exists() and secondary is not None:
+        raise ValueError("Tapo mappings and a second Waveshare board cannot use the same channels.")
     lock_paths = sorted({
         default_socket().parent / (
             "relay-" + hashlib.sha256(f"{device.host}:{device.port}".encode()).hexdigest()[:16] + ".lock"
         ) for device in boards.devices
     })
-    lock_paths.append(config.with_name(config.name + ".service.lock"))
     with ExitStack() as stack:
-        for lock_path in lock_paths:
+        def acquire_lock(lock_path: Path) -> None:
             lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             handle = stack.enter_context(lock_path.open("a"))
             try:
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as error:
                 raise RuntimeError(f"Another controller owns {lock_path}") from error
+
+        acquire_lock(config.with_name(config.name + ".service.lock"))
+        if mapping_path(config).exists():
+            from tapo_plugs import load_mapping
+            lock_paths.extend(
+                default_socket().parent / ("tapo-" + plug.mac.replace(":", "") + ".lock")
+                for plug in load_mapping(mapping_path(config)) if plug is not None
+            )
+        for lock_path in sorted(lock_paths):
+            acquire_lock(lock_path)
         if path.exists():
             if not path.is_socket():
                 raise RuntimeError(f"Refusing to replace a non-socket file: {path}")
@@ -262,6 +370,7 @@ def serve(
             try:
                 service.controller.close(datetime.now())
             finally:
+                service.history.record(None, "Controller", "STOPPED", "Controller shutdown")
                 path.unlink(missing_ok=True)
 
 
@@ -273,7 +382,7 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--slave-id", type=int, default=1)
     parser.add_argument("--timeout", type=float, default=1)
-    parser.add_argument("--second-host", help="Second board IP/host; omit to disable channels 9-16")
+    parser.add_argument("--second-host", help="Second board IP/host; mutually exclusive with a Tapo mapping file")
     parser.add_argument("--second-port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--second-slave-id", type=int, default=1)
     parser.add_argument("--second-timeout", type=float, default=1)
@@ -283,12 +392,16 @@ def main() -> None:
     for signum in (signal.SIGTERM, signal.SIGINT):
         signal.signal(signum, lambda _signum, _frame: stop.set())
     try:
+        restored_boards = system_backup.load_connections(args.config.expanduser())
+        primary = WaveshareRelays(args.host, args.port, args.slave_id, args.timeout)
+        secondary = None if args.second_host is None else WaveshareRelays(
+            args.second_host, args.second_port, args.second_slave_id, args.second_timeout,
+        )
+        if restored_boards is not None:
+            primary = restored_boards[0]
+            secondary = restored_boards[1] if len(restored_boards) == 2 else None
         serve(args.config.expanduser(),
-              WaveshareRelays(args.host, args.port, args.slave_id, args.timeout),
-              args.socket.expanduser(), stop,
-              None if args.second_host is None else WaveshareRelays(
-                  args.second_host, args.second_port, args.second_slave_id, args.second_timeout
-              ))
+              primary, args.socket.expanduser(), stop, secondary)
     except (OSError, RuntimeError, ValueError, ExceptionGroup):
         logging.exception("Controller service stopped; outputs may be unknown")
         raise SystemExit(1)

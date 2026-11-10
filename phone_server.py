@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+from dataclasses import replace
 import hmac
 import ipaddress
 import json
@@ -18,10 +19,11 @@ import stat
 import threading
 import time
 from typing import Mapping
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
-from controller import decode_zones
+from controller import MAX_MANUAL_MINUTES, decode_zones, encode_zones
 from service import DEFAULT_CONFIG, default_socket, exchange
+from system_backup import MAX_TRANSPORT_BYTES
 
 DEFAULT_PASSWORD_FILE = DEFAULT_CONFIG.parent / "phone-password"
 SESSION_COOKIE = "garden_session"
@@ -94,7 +96,7 @@ class PhoneRequestHandler(BaseHTTPRequestHandler):
     def _error(self, status: HTTPStatus, message: str) -> None:
         self._send_json(status, {"error": message})
 
-    def _read_json(self) -> object:
+    def _read_json(self, limit: int = MAX_REQUEST_BYTES) -> object:
         if self.headers.get_content_type() != "application/json":
             raise ValueError("Send a JSON request.")
         raw_length = self.headers.get("Content-Length")
@@ -104,7 +106,7 @@ class PhoneRequestHandler(BaseHTTPRequestHandler):
             length = int(raw_length)
         except ValueError as error:
             raise ValueError("Invalid request body length.") from error
-        if length < 0 or length > MAX_REQUEST_BYTES:
+        if length < 0 or length > limit:
             raise ValueError("Request body is too large.")
         data = self.rfile.read(length)
         if len(data) != length:
@@ -167,29 +169,74 @@ class PhoneRequestHandler(BaseHTTPRequestHandler):
                 not isinstance(item, dict)
                 or type(item.get("channel")) is not int
                 or not isinstance(item.get("source"), str)
-                or not isinstance(item.get("remaining"), (int, float))
+                or (
+                    item.get("remaining") is not None
+                    and not isinstance(item.get("remaining"), (int, float))
+                )
+                or (
+                    item.get("remaining") is None
+                    and (item.get("source") != "Continuous" or "remaining" not in item)
+                )
                 or type(item.get("remaining")) is bool
+                or (item.get("elapsed") is not None and (
+                    type(item["elapsed"]) not in (int, float) or item["elapsed"] < 0
+                ))
             ):
                 raise ValueError("Invalid watering run in service status.")
             runs[item["channel"]] = {
                 "source": item["source"],
-                "remaining": max(0, item["remaining"]),
+                "remaining": None if item["remaining"] is None else max(0, item["remaining"]),
+                "elapsed": item.get("elapsed"),
             }
         channels = []
+        available = data.get("available_channels", list(range(channel_count)))
+        if not isinstance(available, list) or any(type(channel) is not int or channel not in range(channel_count) for channel in available):
+            raise ValueError("Invalid available channel list in service status.")
+        tapo = data.get("tapo")
+        if tapo is not None and (
+            not isinstance(tapo, list) or any(
+                not isinstance(item, dict) or type(item.get("channel")) is not int
+                or type(item.get("assigned")) is not bool for item in tapo
+            )
+        ):
+            raise ValueError("Invalid Tapo channel status.")
+        next_starts = data.get("next_starts")
+        if next_starts is not None and (
+            not isinstance(next_starts, list) or len(next_starts) != channel_count
+            or any(value is not None and not isinstance(value, str) for value in next_starts)
+        ):
+            raise ValueError("Invalid next schedule in service status.")
         for channel, zone in enumerate(zones[:channel_count]):
             channels.append({
                 "channel": channel,
                 "name": zone.name,
+                "available": channel in available,
+                "tapo": next((item for item in tapo if item["channel"] == channel), None) if tapo is not None else None,
                 "enabled": zone.enabled,
                 "rain_pause_exempt": zone.rain_pause_exempt,
+                "pump_exempt": zone.pump_exempt,
+                "max_manual_minutes": zone.max_manual_minutes,
+                "continuous_reminder_minutes": zone.continuous_reminder_minutes,
                 "master": channel == master_channel,
                 "running": runs.get(channel),
                 "pump_on": pump_on if channel == master_channel else False,
+                "next_start": next_starts[channel] if next_starts is not None else None,
             })
         return {
             "channels": channels,
             "rain_paused": rain_paused,
             "fault": fault,
+            "continuous_supported": data.get("continuous_supported") is True,
+            "manual_timers_supported": data.get("manual_timers_supported") is True,
+            "next_schedule_supported": next_starts is not None,
+            "history_supported": data.get("history_supported") is True,
+            "history_filters_supported": data.get("history_filters_supported") is True,
+            "continuous_reminders_supported": data.get("continuous_reminders_supported") is True,
+            "revision": data.get("revision"),
+            "backup_supported": data.get("full_backup_supported") is True,
+            "operation_held": data.get("operation_held") is True,
+            "restore_restart_required": data.get("restore_restart_required") is True,
+            "history_warning": data.get("history_warning", ""),
         }
 
     def _get_service_status(self) -> dict[str, object]:
@@ -198,7 +245,8 @@ class PhoneRequestHandler(BaseHTTPRequestHandler):
         ))
 
     def do_GET(self) -> None:
-        path = urlsplit(self.path).path
+        url = urlsplit(self.path)
+        path = url.path
         static_file = STATIC_FILES.get(path)
         if static_file:
             file_name, content_type = static_file
@@ -210,7 +258,7 @@ class PhoneRequestHandler(BaseHTTPRequestHandler):
                 return
             self._send(HTTPStatus.OK, body, content_type)
             return
-        if path not in ("/api/session", "/api/status"):
+        if path not in ("/api/session", "/api/status", "/api/history", "/api/backup"):
             self._error(HTTPStatus.NOT_FOUND, "Not found.")
             return
         session_info = self._session()
@@ -222,17 +270,46 @@ class PhoneRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, {"csrf": session.csrf_token})
             return
         try:
+            if path == "/api/backup":
+                result = exchange(self.server.service_socket, {"command": "status"})
+                decode_zones(result["settings"])
+                if not isinstance(result.get("revision"), str):
+                    raise ValueError("Invalid service revision.")
+                self._send_json(HTTPStatus.OK, {"revision": result["revision"]})
+                return
+            if path == "/api/history":
+                query = parse_qs(url.query, keep_blank_values=True)
+                values = query.get("offset", ["0"])
+                filters = query.get("filter", ["all"])
+                if set(query) - {"offset", "filter"} or len(values) != 1 or not values[0].isascii() or not values[0].isdecimal() or len(values[0]) > 4 or len(filters) != 1:
+                    raise ValueError("Invalid history page.")
+                category = filters[0]
+                if category not in ("all", "system", "faults") and (
+                    not category.isascii() or not category.isdecimal()
+                    or len(category) > 2 or int(category) not in range(16)
+                ):
+                    raise ValueError("Invalid history filter.")
+                command = {"command": "history", "offset": int(values[0])}
+                if category != "all":
+                    command["filter"] = category
+                result = exchange(self.server.service_socket, command)
+                self._send_json(HTTPStatus.OK, {"history": result})
+                return
             self._send_json(HTTPStatus.OK, {"status": self._get_service_status()})
-        except (OSError, ValueError) as error:
+        except (OSError, ValueError, KeyError) as error:
             self._error(HTTPStatus.SERVICE_UNAVAILABLE, str(error))
 
     def do_POST(self) -> None:
         path = urlsplit(self.path).path
-        if path not in ("/api/login", "/api/logout", "/api/command"):
+        if path not in ("/api/login", "/api/logout", "/api/command", "/api/restore", "/api/reminder",
+                        "/api/backup", "/api/backup-preview"):
             self._error(HTTPStatus.NOT_FOUND, "Not found.")
             return
         try:
-            body = self._read_json()
+            body = self._read_json(
+                MAX_TRANSPORT_BYTES if path in ("/api/restore", "/api/backup-preview")
+                else 16384 if path == "/api/backup" else MAX_REQUEST_BYTES,
+            )
         except ValueError as error:
             self._error(HTTPStatus.BAD_REQUEST, str(error))
             return
@@ -259,6 +336,66 @@ class PhoneRequestHandler(BaseHTTPRequestHandler):
                     f"{SESSION_COOKIE}=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Strict"
                 )},
             )
+            return
+        if path in ("/api/restore", "/api/backup", "/api/backup-preview"):
+            try:
+                password = body.get("password")
+                if not isinstance(password, str) or not password or len(password) > 1024:
+                    raise ValueError("Enter the backup password.")
+                command = {
+                    "command": "backup_restore" if path == "/api/restore" else
+                    "backup_preview" if path == "/api/backup-preview" else "backup_export",
+                    "password": password,
+                }
+                if path != "/api/backup":
+                    command["archive"] = body.get("archive")
+                if path == "/api/restore":
+                    revision = body.get("revision")
+                    if not isinstance(revision, str) or not revision:
+                        raise ValueError("A preview revision is required.")
+                    command["revision"] = revision
+                result = exchange(self.server.service_socket, command)
+                if result.get("fault"):
+                    raise RuntimeError("Controller fault: " + str(result["fault"]))
+                if path == "/api/restore":
+                    self._send_json(HTTPStatus.OK, {
+                        "status": self._public_status(result), "recovery_backup": result.get("recovery_backup", ""),
+                    })
+                else:
+                    self._send_json(HTTPStatus.OK, result)
+            except (ValueError, KeyError) as error:
+                self._error(HTTPStatus.BAD_REQUEST, str(error))
+            except (OSError, RuntimeError) as error:
+                self._error(HTTPStatus.SERVICE_UNAVAILABLE, str(error))
+            return
+        if path == "/api/reminder":
+            try:
+                channel, minutes, revision = body.get("channel"), body.get("minutes"), body.get("revision")
+                if type(channel) is not int or channel not in range(16):
+                    raise ValueError("Choose a configured channel.")
+                if minutes is not None and (type(minutes) is not int or not 1 <= minutes <= MAX_MANUAL_MINUTES):
+                    raise ValueError("Reminder must be blank or 1 to 1440 minutes.")
+                if not isinstance(revision, str) or not revision:
+                    raise ValueError("A settings revision is required.")
+                current = exchange(self.server.service_socket, {"command": "status"})
+                if current.get("continuous_reminders_supported") is not True:
+                    raise ValueError("Restart the updated controller service to configure reminders.")
+                if current.get("revision") != revision:
+                    raise ValueError("Settings changed elsewhere; refresh before saving.")
+                zones = decode_zones(current["settings"])
+                if channel >= current["channel_count"] or channel == current["master_channel"]:
+                    raise ValueError("Choose a configured non-pump channel.")
+                zones[channel] = replace(zones[channel], continuous_reminder_minutes=minutes)
+                result = exchange(self.server.service_socket, {
+                    "command": "save", "settings": encode_zones(zones), "revision": revision,
+                })
+                if result.get("fault"):
+                    raise RuntimeError("Controller fault: " + str(result["fault"]))
+                self._send_json(HTTPStatus.OK, {"status": self._public_status(result)})
+            except (ValueError, KeyError) as error:
+                self._error(HTTPStatus.BAD_REQUEST, str(error))
+            except (OSError, RuntimeError) as error:
+                self._error(HTTPStatus.SERVICE_UNAVAILABLE, str(error))
             return
         self._command(body)
 
@@ -314,21 +451,31 @@ class PhoneRequestHandler(BaseHTTPRequestHandler):
 
     def _command(self, body: dict[str, object]) -> None:
         action = body.get("action")
-        if action == "stop_all":
-            command: dict[str, object] = {"command": "stop_all"}
-        elif action in ("run", "stop"):
+        if action in ("stop_all", "resume_operation"):
+            command: dict[str, object] = {"command": action}
+        elif action in ("run", "continuous", "stop"):
             channel = body.get("channel")
             if type(channel) is not int or channel < 0 or channel >= 16:
                 self._error(HTTPStatus.BAD_REQUEST, "Choose a configured channel.")
                 return
             command = {
-                "command": "manual" if action == "run" else "stop",
+                "command": "manual" if action == "run" else action,
                 "channel": channel,
             }
+            if action == "run" and "duration_minutes" in body:
+                duration = body["duration_minutes"]
+                if type(duration) is not int or not 1 <= duration <= MAX_MANUAL_MINUTES:
+                    self._error(HTTPStatus.BAD_REQUEST, "Manual duration must be 1 to 1440 minutes.")
+                    return
+                command["duration_minutes"] = duration
         else:
             self._error(HTTPStatus.BAD_REQUEST, "Unknown sprinkler action.")
             return
         try:
+            if action == "run" and "duration_minutes" in body:
+                status = exchange(self.server.service_socket, {"command": "status"})
+                if status.get("manual_timers_supported") is not True:
+                    raise ValueError("Restart the updated background service before using manual timers.")
             result = exchange(self.server.service_socket, command)
             fault = result.get("fault")
             if isinstance(fault, str) and fault:

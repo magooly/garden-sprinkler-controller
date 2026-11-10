@@ -23,7 +23,7 @@ class ServiceClient:
             "protocol", "settings", "revision", "rain_paused", "master_channel",
             "pump_on", "fault", "host", "port", "slave_id", "runs",
         }
-        if not required.issubset(data) or data["protocol"] != 1:
+        if not required.issubset(data) or data["protocol"] not in (1, 2):
             raise OSError("Incompatible service reply. Update/restart the service and app together.")
         zones = decode_zones(data["settings"])
         channel_count = data.get("channel_count", 8)
@@ -35,6 +35,14 @@ class ServiceClient:
             raise OSError("Board configuration changed. Close and reopen this window.")
         self.zones = zones
         self.channel_count = channel_count
+        available = data.get("available_channels", list(range(channel_count)))
+        if (
+            not isinstance(available, list) or any(type(channel) is not int or channel not in range(channel_count) for channel in available)
+            or not set(range(8)).issubset(available)
+        ):
+            raise OSError("Invalid available channel list in service reply.")
+        self.available_channels = frozenset(available)
+        self.tapo = data.get("tapo")
         self.boards = data.get("boards", [
             {"host": data["host"], "port": data["port"], "slave_id": data["slave_id"]}
         ])
@@ -43,17 +51,51 @@ class ServiceClient:
         self.master_channel = data["master_channel"]
         self.pump_on = data["pump_on"]
         self.fault = data["fault"]
+        self.full_backup_supported = data.get("full_backup_supported") is True
+        self.operation_held = data.get("operation_held") is True
+        self.restore_restart_required = data.get("restore_restart_required") is True
+        self.recovery_backup = data.get("recovery_backup", "")
+        self.manual_timers_supported = data.get("manual_timers_supported") is True
+        self.history_supported = data.get("history_supported") is True
+        self.history_filters_supported = data.get("history_filters_supported") is True
+        self.continuous_reminders_supported = data.get("continuous_reminders_supported") is True
+        self.history_warning = data.get("history_warning", "")
         self.timetables = data.get("timetables")
+        self.timetable_groups = data.get("timetable_groups")
         self.host = data["host"]
         self.port = data["port"]
         self.slave_id = data["slave_id"]
         self.runs = {
-            item["channel"]: Run(item["source"], self.clock() + item["remaining"])
+            item["channel"]: Run(
+                item["source"],
+                None if item["remaining"] is None else self.clock() + item["remaining"],
+                started=None if item.get("elapsed") is None else self.clock() - item["elapsed"],
+            )
             for item in data["runs"]
         }
 
     def sync(self) -> None:
         self._update(exchange(self.path, {"command": "status"}))
+
+    def history(self, offset: int, category: str = "all") -> dict:
+        if not self.history_supported:
+            raise ValueError("Restart the updated controller service to view activity history.")
+        if category != "all" and not self.history_filters_supported:
+            raise ValueError("Restart the updated controller service to filter history.")
+        request = {"command": "history", "offset": offset}
+        if category != "all":
+            request["filter"] = category
+        return exchange(self.path, request)
+
+    def backup(self, command: str, **arguments: object) -> dict:
+        if not self.full_backup_supported:
+            raise ValueError("Restart the updated controller service to enable encrypted full backups.")
+        result = exchange(self.path, {"command": command, **arguments})
+        if result.get("fault"):
+            raise RuntimeError("Service fault: " + result["fault"])
+        if command == "backup_restore":
+            self._update(result)
+        return result
 
     def command(self, command: str, **arguments: object) -> None:
         self._update(exchange(self.path, {"command": command, **arguments}))
@@ -78,21 +120,29 @@ class ServiceClient:
     def stop(self, channel: int, now: datetime) -> None:
         self.command("stop", channel=channel)
 
-    def save_profile(self, name: str) -> None:
-        if self.timetables is None:
-            raise ValueError("Restart the background service to enable timetable profiles.")
-        self.command("profile_save", name=name, revision=self.revision)
+    def save_profile(self, name: str, bank: int = 0) -> None:
+        if self.timetable_groups is None:
+            raise ValueError("Restart the background service to enable separate timetable groups.")
+        self.command("profile_save", name=name, bank=bank, revision=self.revision)
 
-    def load_profile(self, name: str) -> None:
-        if self.timetables is None:
-            raise ValueError("Restart the background service to enable timetable profiles.")
-        self.command("profile_load", name=name, revision=self.revision)
+    def load_profile(self, name: str, bank: int = 0) -> None:
+        if self.timetable_groups is None:
+            raise ValueError("Restart the background service to enable separate timetable groups.")
+        self.command("profile_load", name=name, bank=bank, revision=self.revision)
 
     def stop_all(self, now: datetime) -> None:
         self.command("stop_all")
 
-    def start_manual(self, channel: int, now: datetime) -> None:
-        self.command("manual", channel=channel)
+    def start_manual(
+        self, channel: int, now: datetime, *, duration_minutes: int = 10,
+        continuous: bool = False,
+    ) -> None:
+        if not self.manual_timers_supported:
+            raise ValueError("Restart the updated background service before using manual timers.")
+        if continuous:
+            self.command("continuous", channel=channel)
+        else:
+            self.command("manual", channel=channel, duration_minutes=duration_minutes)
 
     def toggle_test(self, channel: int, now: datetime) -> None:
         self.command("test", channel=channel)
@@ -100,7 +150,7 @@ class ServiceClient:
     def set_rain_pause(self, paused: bool, now: datetime) -> None:
         self.command("rain_pause", paused=paused)
 
-    def read_states(self) -> list[bool]:
+    def read_states(self) -> list[bool | None]:
         result = exchange(self.path, {"command": "read_states"})
         if "states" not in result:
             self._update(result)

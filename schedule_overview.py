@@ -86,7 +86,7 @@ def overview_rows(
 
 class ScheduleOverview(ctk.CTkToplevel):
     def __init__(
-        self, master: ctk.CTk, snapshot: Callable[[], tuple[list[Zone], int | None, bool, bool, bool]],
+        self, master: ctk.CTk, snapshot: Callable[[], tuple[list[Zone], int | None, bool, bool, bool, int]],
         select_zone: Callable[[int], None], day: int,
     ) -> None:
         super().__init__(master)
@@ -157,12 +157,15 @@ class ScheduleOverview(ctk.CTkToplevel):
             self.master.lift()
 
     def refresh(self) -> None:
-        zones, master, dirty, paused, unavailable = self.snapshot()
-        signature = (zones, master, dirty, paused, unavailable, self.day.get(), self.hide_disabled.get())
+        zones, master, dirty, paused, unavailable, first = self.snapshot()
+        signature = (zones, master, dirty, paused, unavailable, first, self.day.get(), self.hide_disabled.get())
         if signature == self.last_snapshot:
             return
         self.last_snapshot = signature
-        self.rows = overview_rows(zones, DAY_NAMES.index(self.day.get()), master, self.hide_disabled.get())
+        self.rows = [
+            row for row in overview_rows(zones, DAY_NAMES.index(self.day.get()), master, self.hide_disabled.get())
+            if first <= row.channel < first + 8
+        ]
         self.table.delete(*self.table.get_children())
         for index, row in enumerate(self.rows):
             invalid = row.stop_minute is None
@@ -176,6 +179,7 @@ class ScheduleOverview(ctk.CTkToplevel):
                 row.warning,
             ), tags=(tag,))
         text = "UNSAVED EDITS - not yet applied" if dirty else "Saved schedules"
+        text += f" / Channels {first + 1}-{first + 8}"
         text += f" / {len(self.rows)} periods / {sum(bool(row.warning) for row in self.rows)} rows with warnings"
         if not self.rows:
             text += " / No configured periods for this day/filter"
@@ -191,7 +195,7 @@ class ScheduleOverview(ctk.CTkToplevel):
 class WeeklyOverview(ctk.CTkToplevel):
     def __init__(
         self, master: ctk.CTk,
-        snapshot: Callable[[], tuple[list[Zone], int | None, bool, bool, bool]],
+        snapshot: Callable[[], tuple[list[Zone], int | None, bool, bool, bool, int]],
         select_zone: Callable[[int], None],
     ) -> None:
         super().__init__(master)
@@ -229,8 +233,8 @@ class WeeklyOverview(ctk.CTkToplevel):
         self.master.lift()
 
     def refresh(self) -> None:
-        zones, master, dirty, paused, unavailable = self.snapshot()
-        signature = (zones, master, dirty, paused, unavailable, self.hide_disabled.get())
+        zones, master, dirty, paused, unavailable, first = self.snapshot()
+        signature = (zones, master, dirty, paused, unavailable, first, self.hide_disabled.get())
         if signature == self.last_snapshot:
             return
         self.last_snapshot = signature
@@ -244,7 +248,8 @@ class WeeklyOverview(ctk.CTkToplevel):
         days = [overview_rows(zones, day, master, self.hide_disabled.get()) for day in range(7)]
         channels = [
             channel for channel, zone in enumerate(zones)
-            if channel != master and (zone.enabled or not self.hide_disabled.get())
+            if first <= channel < first + 8
+            and channel != master and (zone.enabled or not self.hide_disabled.get())
         ]
         for row_index, channel in enumerate(channels, start=1):
             zone = zones[channel]
@@ -278,6 +283,7 @@ class WeeklyOverview(ctk.CTkToplevel):
                 cell.bind("<Button-1>", lambda _event, index=channel: self.open_channel(index))
                 self.cells[channel, day] = cell
         text = "UNSAVED EDITS - not yet applied" if dirty else "Saved schedules"
+        text += f" / Channels {first + 1}-{first + 8}"
         text += f" / All seven days / {len(channels)} garden relays"
         if not channels:
             text += " / No relays match this filter"
@@ -285,6 +291,6 @@ class WeeklyOverview(ctk.CTkToplevel):
             text += "\nRAIN PAUSE is on; configured times are shown, not running outputs."
         if unavailable:
             text += "\nService unavailable or faulted: saved status may be stale."
-        if any(row.stop_minute is None for rows in days for row in rows):
+        if any(row.stop_minute is None for rows in days for row in rows if row.channel in channels):
             text += "\nInvalid/incomplete pairs (!) cannot be fully checked for conflicts."
         self.summary.configure(text=text)
