@@ -2,6 +2,10 @@
 
 Version **1.3.0**
 
+[Read the printable user and installation guide (PDF)](README.pdf).
+The guide includes a clickable contents page, numbered pages and formatted
+instructions for everyday use, installation and recovery.
+
 A dark-mode CustomTkinter desktop app for seven independently named sprinkler
 zones plus a channel 8 master pump, with an optional second eight-channel
 **Waveshare Modbus POE ETH Relay (B)** or individual **Tapo P110M Wi-Fi plugs**

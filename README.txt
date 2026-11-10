@@ -3,6 +3,9 @@ GARDEN SPRINKLER CONTROLLER
 
 Version 1.3.0
 
+For the readable, printable user and installation guide, open README.pdf.
+It includes a contents page, page numbers and formatted command examples.
+
 Developed by Wally Horsman, 2026
 
 Seven garden zones and an automatic channel 8 master pump, using the
