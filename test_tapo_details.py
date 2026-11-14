@@ -74,10 +74,14 @@ class ReadTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CacheTests(unittest.TestCase):
-    def test_refresh_is_nonblocking_coalesced_and_preserves_stale_readings(self):
+    def test_failed_refresh_is_nonblocking_coalesced_and_clears_current_readings(self):
         entered, release, done = threading.Event(), threading.Event(), threading.Event()
         cache = TapoDetails((PLUG,), CREDENTIALS)
-        cache.rows[0] = {"power_w": 12.3, "updated": "2026-01-01T00:00:00+00:00"}
+        cache.rows[0] = {
+            "state": True, "power_w": 12.3, "today_kwh": 0.5, "month_kwh": 2.5,
+            "voltage_v": 240.0, "current_a": 0.05,
+            "updated": "2026-01-01T00:00:00+00:00",
+        }
 
         async def slow(*_args):
             entered.set()
@@ -105,7 +109,9 @@ class CacheTests(unittest.TestCase):
                 self.assertTrue(done.wait(2))
             self.assertEqual(read.call_count, 1)
             row = cache.snapshot(["name"] * 16)["rows"][0]
-            self.assertEqual(row["power_w"], 12.3)
+            for key in ("state", "power_w", "today_kwh", "month_kwh", "voltage_v", "current_a"):
+                self.assertIsNone(row[key], key)
+            self.assertEqual(row["updated"], "2026-01-01T00:00:00+00:00")
             self.assertEqual(row["error"], "unavailable")
             cache.snapshot(["name"] * 16, True)
             self.assertEqual(read.call_count, 1)

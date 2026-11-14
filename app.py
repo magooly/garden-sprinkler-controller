@@ -710,9 +710,9 @@ class SprinklerApp(ctk.CTk):
                 stale = bool(row["error"]) or (
                     stamp is not None and (datetime.now(stamp.tzinfo) - stamp).total_seconds() > 60
                 )
-                state = "Unavailable" if row["state"] is None else "ON" if row["state"] else "OFF"
+                state = "Unavailable" if row["error"] or row["state"] is None else "ON" if row["state"] else "OFF"
                 numbers = [
-                    "Unavailable" if row[key] is None else f"{row[key]:.3f}"
+                    "Unavailable" if row["error"] or row[key] is None else f"{row[key]:.3f}"
                     for key in ("power_w", "today_kwh", "month_kwh", "voltage_v", "current_a")
                 ]
                 table.insert("", "end", values=(

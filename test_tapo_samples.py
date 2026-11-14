@@ -51,7 +51,7 @@ class SampleTests(unittest.TestCase):
         row = self.store.history(PLUG.mac, datetime.fromtimestamp(self.bucket, timezone.utc))["samples"][-1]
         self.assertIsNone(row["power_w"])
         self.assertEqual(row["error"], "offline")
-        self.assertEqual(cache.rows[0]["power_w"], 123.4)
+        self.assertIsNone(cache.rows[0]["power_w"])
 
     def test_sample_due_nonblocking_once_per_bucket_and_skips_busy_reader(self):
         cache = TapoDetails((PLUG,), CREDENTIALS, self.config)

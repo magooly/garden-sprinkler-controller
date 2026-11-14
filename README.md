@@ -241,7 +241,9 @@ the reading time. Opening the view or pressing **Refresh** requests one batch
 of readings; overlapping requests are combined and batches are limited to
 one per ten seconds. Reads run outside the controller's switching loop.
 Missing measurements are shown as unavailable, not zero. Failed refreshes
-retain previous values marked stale and do not stop watering. This does not
+show state and measurements as Unavailable rather than displaying old values.
+The timestamp remains the last successful read; recorded graph history is retained.
+Telemetry failures do not stop watering. This does not
 change the controller's existing fault policy for switching failures. Readings
 are not proof of electrical isolation or appliance operation.
 

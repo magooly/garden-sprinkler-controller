@@ -120,7 +120,12 @@ class TapoDetails:
             except OSError as exc:
                 logging.warning("Tapo details for channel %s: %s", index + 9, exc)
                 with self.lock:
-                    self.rows[index] = {**self.rows.get(index, {}), "error": str(exc)}
+                    self.rows[index] = {
+                        **self.rows.get(index, {}),
+                        "state": None, "power_w": None, "today_kwh": None,
+                        "month_kwh": None, "voltage_v": None, "current_a": None,
+                        "error": str(exc),
+                    }
                 row = {"error": str(exc), "updated": None}
             else:
                 with self.lock:

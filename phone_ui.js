@@ -247,9 +247,9 @@ async function loadTapo(refresh = false) {
       const stale = Boolean(row.error) || (row.updated && Date.now() - Date.parse(row.updated) > 60000);
       const values = [
         row.channel + 1, row.name,
-        row.state === null ? "Unavailable" : row.state ? "ON" : "OFF",
+        row.error || row.state === null ? "Unavailable" : row.state ? "ON" : "OFF",
         ...["power_w", "today_kwh", "month_kwh", "voltage_v", "current_a"]
-          .map(key => row[key] === null ? "Unavailable" : row[key].toFixed(3)),
+          .map(key => row.error || row[key] === null ? "Unavailable" : row[key].toFixed(3)),
         row.updated ? new Date(row.updated).toLocaleString() : "Never",
         row.station_fault ? `Station fault — ${row.station_fault}. Explicit retry required.`
           : row.error ? `${row.updated ? "Stale" : "Unavailable"}: ${row.error}`

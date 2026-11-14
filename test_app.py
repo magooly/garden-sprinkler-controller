@@ -129,6 +129,19 @@ class RainPauseGuiTests(unittest.TestCase):
                         self.assertIn("Unavailable", values)
                         self.assertIn("Stale", values)
                         read.assert_called_once_with(True)
+                        row["error"] = "Plug unreachable"
+                        refresh = next(w for w in other.tapo_window.winfo_children()
+                                       if isinstance(w, ctk.CTkButton))
+                        refresh.invoke()
+                        deadline = time.monotonic() + 2
+                        while time.monotonic() < deadline:
+                            other.update()
+                            values = table.item(table.get_children()[0], "values")
+                            if "Plug unreachable" in str(values):
+                                break
+                            time.sleep(0.01)
+                        self.assertEqual(values[2:8], ("Unavailable",) * 6)
+                        row["error"] = ""
                         row.update({
                             "state": None, "off_peak": True, "requested_state": True,
                             "last_confirmed_state": True, "confirmed_at": row["updated"],
