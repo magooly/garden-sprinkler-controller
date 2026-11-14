@@ -64,6 +64,12 @@ class TapoTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await plug_operation(self.plug, self.credentials, None))
         self.device.protocol.query.assert_not_awaited()
 
+    async def test_superseded_request_is_not_written_after_discovery(self) -> None:
+        self.assertTrue(await plug_operation(
+            self.plug, self.credentials, False, permit_write=lambda: False,
+        ))
+        self.device.protocol.query.assert_not_awaited()
+
     async def test_readback_mismatch_is_not_success(self) -> None:
         self.device.is_on = False
         with self.assertRaisesRegex(OSError, "readback"):
@@ -87,6 +93,24 @@ class TapoTransportTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(OSError, "timed out"):
                 await plug_operation(self.plug, self.credentials, True)
         self.device.protocol.query.assert_not_awaited()
+        self.device.disconnect.assert_awaited_once()
+
+    async def test_timeout_after_write_is_reported_as_unknown_without_retrying(self) -> None:
+        calls = 0
+
+        async def update():
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                await asyncio.sleep(10)
+
+        self.device.update.side_effect = update
+        with patch("tapo_plugs.OPERATION_SECONDS", 0.05):
+            with self.assertRaisesRegex(OSError, "state is unknown"):
+                await plug_operation(self.plug, self.credentials, True)
+        self.device.protocol.query.assert_awaited_once_with(
+            {"set_device_info": {"device_on": True}}, retry_count=0,
+        )
         self.device.disconnect.assert_awaited_once()
 
 
@@ -115,7 +139,20 @@ class TapoSetupTests(unittest.TestCase):
             decode_mapping({"version": 1, "plugs": [{"host": "192.168.0.50", "mac": MAC}] * 8})
         self.assertEqual(load_mapping(mapping_path(self.config)), (None,) * 8)
 
-    def test_credentials_are_private_and_not_in_status_or_backup(self) -> None:
+    def test_assignment_preserves_other_policy_but_does_not_transfer_it(self) -> None:
+        self.mapping["plugs"][7] = {"host": "192.168.0.121", "mac": MAC, "off_peak": True}
+        self.write_mapping()
+        for channel, host, mac, enabled in (
+            (9, "192.168.0.50", "00:00:00:00:00:01", True),
+            (16, "192.168.0.122", "00:00:00:00:00:02", False),
+        ):
+            with patch("sys.argv", [
+                "tapo_plugs.py", "--config", str(self.config), "assign", str(channel), host, mac,
+            ]), contextlib.redirect_stdout(io.StringIO()):
+                main()
+            self.assertEqual(load_mapping(mapping_path(self.config))[7].off_peak, enabled)
+
+    def test_credentials_are_private_and_not_in_status(self) -> None:
         self.credentials()
         path = credentials_path(self.config)
         self.assertEqual(load_credentials(path).username, "test@example.invalid")
@@ -126,6 +163,19 @@ class TapoSetupTests(unittest.TestCase):
         service = Service(self.config, self.primary)
         self.assertNotIn("private-value", json.dumps(service.status()))
         self.assertNotIn("test@example.invalid", json.dumps(service.status()))
+
+    def test_credentials_setup_explains_backup_inclusion(self) -> None:
+        output = io.StringIO()
+        with (
+            patch("sys.argv", ["tapo_plugs.py", "--config", str(self.config), "credentials"]),
+            patch("builtins.input", return_value="test@example.invalid"),
+            patch("tapo_plugs.getpass", return_value="private-value"),
+            contextlib.redirect_stdout(output),
+        ):
+            main()
+        self.assertIn("Encrypted full-system backups include them", output.getvalue())
+        self.assertIn("settings exports do not", output.getvalue())
+        self.assertNotIn("private-value", output.getvalue())
 
     def test_unassigned_slots_do_not_send_fake_off_or_start_schedules(self) -> None:
         zones = default_zones(16)
@@ -180,7 +230,9 @@ class TapoSetupTests(unittest.TestCase):
             self.assertTrue(any(event["channel"] == 8 and event["event"] == "ON" for event in events))
             transport.side_effect = OSError("offline")
             service.dispatch({"command": "manual", "channel": 8})
-            self.assertIn("offline", service.fault)
+            self.assertFalse(service.fault)
+            self.assertIn("offline", service.controller.channel_faults[8])
+            self.assertFalse(service.controller.closed)
             self.assertIsNone(service.relay.states[8])
             self.assertFalse(any(self.primary.states))
 

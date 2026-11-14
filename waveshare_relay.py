@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import math
 import socket
 import struct
@@ -134,6 +135,7 @@ class RelayBoards:
         self.port = primary.port
         self.slave_id = primary.slave_id
         self.channel_count = 8 if secondary is None else 16
+        self.errors: dict[int, str] = {}
 
     @property
     def devices(self) -> tuple[WaveshareRelays, ...]:
@@ -147,8 +149,19 @@ class RelayBoards:
             raise ValueError("The second relay board is not configured.")
         device.set_relay(channel % 8, energized)
 
-    def read_states(self) -> tuple[bool, ...]:
-        return tuple(state for device in self.devices for state in device.read_states())
+    def read_states(self) -> tuple[bool | None, ...]:
+        primary = tuple(self.primary.read_states())
+        if self.secondary is None:
+            return primary
+        try:
+            secondary = tuple(self.secondary.read_states())
+        except OSError as error:
+            for channel in range(8, 16):
+                self.errors[channel] = str(error)
+            logging.error("Appliance board status unavailable; garden unaffected: %s", error)
+            return primary + (None,) * 8
+        self.errors.clear()
+        return primary + secondary
 
 
 def main() -> None:

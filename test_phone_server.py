@@ -34,6 +34,109 @@ def service_status() -> dict[str, object]:
 
 
 class PhoneServerTests(unittest.TestCase):
+    def test_group_stops_and_station_retry_require_auth_csrf_and_preserve_local_faults(self):
+        for action in ("stop_garden", "stop_appliances", "retry_station"):
+            body = {"action": action, "channel": 8}
+            self.assertEqual(self.request("POST", "/api/command", body)[0], 401)
+        cookie, csrf = self.login()
+        data = service_status()
+        data.update({
+            "settings": encode_zones(default_zones(16)), "channel_count": 16,
+            "group_controls_supported": True, "garden_fault": "",
+            "channel_faults": {"8": "plug unavailable"},
+        })
+        self.mock_exchange.return_value = data
+        for action in ("stop_garden", "stop_appliances", "retry_station"):
+            self.mock_exchange.reset_mock()
+            body = {"action": action, "channel": 8}
+            self.assertEqual(self.request("POST", "/api/command", body, cookie)[0], 403)
+            self.mock_exchange.assert_not_called()
+            status, response, _ = self.request("POST", "/api/command", body, cookie, csrf)
+            self.assertEqual(status, 200)
+            self.assertFalse(response["status"]["fault"])
+            self.assertFalse(response["status"]["channels"][0]["fault"])
+            self.assertEqual(response["status"]["channels"][8]["fault"], "plug unavailable")
+            expected = {"command": action}
+            if action == "retry_station":
+                expected["channel"] = 8
+            self.mock_exchange.assert_called_once_with(self.socket_path, expected)
+
+    def test_tapo_timeline_auth_and_channel_validation(self) -> None:
+        self.assertEqual(self.request("GET", "/api/tapo-timeline?channel=8")[0], 401)
+        cookie, _ = self.login()
+        self.mock_exchange.return_value = {"channel": 8, "segments": [], "events": []}
+        status, data, _ = self.request("GET", "/api/tapo-timeline?channel=8", cookie=cookie)
+        self.assertEqual(status, 200)
+        self.assertEqual(data["timeline"]["channel"], 8)
+        self.mock_exchange.assert_called_once_with(
+            self.socket_path, {"command": "tapo_timeline", "channel": 8},
+        )
+        self.mock_exchange.reset_mock()
+        for query in ("channel=7", "channel=16", "channel=8&channel=9", "channel=bad", "channel=8&extra=1"):
+            self.assertEqual(self.request("GET", "/api/tapo-timeline?" + query, cookie=cookie)[0], 503)
+        self.mock_exchange.assert_not_called()
+
+    def test_tapo_details_require_auth_and_only_route_read_command(self) -> None:
+        self.assertEqual(self.request("GET", "/api/tapo-details")[0], 401)
+        cookie, _ = self.login()
+        self.mock_exchange.return_value = {"reading": False, "rows": []}
+        status, body, _ = self.request("GET", "/api/tapo-details?refresh=1", cookie=cookie)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["details"]["rows"], [])
+        self.mock_exchange.assert_called_once_with(
+            self.socket_path, {"command": "tapo_details", "refresh": True},
+        )
+        self.mock_exchange.reset_mock()
+        self.assertEqual(self.request("GET", "/api/tapo-details?refresh=invalid", cookie=cookie)[0], 503)
+        self.mock_exchange.assert_not_called()
+
+    def test_window_pause_is_revision_guarded_and_changes_only_selected_group(self) -> None:
+        cookie, csrf = self.login()
+        current = service_status()
+        self.mock_exchange.return_value = current
+        body = {"channel": 1, "group": 2, "paused": True, "revision": "revision-1"}
+        self.assertEqual(self.request("POST", "/api/window-pause", body, cookie)[0], 403)
+        self.mock_exchange.assert_not_called()
+        for changes in ({"group": -1}, {"group": 4}, {"group": True}, {"paused": 1},
+                        {"channel": 7}, {"channel": 15}, {"revision": "stale"}):
+            self.assertEqual(self.request(
+                "POST", "/api/window-pause", {**body, **changes}, cookie, csrf,
+            )[0], 400)
+        self.mock_exchange.reset_mock()
+        status, response, _ = self.request("POST", "/api/window-pause", body, cookie, csrf)
+        self.assertEqual(status, 200)
+        self.assertEqual(self.mock_exchange.call_count, 2)
+        save = self.mock_exchange.call_args.args[1]
+        from controller import decode_zones
+        from dataclasses import replace
+        expected = default_zones()
+        expected[1] = replace(expected[1], paused_windows=(False, False, True, False))
+        self.assertEqual(decode_zones(save["settings"]), expected)
+        self.assertEqual(save["revision"], "revision-1")
+        self.assertIn("paused_windows", response["status"]["channels"][1])
+
+    def test_rain_pause_requires_csrf_and_boolean(self) -> None:
+        cookie, csrf = self.login()
+        self.mock_exchange.return_value = service_status()
+        body = {"action": "rain_pause", "paused": True}
+        self.assertEqual(self.request("POST", "/api/command", body, cookie)[0], 403)
+        self.mock_exchange.assert_not_called()
+        for invalid in (None, 1, "true"):
+            status, _, _ = self.request(
+                "POST", "/api/command", {**body, "paused": invalid}, cookie, csrf,
+            )
+            self.assertEqual(status, 400)
+        self.mock_exchange.assert_not_called()
+        for paused in (True, False):
+            status, _, _ = self.request(
+                "POST", "/api/command", {**body, "paused": paused}, cookie, csrf,
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(
+                self.mock_exchange.call_args.args[1],
+                {"command": "rain_pause", "paused": paused},
+            )
+
     def test_reminder_change_is_revision_guarded_and_validated(self) -> None:
         cookie, csrf = self.login()
         current = service_status()

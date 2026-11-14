@@ -213,6 +213,7 @@ class PhoneRequestHandler(BaseHTTPRequestHandler):
                 "available": channel in available,
                 "tapo": next((item for item in tapo if item["channel"] == channel), None) if tapo is not None else None,
                 "enabled": zone.enabled,
+                "paused_windows": list(zone.paused_windows),
                 "rain_pause_exempt": zone.rain_pause_exempt,
                 "pump_exempt": zone.pump_exempt,
                 "max_manual_minutes": zone.max_manual_minutes,
@@ -220,12 +221,17 @@ class PhoneRequestHandler(BaseHTTPRequestHandler):
                 "master": channel == master_channel,
                 "running": runs.get(channel),
                 "pump_on": pump_on if channel == master_channel else False,
+                "fault": data.get("garden_fault", "") if channel < 8
+                else data.get("channel_faults", {}).get(str(channel), ""),
                 "next_start": next_starts[channel] if next_starts is not None else None,
             })
         return {
             "channels": channels,
             "rain_paused": rain_paused,
             "fault": fault,
+            "garden_fault": data.get("garden_fault", ""),
+            "channel_faults": data.get("channel_faults", {}),
+            "group_controls_supported": data.get("group_controls_supported") is True,
             "continuous_supported": data.get("continuous_supported") is True,
             "manual_timers_supported": data.get("manual_timers_supported") is True,
             "next_schedule_supported": next_starts is not None,
@@ -258,7 +264,7 @@ class PhoneRequestHandler(BaseHTTPRequestHandler):
                 return
             self._send(HTTPStatus.OK, body, content_type)
             return
-        if path not in ("/api/session", "/api/status", "/api/history", "/api/backup"):
+        if path not in ("/api/session", "/api/status", "/api/history", "/api/backup", "/api/tapo-details", "/api/tapo-timeline"):
             self._error(HTTPStatus.NOT_FOUND, "Not found.")
             return
         session_info = self._session()
@@ -270,6 +276,25 @@ class PhoneRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, {"csrf": session.csrf_token})
             return
         try:
+            if path == "/api/tapo-timeline":
+                query = parse_qs(url.query, keep_blank_values=True)
+                values = query.get("channel", [])
+                if set(query) != {"channel"} or len(values) != 1 or values[0] not in tuple(str(i) for i in range(8, 16)):
+                    raise ValueError("Choose an assigned Tapo channel.")
+                result = exchange(self.server.service_socket, {
+                    "command": "tapo_timeline", "channel": int(values[0]),
+                })
+                self._send_json(HTTPStatus.OK, {"timeline": result})
+                return
+            if path == "/api/tapo-details":
+                query = parse_qs(url.query, keep_blank_values=True)
+                if query not in ({}, {"refresh": ["1"]}):
+                    raise ValueError("Invalid Tapo details request.")
+                result = exchange(self.server.service_socket, {
+                    "command": "tapo_details", "refresh": bool(query),
+                })
+                self._send_json(HTTPStatus.OK, {"details": result})
+                return
             if path == "/api/backup":
                 result = exchange(self.server.service_socket, {"command": "status"})
                 decode_zones(result["settings"])
@@ -301,7 +326,7 @@ class PhoneRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlsplit(self.path).path
-        if path not in ("/api/login", "/api/logout", "/api/command", "/api/restore", "/api/reminder",
+        if path not in ("/api/login", "/api/logout", "/api/command", "/api/restore", "/api/reminder", "/api/window-pause",
                         "/api/backup", "/api/backup-preview"):
             self._error(HTTPStatus.NOT_FOUND, "Not found.")
             return
@@ -368,24 +393,34 @@ class PhoneRequestHandler(BaseHTTPRequestHandler):
             except (OSError, RuntimeError) as error:
                 self._error(HTTPStatus.SERVICE_UNAVAILABLE, str(error))
             return
-        if path == "/api/reminder":
+        if path in ("/api/reminder", "/api/window-pause"):
             try:
                 channel, minutes, revision = body.get("channel"), body.get("minutes"), body.get("revision")
                 if type(channel) is not int or channel not in range(16):
                     raise ValueError("Choose a configured channel.")
-                if minutes is not None and (type(minutes) is not int or not 1 <= minutes <= MAX_MANUAL_MINUTES):
+                group, paused = body.get("group"), body.get("paused")
+                if path == "/api/window-pause" and (
+                    type(group) is not int or group not in range(4) or type(paused) is not bool
+                ):
+                    raise ValueError("Choose a schedule group from 0 to 3 and a true or false pause state.")
+                if path == "/api/reminder" and minutes is not None and (type(minutes) is not int or not 1 <= minutes <= MAX_MANUAL_MINUTES):
                     raise ValueError("Reminder must be blank or 1 to 1440 minutes.")
                 if not isinstance(revision, str) or not revision:
                     raise ValueError("A settings revision is required.")
                 current = exchange(self.server.service_socket, {"command": "status"})
-                if current.get("continuous_reminders_supported") is not True:
+                if path == "/api/reminder" and current.get("continuous_reminders_supported") is not True:
                     raise ValueError("Restart the updated controller service to configure reminders.")
                 if current.get("revision") != revision:
                     raise ValueError("Settings changed elsewhere; refresh before saving.")
                 zones = decode_zones(current["settings"])
                 if channel >= current["channel_count"] or channel == current["master_channel"]:
                     raise ValueError("Choose a configured non-pump channel.")
-                zones[channel] = replace(zones[channel], continuous_reminder_minutes=minutes)
+                if path == "/api/window-pause":
+                    windows = list(zones[channel].paused_windows)
+                    windows[group] = paused
+                    zones[channel] = replace(zones[channel], paused_windows=tuple(windows))
+                else:
+                    zones[channel] = replace(zones[channel], continuous_reminder_minutes=minutes)
                 result = exchange(self.server.service_socket, {
                     "command": "save", "settings": encode_zones(zones), "revision": revision,
                 })
@@ -451,9 +486,15 @@ class PhoneRequestHandler(BaseHTTPRequestHandler):
 
     def _command(self, body: dict[str, object]) -> None:
         action = body.get("action")
-        if action in ("stop_all", "resume_operation"):
+        if action in ("stop_all", "stop_garden", "stop_appliances", "resume_operation"):
             command: dict[str, object] = {"command": action}
-        elif action in ("run", "continuous", "stop"):
+        elif action == "rain_pause":
+            paused = body.get("paused")
+            if type(paused) is not bool:
+                self._error(HTTPStatus.BAD_REQUEST, "Rain Pause must be true or false.")
+                return
+            command = {"command": "rain_pause", "paused": paused}
+        elif action in ("run", "continuous", "stop", "retry_station"):
             channel = body.get("channel")
             if type(channel) is not int or channel < 0 or channel >= 16:
                 self._error(HTTPStatus.BAD_REQUEST, "Choose a configured channel.")

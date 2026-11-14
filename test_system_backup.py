@@ -217,6 +217,17 @@ class SystemBackupTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "credentials"):
             backup.validate(payload)
 
+    def test_off_peak_policy_survives_encrypted_backup_and_install(self) -> None:
+        payload = backup.decrypt(self.export(), PASSWORD)
+        payload["settings"]["zones"].extend(copy.deepcopy(payload["settings"]["zones"]))
+        payload["mapping"] = {"version": 1, "plugs": [None] * 7 + [
+            {"host": "192.168.0.121", "mac": "aa:bb:cc:dd:ee:ff", "off_peak": True},
+        ]}
+        restored = backup.decrypt(backup.encrypt(payload, PASSWORD), PASSWORD)
+        backup.validate(restored)
+        backup.install(self.config, restored, self.service.history)
+        self.assertEqual(json.loads(mapping_path(self.config).read_text()), payload["mapping"])
+
     def test_offline_recovery_is_available_when_current_settings_are_corrupt(self) -> None:
         archive = self.root / "recovery.sprinkler-backup"
         archive.write_text(json.dumps(self.export()))

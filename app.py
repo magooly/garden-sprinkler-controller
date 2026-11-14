@@ -6,11 +6,13 @@ import argparse
 import json
 import logging
 import math
+import queue
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 from typing import Callable
 
 import customtkinter as ctk
@@ -31,6 +33,8 @@ from controller import (
     save_rain_pause,
     save_zones,
     parse_time,
+    parse_manual_duration,
+    format_manual_duration,
     overlapping_windows,
     validate_zones,
 )
@@ -172,6 +176,7 @@ class SprinklerApp(ctk.CTk):
         self.weekly_overview: WeeklyOverview | None = None
         self.profile_window: ctk.CTkToplevel | None = None
         self.history_window: ctk.CTkToplevel | None = None
+        self.tapo_window: ctk.CTkToplevel | None = None
         self.running_window: ctk.CTkToplevel | None = None
         self.profile_refresh: Callable[[], None] | None = None
         self.relay = backend
@@ -402,7 +407,7 @@ class SprinklerApp(ctk.CTk):
         )
         self.duration_menu.grid(row=0, column=0, padx=(0, 8))
         self.duration_entry = ctk.CTkEntry(
-            actions, textvariable=self.custom_duration, width=110, placeholder_text="Minutes",
+            actions, textvariable=self.custom_duration, width=150, placeholder_text="30 or 2.5h",
         )
         self.duration_summary = ctk.CTkLabel(
             panel, text="", text_color=GREY, anchor="w", justify="left",
@@ -419,15 +424,31 @@ class SprinklerApp(ctk.CTk):
             footer, text="Activity", command=self.show_history, width=90,
         )
         self.history_button.grid(row=0, column=1, padx=4)
+        self.tapo_button = ctk.CTkButton(
+            footer, text="Show Tapo Details", command=self.show_tapo_details, width=140,
+        )
+        self.tapo_button.grid(row=2, column=0, columnspan=5, pady=(0, 8))
         self.backup_button = ctk.CTkButton(
             footer, text="Backup", command=self.show_backup, width=80,
         )
         self.backup_button.grid(row=0, column=4, padx=(0, 8))
         self.stop_all_button = ctk.CTkButton(
-            footer, text="STOP ALL", fg_color=RED, hover_color="#92313c",
+            footer, text="STOP EVERYTHING", fg_color=RED, hover_color="#92313c",
             command=self.stop_all, width=120,
         )
         self.stop_all_button.grid(row=0, column=2, padx=10)
+        group_controls = ctk.CTkFrame(footer, fg_color="transparent")
+        group_controls.grid(row=3, column=0, columnspan=5, pady=(0, 8))
+        self.stop_garden_button = ctk.CTkButton(
+            group_controls, text="Stop Garden (1-8)", command=lambda: self.stop_group(0),
+            fg_color=RED, hover_color="#92313c",
+        )
+        self.stop_garden_button.pack(side="left", padx=8)
+        self.stop_appliances_button = ctk.CTkButton(
+            group_controls, text="Stop Appliances (9-16)", command=lambda: self.stop_group(8),
+            fg_color=RED, hover_color="#92313c",
+        )
+        self.stop_appliances_button.pack(side="left", padx=8)
         self.save_button = ctk.CTkButton(
             footer, text="Save Settings", command=self.save, width=150
         )
@@ -614,6 +635,261 @@ class SprinklerApp(ctk.CTk):
         except (OSError, ValueError, RuntimeError) as error:
             messagebox.showerror("Cannot resume operation", str(error), parent=self)
         self._refresh()
+
+    def show_tapo_details(self) -> None:
+        if not isinstance(self.controller, ServiceClient):
+            messagebox.showinfo("Tapo details", "Tapo details require the background service.", parent=self)
+            return
+        client = self.controller
+        if self.tapo_window is not None and self.tapo_window.winfo_exists():
+            self.tapo_window.lift()
+            return
+        window = ctk.CTkToplevel(self)
+        self.tapo_window = window
+        window.title("Tapo details (read-only)")
+        window.geometry("1100x360")
+        window.grid_columnconfigure(0, weight=1)
+        window.grid_rowconfigure(1, weight=1)
+        status = ctk.CTkLabel(window, text="Reading...", anchor="w")
+        status.grid(row=0, column=0, sticky="ew", padx=12, pady=8)
+        columns = ("zone", "name", "state", "power", "today", "month", "voltage", "current", "updated", "status", "policy")
+        table = ttk.Treeview(window, columns=columns, show="headings")
+        for key, title in zip(columns, (
+            "Zone", "Name", "State", "Power (W)", "Today (kWh)", "Month (kWh)",
+            "Voltage (V)", "Current (A)", "Updated (local)", "Status", "Control policy",
+        )):
+            table.heading(key, text=title)
+            table.column(key, width=170 if key in ("name", "updated", "status") else 95)
+        table.grid(row=1, column=0, sticky="nsew", padx=12)
+        scroll = ttk.Scrollbar(window, orient="horizontal", command=table.xview)
+        table.configure(xscrollcommand=scroll.set)
+        scroll.grid(row=2, column=0, sticky="ew", padx=12)
+        vertical = ttk.Scrollbar(window, orient="vertical", command=table.yview)
+        table.configure(yscrollcommand=vertical.set)
+        vertical.grid(row=1, column=1, sticky="ns")
+        poll_timer: str | None = None
+
+        def load(refresh: bool = False) -> None:
+            nonlocal poll_timer
+            if not window.winfo_exists():
+                return
+            if poll_timer is not None:
+                window.after_cancel(poll_timer)
+                poll_timer = None
+            button.configure(state="disabled")
+            replies: queue.Queue[dict | Exception] = queue.Queue()
+
+            def fetch() -> None:
+                try:
+                    replies.put(client.tapo_details(refresh))
+                except (OSError, RuntimeError, ValueError) as exc:
+                    replies.put(exc)
+
+            def receive() -> None:
+                if not window.winfo_exists():
+                    return
+                try:
+                    result = replies.get_nowait()
+                except queue.Empty:
+                    window.after(100, receive)
+                    return
+                if isinstance(result, Exception):
+                    status.configure(text=f"Details unavailable: {result}. Displayed readings are stale.")
+                    button.configure(state="normal")
+                else:
+                    display(result)
+
+            threading.Thread(target=fetch, daemon=True).start()
+            receive()
+
+        def display(details: dict) -> None:
+            nonlocal poll_timer
+            table.delete(*table.get_children())
+            for row in details["rows"]:
+                stamp = datetime.fromisoformat(row["updated"]) if row["updated"] else None
+                stale = bool(row["error"]) or (
+                    stamp is not None and (datetime.now(stamp.tzinfo) - stamp).total_seconds() > 60
+                )
+                state = "Unavailable" if row["state"] is None else "ON" if row["state"] else "OFF"
+                numbers = [
+                    "Unavailable" if row[key] is None else f"{row[key]:.3f}"
+                    for key in ("power_w", "today_kwh", "month_kwh", "voltage_v", "current_a")
+                ]
+                table.insert("", "end", values=(
+                    row["channel"] + 1, row["name"], state, *numbers,
+                    stamp.astimezone().strftime("%Y-%m-%d %H:%M:%S") if stamp else "Never",
+                    f"Station fault: {row['station_fault']}; retry required" if row.get("station_fault")
+                    else f"{'Stale' if stamp else 'Unavailable'}: {row['error']}" if row["error"] else "Stale" if stale
+                    else "Read" if stamp else "Reading..." if details["reading"] else "Unavailable",
+                    f"Requested {'ON' if row['requested_state'] else 'OFF'}; {row['availability']}; "
+                    f"last confirmed {'unknown' if row['last_confirmed_state'] is None else 'ON' if row['last_confirmed_state'] else 'OFF'}"
+                    f" at {row['confirmed_at'] or 'never'}" if row.get("off_peak") else "Individual station fault protection",
+                ))
+            status.configure(text=(
+                "Reading... Previous values remain visible." if details["reading"]
+                else "No Tapo plugs assigned." if not details["rows"]
+                else "Read-only readings. Unavailable is not zero. Refresh reads at most once per 10 seconds."
+            ))
+            button.configure(state="disabled" if details["reading"] else "normal")
+            poll_timer = window.after(750 if details["reading"] else 15000, load)
+
+        button = ctk.CTkButton(window, text="Refresh", command=lambda: load(True))
+        button.grid(row=3, column=0, pady=10)
+        def open_graph(_event=None) -> None:
+            selected = table.selection()
+            if selected:
+                self.show_tapo_timeline(int(table.item(selected[0], "values")[0]) - 1)
+        def click_graph(event) -> None:
+            item = table.identify_row(event.y)
+            if item:
+                table.selection_set(item)
+                open_graph()
+        table.bind("<ButtonRelease-1>", click_graph)
+        table.bind("<Return>", open_graph)
+        load(True)
+
+    def show_tapo_timeline(self, channel: int) -> None:
+        if not isinstance(self.controller, ServiceClient):
+            return
+        client = self.controller
+        window = ctk.CTkToplevel(self)
+        window.title(f"Zone {channel + 1}: 24-hour controller history")
+        window.geometry("900x760")
+        window.grid_columnconfigure(0, weight=1)
+        window.grid_rowconfigure(5, weight=1)
+        label = ctk.CTkLabel(window, text="Loading controller switching history...", wraplength=850)
+        label.grid(row=0, column=0, sticky="ew", padx=12, pady=12)
+        canvas = tk.Canvas(window, height=110, background="#202020", highlightthickness=0)
+        canvas.grid(row=1, column=0, sticky="ew", padx=12)
+        ctk.CTkLabel(window, text="Green: recorded ON   Blue: recorded OFF   Grey: Unknown").grid(row=2, column=0)
+        metrics = {
+            "Power (W)": "power_w", "Voltage (V)": "voltage_v", "Current (A)": "current_a",
+            "Today counter (kWh)": "today_kwh", "Month counter (kWh)": "month_kwh",
+            "Reported state (ON=1, OFF=0)": "state",
+        }
+        metric = tk.StringVar(window, "Power (W)")
+        menu = ctk.CTkOptionMenu(window, variable=metric, values=list(metrics),
+                                command=lambda _value: draw())
+        menu.grid(row=3, column=0, pady=6)
+        sample_canvas = tk.Canvas(window, height=160, background="#202020", highlightthickness=0)
+        sample_canvas.grid(row=4, column=0, sticky="ew", padx=12)
+        text = ctk.CTkTextbox(window, wrap="word")
+        text.grid(row=5, column=0, sticky="nsew", padx=12, pady=8)
+        replies: queue.Queue[dict | Exception] = queue.Queue()
+        data: dict = {}
+
+        def draw(_event=None) -> None:
+            if not data:
+                return
+            canvas.delete("all")
+            width = max(1, canvas.winfo_width() - 24)
+            start = datetime.fromisoformat(data["start"])
+            for segment in data["segments"]:
+                left = (datetime.fromisoformat(segment["start"]) - start).total_seconds() / 86400
+                right = (datetime.fromisoformat(segment["end"]) - start).total_seconds() / 86400
+                canvas.create_rectangle(12 + width * left, 20, 12 + width * right, 60,
+                                        fill={"ON": "#238636", "OFF": "#3178b6", "Unknown": "#777777"}[segment["state"]],
+                                        outline="")
+            for hours in (0, 6, 12, 18, 24):
+                stamp = (start + timedelta(hours=hours)).astimezone()
+                canvas.create_text(12 + width * hours / 24, 85, text=stamp.strftime("%d/%m %H:%M"),
+                                   fill="white", anchor="w" if hours == 0 else "e" if hours == 24 else "center")
+            if data.get("off_peak"):
+                for segment in data.get("requested_segments", []):
+                    left = (datetime.fromisoformat(segment["start"]) - start).total_seconds() / 86400
+                    right = (datetime.fromisoformat(segment["end"]) - start).total_seconds() / 86400
+                    canvas.create_rectangle(12 + width * left, 63, 12 + width * right, 72,
+                                            fill={"ON": "#238636", "OFF": "#3178b6", "Unknown": "#777777"}[segment["state"]],
+                                            outline="")
+            sample_canvas.delete("all")
+            values = []
+            key = metrics[metric.get()]
+            for row in data.get("samples", []):
+                value = row.get(key)
+                values.append(None if row["error"] or value is None else float(value))
+            maximum = max([1.0] + [value for value in values if value is not None])
+            sample_width = max(1, sample_canvas.winfo_width() - 70)
+            previous = None
+            count = 0
+            for row, value in zip(data.get("samples", []), values):
+                if value is None:
+                    previous = None
+                    continue
+                x = 55 + (datetime.fromisoformat(row["timestamp"]) - start).total_seconds() / 86400 * sample_width
+                y = 125 - value / maximum * 100
+                if previous is not None:
+                    sample_canvas.create_line(*previous, x, y, fill="#f6b73c", width=2)
+                sample_canvas.create_oval(x - 3, y - 3, x + 3, y + 3, fill="#f6b73c", outline="")
+                previous = (x, y)
+                count += 1
+            sample_canvas.create_text(3, 25, text=f"{maximum:.3f}", fill="white", anchor="w")
+            sample_canvas.create_text(3, 125, text="0", fill="white", anchor="w")
+            sample_canvas.create_text(55, 145, text=f"24h ago — {count} available 15-minute snapshots; gaps are not zero",
+                                      fill="white", anchor="w")
+            sample_canvas.create_text(55 + sample_width, 145, text="Now", fill="white", anchor="e")
+
+        def fetch() -> None:
+            try:
+                replies.put(client.tapo_timeline(channel))
+            except (OSError, RuntimeError, ValueError) as exc:
+                replies.put(exc)
+
+        def receive() -> None:
+            if not window.winfo_exists():
+                return
+            try:
+                result = replies.get_nowait()
+            except queue.Empty:
+                window.after(100, receive)
+                return
+            button.configure(state="normal")
+            if isinstance(result, Exception):
+                label.configure(text=f"History unavailable: {result}. Previous graph, if any, is stale.")
+                return
+            data.clear()
+            data.update(result)
+            label.configure(text=f"{result['name']} — last 24 hours. Recorded ON: "
+                            f"{result['on_seconds'] / 3600:.2f} hours.\n{result['description']}\n"
+                            f"{result['warning']} {result.get('samples_warning', '')}")
+            text.configure(state="normal")
+            text.delete("1.0", "end")
+            text.insert("end", "Recorded periods (local time)\n")
+            if result.get("off_peak"):
+                text.insert("end", "Upper band: last confirmed state. Thin lower band: requested operation.\n"
+                            "Unavailable means supply or connection unknown; not proven off-peak loss.\n")
+                for row in result.get("requested_segments", []):
+                    text.insert("end", f"Requested {row['state']}: {row['start']} — {row['end']}\n")
+            for row in result["segments"]:
+                first = datetime.fromisoformat(row["start"]).astimezone().strftime("%d/%m %H:%M:%S")
+                last = datetime.fromisoformat(row["end"]).astimezone().strftime("%d/%m %H:%M:%S")
+                text.insert("end", f"{first} — {last}: {row['state']} ({row['seconds'] / 60:.1f} minutes)\n")
+            text.insert("end", "\nEvents and reasons\n")
+            for row in result["events"]:
+                stamp = datetime.fromisoformat(row["timestamp"]).astimezone().strftime("%d/%m %H:%M:%S")
+                text.insert("end", f"{stamp}: {row['event']} — {row['reason']}\n")
+            text.insert("end", "\n15-minute snapshots (not averages; short runs can occur between samples)\n"
+                        "Time | State | W | Today kWh | Month kWh | V | A | Status\n")
+            for row in result.get("samples", []):
+                stamp = datetime.fromisoformat(row["timestamp"]).astimezone().strftime("%d/%m %H:%M")
+                state = "Unknown" if row["state"] is None else "ON" if row["state"] else "OFF"
+                values = ["Unavailable" if row[key] is None else f"{row[key]:.3f}"
+                          for key in ("power_w", "today_kwh", "month_kwh", "voltage_v", "current_a")]
+                actual = row["updated"] or "Unavailable"
+                text.insert("end", f"{stamp} | {state} | {' | '.join(values)} | {row['error'] or 'Read'} "
+                            f"(actual read: {actual})\n")
+            text.configure(state="disabled")
+            draw()
+
+        def refresh() -> None:
+            button.configure(state="disabled")
+            threading.Thread(target=fetch, daemon=True).start()
+            receive()
+
+        canvas.bind("<Configure>", draw)
+        sample_canvas.bind("<Configure>", draw)
+        button = ctk.CTkButton(window, text="Refresh history", command=refresh)
+        button.grid(row=6, column=0, pady=8)
+        refresh()
 
     def show_history(self) -> None:
         if not isinstance(self.controller, ServiceClient):
@@ -1327,12 +1603,10 @@ class SprinklerApp(ctk.CTk):
         else:
             name = self.fields[self.selected].name.get().strip() or "(Unnamed)"
             if choice == "Custom":
-                value = self.custom_duration.get().strip()
-                valid = value.isascii() and value.isdigit() and len(value) <= 4
-                duration = (
-                    f"{value} minutes" if valid and 1 <= int(value) <= MAX_MANUAL_MINUTES
-                    else "the custom minutes entered"
-                )
+                try:
+                    duration = format_manual_duration(parse_manual_duration(self.custom_duration.get()))
+                except ValueError as error:
+                    duration = f"custom minutes or hours (30 or 2.5h). {error}"
             else:
                 duration = {"10 min": "10 minutes", "30 min": "30 minutes",
                             "1 hour": "1 hour", "Until stopped": "until stopped"}.get(choice, choice)
@@ -1357,6 +1631,11 @@ class SprinklerApp(ctk.CTk):
                     seconds = max(0, math.ceil(run.deadline - self.controller.clock()))
                     end = "until about " + (now + timedelta(seconds=seconds)).strftime("%a %H:%M")
                 running.append(f"Channel {channel + 1}, {name} - {run.source} - {end}")
+                if isinstance(self.controller, ServiceClient) and self.controller.tapo:
+                    plug = next((p for p in self.controller.tapo if p["channel"] == channel), None)
+                    if plug and plug.get("off_peak"):
+                        running[-1] += (f" - requested ON; {plug['availability']}; confirmed "
+                                        + ("unknown" if plug["state"] is None else "ON" if plug["state"] else "OFF"))
                 threshold = self.controller.zones[channel].continuous_reminder_minutes
                 if run.source == "Continuous" and threshold is not None and run.started is not None:
                     if self.controller.clock() - run.started >= threshold * 60:
@@ -1402,7 +1681,14 @@ class SprinklerApp(ctk.CTk):
                 if available and not master and (not self.controller.rain_paused or zone.rain_pause_exempt)
                 and zone.scheduled(now) else GREY
             )
+            if isinstance(self.controller, ServiceClient) and self.controller.tapo:
+                plug = next((p for p in self.controller.tapo if p["channel"] == channel), None)
+                if plug and plug.get("off_peak"):
+                    color = "#e6a23c" if plug["state"] is None or plug["pending"] else RUNNING_RED if plug["state"] else GREY
             self.zone_dots[channel].configure(text_color=color)
+            station_fault = self.controller.garden_fault if channel < 8 else self.controller.channel_faults.get(channel, "")
+            if station_fault:
+                self.zone_dots[channel].configure(text_color="#ff9999")
             name = "Master Pump" if master else self.fields[channel].name.get().strip() or "(Unnamed)"
             if not available:
                 name = "(Unassigned) " + name
@@ -1498,6 +1784,18 @@ class SprinklerApp(ctk.CTk):
         if operation_held and not self.faulted:
             text = "RESTORE SAFETY HOLD / ALL OUTPUTS STOPPED\n"
             text += "Restart services and reopen app." if self.controller.restore_restart_required else "Review settings, then Backup > Resume operation."
+        if isinstance(self.controller, ServiceClient) and self.controller.tapo:
+            plug = next((p for p in self.controller.tapo if p["channel"] == self.selected), None)
+            if plug and plug.get("off_peak"):
+                text = (f"Requested {'ON' if plug['requested_state'] else 'OFF'} / {plug['availability']}\n"
+                        f"Last confirmed: {'unknown' if plug['last_confirmed_state'] is None else 'ON' if plug['last_confirmed_state'] else 'OFF'}"
+                        f" at {plug['confirmed_at'] or 'never'}"
+                        + ("\nRequest not yet confirmed" if plug["pending"] else ""))
+        selected_fault = (self.controller.garden_fault if self.selected < 8
+                          else self.controller.channel_faults.get(self.selected, ""))
+        if selected_fault:
+            text = ("GARDEN FAULT / check hardware and restart; appliances remain enabled.\n"
+                    if self.selected < 8 else "STATION FAULT / other stations remain enabled.\n") + selected_fault
         self.status.configure(
             text=text, text_color="#ff9999" if self.faulted else RUNNING_RED
             if run or (master_selected and self.controller.pump_on) else GREY
@@ -1506,15 +1804,17 @@ class SprinklerApp(ctk.CTk):
             for dot in self.zone_dots:
                 dot.configure(text_color="#ff9999")
         self.manual_button.configure(
-            text="STOP THIS ZONE" if run else "RUN ZONE",
+            text="RETRY STATION (OFF)" if selected_fault and self.selected >= 8
+            else "STOP THIS ZONE" if run else "RUN ZONE",
             fg_color=RED if run else "#1f6aa5",
             hover_color="#92313c" if run else "#144870",
             state="disabled" if self.faulted or operation_held or master_selected or not available
+            or (selected_fault and self.selected < 8)
             or (self.controller.rain_paused and not run
-                and not self.controller.zones[self.selected].rain_pause_exempt)
+                and not selected_fault and not self.controller.zones[self.selected].rain_pause_exempt)
             else "normal",
         )
-        duration_disabled = self.faulted or operation_held or master_selected or run is not None or not available
+        duration_disabled = self.faulted or selected_fault or operation_held or master_selected or run is not None or not available
         choices = ["10 min", "30 min", "1 hour", "Custom"]
         if (
             not master_selected
@@ -1587,6 +1887,14 @@ class SprinklerApp(ctk.CTk):
         )
         self.rain_pause_var.set(self.controller.rain_paused)
         self.rain_pause_switch.configure(state="disabled" if self.faulted else "normal")
+        supported = not isinstance(self.controller, ServiceClient) or self.controller.group_controls_supported
+        self.stop_garden_button.configure(state="normal" if supported else "disabled")
+        self.stop_appliances_button.configure(state="normal" if supported and self.controller.channel_count == 16 else "disabled")
+        if supported and self.controller.channel_count == 16 and not self.faulted:
+            health = ("Garden: FAULT (check hardware/restart)" if self.controller.garden_fault else "Garden: enabled")
+            health += (" / Appliance faults: " + ", ".join(str(channel + 1) for channel in self.controller.channel_faults)
+                       if self.controller.channel_faults else " / Appliances: enabled")
+            self.system_status.configure(text=self.system_status.cget("text") + " / " + health)
         self.history_button.configure(state="disabled" if self.service_error else "normal")
         if isinstance(self.controller, ServiceClient) and self.controller.history_warning:
             self.system_status.configure(
@@ -1642,6 +1950,7 @@ class SprinklerApp(ctk.CTk):
             f"\nUnassigned/unknown: {', '.join(unknown) if unknown else 'none'}",
             parent=self,
         )
+        self._refresh()
 
     def save(self, *, automatic: bool = False, bank: int | None = None) -> bool:
         if self.autosave_timer is not None:
@@ -1682,7 +1991,9 @@ class SprinklerApp(ctk.CTk):
 
     def manual(self) -> None:
         try:
-            if self.selected in self.controller.runs:
+            if self.selected in self.controller.channel_faults:
+                self.controller.retry_station(self.selected, datetime.now())
+            elif self.selected in self.controller.runs:
                 self.controller.stop(self.selected, datetime.now())
             else:
                 fields = self.fields[self.selected]
@@ -1704,10 +2015,7 @@ class SprinklerApp(ctk.CTk):
                     ):
                         return
                 if choice == "Custom":
-                    value = self.custom_duration.get().strip()
-                    if not value.isascii() or not value.isdecimal():
-                        raise ValueError("Enter a custom duration of 1 to 1440 minutes.")
-                    duration = int(value)
+                    duration = parse_manual_duration(self.custom_duration.get())
                 else:
                     duration = {"10 min": 10, "30 min": 30, "1 hour": 60, "Until stopped": 10}[choice]
                 if not 1 <= duration <= MAX_MANUAL_MINUTES:
@@ -1764,6 +2072,15 @@ class SprinklerApp(ctk.CTk):
             self.controller.stop_all(datetime.now())
         except (OSError, RuntimeError, ValueError, ExceptionGroup) as exc:
             self._fault("Relay shutdown failed", exc)
+        self._refresh()
+
+    def stop_group(self, bank: int) -> None:
+        try:
+            self.controller.stop_group(bank, datetime.now())
+        except ValueError as exc:
+            messagebox.showerror("Group stop rejected", str(exc), parent=self)
+        except (OSError, RuntimeError, ExceptionGroup) as exc:
+            self._fault("Group stop failed", exc)
         self._refresh()
 
     def _tick(self) -> None:

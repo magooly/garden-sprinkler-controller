@@ -1,0 +1,4 @@
+# Separate environment for experimental TPAP support; not an upstream release.
+customtkinter>=5.2.2,<6
+python-kasa @ git+https://github.com/ZeliardM/python-kasa.git@a1a6c3854ace705b21357b357354d4ae8b6307b4
+cryptography>=42,<47

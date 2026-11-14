@@ -1,4 +1,5 @@
 .venv/
+.venv-tapo/
 __pycache__/
 settings.json
 *.timetables.json

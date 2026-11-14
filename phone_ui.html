@@ -10,7 +10,8 @@
 </head>
 <body>
   <main>
-    <header>
+    <p id="exit-message" class="notice visible hidden" role="status" aria-live="polite"></p>
+    <header class="home-only">
       <div>
         <p class="eyebrow">GARDEN CONTROL</p>
         <h1>Sprinklers</h1>
@@ -32,16 +33,75 @@
     <section id="controls" class="hidden">
       <div id="notice" class="notice" role="status" aria-live="polite"></div>
       <div class="toolbar">
-        <span id="updated">Loading status…</span>
-        <button id="stop-all" class="danger" type="button">STOP ALL</button>
+        <button id="back-to-zones" class="quiet hidden" type="button">Back to all zones</button>
+        <span id="updated" class="home-only">Loading status…</span>
+        <button id="rain-pause" class="quiet home-only" type="button" disabled>Rain Pause</button>
       </div>
-      <section class="panel running-summary">
+      <div class="stop-controls" role="group" aria-label="Stop controls">
+        <button id="stop-all" class="danger" type="button">Stop Everything</button>
+        <button id="stop-garden" class="danger" type="button">Stop Garden<br>(1–8)</button>
+        <button id="stop-appliances" class="danger" type="button">Stop Appliances<br>(9–16)</button>
+      </div>
+      <p id="group-health" role="status"></p>
+      <section class="panel running-summary home-only">
         <h2>Currently running</h2>
         <div id="running-summary" role="status">Loading status…</div>
       </section>
-      <div id="channels" class="channels"></div>
-      <section class="panel activity">
-        <h2>Activity history</h2>
+      <section class="home-only" aria-labelledby="zone-grid-heading">
+        <h2 id="zone-grid-heading">Choose a zone</h2>
+        <div id="zone-grid" class="zone-grid"></div>
+      </section>
+      <div id="channels" class="channels" role="region" aria-label="Selected zone controls"></div>
+      <button id="open-history" class="quiet activity home-only" type="button">Activity history</button>
+      <button id="open-tapo" class="quiet home-only" type="button">Show Tapo Details</button>
+      <section id="tapo-panel" class="panel hidden" aria-labelledby="tapo-heading">
+        <h2 id="tapo-heading">Tapo details (read-only)</h2>
+        <p>Unavailable is not zero. Readings do not prove electrical isolation or appliance operation.</p>
+        <div id="tapo-status" role="status"></div>
+        <div class="tapo-table-scroll">
+          <table id="tapo-table">
+            <thead><tr><th>Zone</th><th>Name</th><th>State</th><th>Power (W)</th><th>Today (kWh)</th><th>Month (kWh)</th><th>Voltage (V)</th><th>Current (A)</th><th>Updated</th><th>Status</th><th>Control policy</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <button id="tapo-refresh" class="quiet" type="button">Refresh</button>
+        <section id="tapo-graph" class="hidden" aria-labelledby="tapo-graph-heading">
+          <h3 id="tapo-graph-heading">24-hour controller switching history</h3>
+          <button id="tapo-graph-back" class="quiet" type="button">Back to Tapo table</button>
+          <button id="tapo-graph-refresh" class="quiet" type="button">Refresh history</button>
+          <p id="tapo-graph-status" role="status"></p>
+          <p>Green: recorded ON · Blue: recorded OFF · Grey: Unknown</p>
+          <div id="tapo-timeline" aria-label="24-hour switching timeline"></div>
+          <p id="tapo-timeline-range"></p>
+          <section id="tapo-requested-panel" class="hidden">
+            <h4>Requested operation (not confirmed power)</h4>
+            <div id="tapo-requested-timeline" aria-label="Requested operation timeline"></div>
+            <p>Unavailable means supply or connection unknown, not proven off-peak loss. Above: last confirmed state history. Below: measured samples; missing readings remain gaps.</p>
+          </section>
+          <h4>Recorded readings — every 15 minutes</h4>
+          <p>Snapshots, not interval averages. Missing readings break the line; short runs can occur between samples.</p>
+          <label for="tapo-metric">Measurement</label>
+          <select id="tapo-metric">
+            <option value="power_w">Power (W)</option>
+            <option value="voltage_v">Voltage (V)</option>
+            <option value="current_a">Current (A)</option>
+            <option value="today_kwh">Today's energy counter (kWh)</option>
+            <option value="month_kwh">Month's energy counter (kWh)</option>
+            <option value="state">Reported state (ON=1, OFF=0)</option>
+          </select>
+          <svg id="tapo-sample-graph" viewBox="0 0 800 180" role="img" aria-label="Recorded Tapo measurements over 24 hours"></svg>
+          <p id="tapo-sample-status" role="status"></p>
+          <details><summary>Recorded measurements</summary><div class="tapo-table-scroll">
+            <table><thead><tr><th>Interval time</th><th>Actual reading</th><th>State</th><th>W</th><th>Today kWh</th><th>Month kWh</th><th>V</th><th>A</th><th>Status</th></tr></thead>
+              <tbody id="tapo-sample-rows"></tbody></table>
+          </div></details>
+          <ol id="tapo-periods"></ol>
+          <h4>Events and reasons</h4>
+          <ol id="tapo-events"></ol>
+        </section>
+      </section>
+      <section id="history-panel" class="panel activity hidden" aria-labelledby="history-heading">
+        <h2 id="history-heading">Activity history</h2>
         <p>Controller-reported commands, not proof of physical operation.</p>
         <label for="history-filter">Show</label>
         <select id="history-filter"><option value="all">All activity</option></select>
@@ -53,8 +113,8 @@
           <button id="history-refresh" class="quiet" type="button">Refresh</button>
         </div>
       </section>
-      <section class="panel activity">
-        <h2>Full system backup and restore</h2>
+      <details id="backup-panel" class="panel activity home-only">
+        <summary>Full system backup and restore</summary>
         <p>Encrypted backup of all saved channels, timetables, Rain Pause, relay connections, Tapo assignments and credentials, the standard phone password, activity history and service configuration. Not an Ubuntu image. Active runs are never restored.</p>
         <p>Choose a separate backup password of at least 12 characters. Store it in a password manager or a safe place separate from the backup. It is not your Tapo or phone password. Lost backup passwords cannot be recovered.</p>
         <div class="history-actions">
@@ -64,7 +124,7 @@
           <input id="backup-file" class="hidden" type="file" accept=".sprinkler-backup,application/json">
         </div>
         <p id="backup-status" role="status"></p>
-      </section>
+      </details>
       <p class="footnote">Timed runs stop automatically while the controller is working. RUN UNTIL STOPPED requires a saved master pump exclusion and no manual maximum; it has no time limit, even if your phone disconnects. Adding or lowering a manual maximum stops an active manual run. Rain Pause exemptions still apply. Manual runs stop on controller restart; communication failure can prevent an OFF command from reaching the relay. The master pump is automatic.</p>
     </section>
   </main>

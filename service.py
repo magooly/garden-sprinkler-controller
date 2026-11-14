@@ -26,6 +26,7 @@ from activity_history import ActivityHistory
 from waveshare_relay import DEFAULT_HOST, DEFAULT_PORT, RelayBoards, WaveshareRelays
 from timetable_profiles import TimetableProfiles
 from tapo_plugs import TapoRelays, mapping_path
+from tapo_details import TapoDetails
 
 import sqlite3
 import system_backup
@@ -57,6 +58,11 @@ class Service:
         if secondary is not None and mapping_path(config).exists():
             raise ValueError("Choose either Tapo plugs or a second Waveshare board for channels 9-16.")
         self.relay = TapoRelays(relay, config) if mapping_path(config).exists() else RelayBoards(relay, secondary)
+        self.tapo_details = TapoDetails(
+            self.relay.plugs if isinstance(self.relay, TapoRelays) else (),
+            self.relay.credentials if isinstance(self.relay, TapoRelays) else None,
+            config,
+        )
         zones = load_zones(config)
         if self.relay.channel_count == 16 and len(zones) == 8:
             zones.extend(default_zones(16)[8:])
@@ -73,7 +79,14 @@ class Service:
         self.revision = uuid.uuid4().hex
         self.controller.operation_held = restore_held
         self.fault = ""
-        self.history.record(None, "Controller", "STARTED", "Startup; outputs initialized OFF")
+        if isinstance(self.relay, TapoRelays) and self.relay.hot_water is not None:
+            self.relay.hot_water.activity = self.history.record
+        self.history.record(None, "Controller", "STARTED",
+                            "Startup; OFF commands attempted. Check group/station faults; "
+                            "off-peak OFF requests are confirmed asynchronously."
+                            if self.controller.split_groups else "Startup; outputs initialized OFF")
+        if isinstance(self.relay, TapoRelays) and self.relay.hot_water is not None:
+            self.history.record(15, "Hot Water System", "REQUESTED OFF", "Startup request; not yet confirmed")
 
     def fail(self, error: Exception) -> None:
         self.fault = error_details(error)
@@ -119,6 +132,9 @@ class Service:
             "master_channel": controller.master_channel,
             "pump_on": controller.pump_on,
             "fault": self.fault,
+            "group_controls_supported": True,
+            "garden_fault": controller.garden_fault,
+            "channel_faults": {str(channel): error for channel, error in controller.channel_faults.items()},
             "host": self.relay.host,
             "port": self.relay.port,
             "slave_id": self.relay.slave_id,
@@ -149,8 +165,47 @@ class Service:
         command = request["command"]
         if command == "status":
             return self.status()
+        if command == "tapo_details":
+            refresh = request.get("refresh", False)
+            if type(refresh) is not bool:
+                raise ValueError("Refresh must be a boolean.")
+            details = self.tapo_details.snapshot(
+                [zone.name for zone in self.controller.zones], refresh,
+            )
+            if isinstance(self.relay, TapoRelays) and self.relay.hot_water is not None:
+                for row in details["rows"]:
+                    if row["channel"] == 15:
+                        control = self.relay.hot_water.status()
+                        error = "; ".join(str(value) for value in (row["error"], control["error"]) if value)
+                        row.update(control)
+                        row["error"] = error
+            for row in details["rows"]:
+                row["station_fault"] = self.controller.channel_faults.get(row["channel"], "")
+            return details
+        if command == "tapo_timeline":
+            channel = request.get("channel")
+            if type(channel) is not int or channel not in range(8, 16):
+                raise ValueError("Choose an assigned Tapo channel.")
+            if not isinstance(self.relay, TapoRelays):
+                raise ValueError("This Tapo channel is unassigned.")
+            plug = self.relay.plugs[channel - 8]
+            if plug is None:
+                raise ValueError("This Tapo channel is unassigned.")
+            timeline = self.history.timeline(channel)
+            if self.tapo_details.store is None:
+                raise OSError("Tapo sample storage is unavailable.")
+            return {
+                **timeline, "name": self.controller.zones[channel].name,
+                "off_peak": plug.off_peak,
+                **self.tapo_details.store.history(
+                    plug.mac, datetime.fromisoformat(timeline["end"]),
+                ),
+            }
         if command == "history":
             return self.history.page(request.get("offset", 0), request.get("filter", "all"))
+        if command in ("stop_garden", "stop_appliances"):
+            self.controller.stop_group(0 if command == "stop_garden" else 8, datetime.now())
+            return self.status()
         if command == "stop_all":
             try:
                 self.controller.stop_all(datetime.now())
@@ -228,7 +283,7 @@ class Service:
                 save_rain_pause(self.config, paused)
                 self.controller.set_rain_pause(paused, now)
                 self.history.record(None, "Controller", "RAIN PAUSE", "Enabled" if paused else "Disabled")
-            elif command in ("manual", "continuous", "test", "stop"):
+            elif command in ("manual", "continuous", "test", "stop", "retry_station"):
                 channel = request.get("channel")
                 if type(channel) is not int or channel not in range(self.controller.channel_count):
                     raise ValueError("Channel is not configured; configure the second board for channels 9-16.")
@@ -237,7 +292,7 @@ class Service:
                 if channel == self.controller.master_channel:
                     raise ValueError("The master pump is controlled automatically.")
                 if (
-                    command != "stop" and self.controller.rain_paused
+                    command not in ("stop", "retry_station") and self.controller.rain_paused
                     and not self.controller.zones[channel].rain_pause_exempt
                 ):
                     raise ValueError("Rain Pause is enabled.")
@@ -254,12 +309,23 @@ class Service:
                     if run and run.source != "Test":
                         raise ValueError("Stop the current watering run before testing.")
                     self.controller.toggle_test(channel, now)
+                elif command == "retry_station":
+                    self.controller.retry_station(channel, now)
                 else:
-                    if isinstance(self.relay, TapoRelays) and channel >= 8 and channel not in self.controller.runs:
-                        self.relay.set_relay(channel, False)
                     self.controller.stop(channel, now)
             elif command == "read_states":
-                return {"states": self.relay.read_states()}
+                try:
+                    states = self.relay.read_states()
+                except OSError as error:
+                    if not self.controller.split_groups:
+                        raise
+                    self.controller.garden_fault = str(error)
+                    self.controller._record(None, "GARDEN FAULT", str(error))
+                    self.controller.stop_group(0, now, reason="Garden read fault")
+                    return self.status()
+                for channel, error in self.relay.errors.items():
+                    self.controller.fail_station(channel, OSError(error))
+                return {"states": states}
             else:
                 raise ValueError(f"Unknown command: {command}")
         except (OSError, RuntimeError, sqlite3.Error, ExceptionGroup) as error:
@@ -364,12 +430,17 @@ def serve(
                 logging.info("Controller ready on %s (rain pause: %s)", path,
                              service.controller.rain_paused)
                 while not stop.is_set():
+                    service.tapo_details.sample_due()
                     service.tick()
+                    if isinstance(service.relay, TapoRelays) and service.relay.hot_water is not None:
+                        service.relay.hot_water.reconcile()
                     server.handle_request()
         finally:
             try:
                 service.controller.close(datetime.now())
             finally:
+                if isinstance(service.relay, TapoRelays) and service.relay.hot_water is not None:
+                    service.relay.hot_water.shutdown()
                 service.history.record(None, "Controller", "STOPPED", "Controller shutdown")
                 path.unlink(missing_ok=True)
 

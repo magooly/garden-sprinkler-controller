@@ -1,10 +1,18 @@
 # Garden Sprinkler Controller
 
-Version **1.3.0**
+Version **1.4.0**
+
+Documentation updated **14 November 2026**.
+
+Version 1.4.0 includes independent garden/appliance fault handling, off-peak
+hot-water reconciliation, Tapo details and 24-hour graphs with 15-minute
+measurements, and compact phone stop controls.
 
 [Read the printable user and installation guide (PDF)](README.pdf).
 The guide includes a clickable contents page, numbered pages and formatted
 instructions for everyday use, installation and recovery.
+[Plain-text documentation](README.txt) and its [printable edition](README-text.pdf)
+contain the same current reference material.
 
 A dark-mode CustomTkinter desktop app for seven independently named sprinkler
 zones plus a channel 8 master pump, with an optional second eight-channel
@@ -13,6 +21,26 @@ for independent channels 9-16.
 The headless controller runs as a Linux user service, including while logged
 out. The desktop app connects locally to that service; it never owns the relays.
 An optional phone web interface can be reached privately over Tailscale.
+
+## Everyday controls at a glance
+
+| Control or status | What it means |
+|---|---|
+| Stations 1-8 | Seven garden zones and the automatic station 8 master pump. Garden hardware faults stop only this group when 16 outputs are configured. |
+| Stations 9-16 | Independent appliance outputs. An ordinary plug fault affects only that station, not the garden or other working appliances. |
+| Stop Garden (1-8) | Attempts OFF only for the garden group, pump first. Current garden schedule windows are suppressed. |
+| Stop Appliances (9-16) | Attempts OFF only for appliances. Current appliance schedule windows are suppressed. |
+| Stop Everything | Attempts OFF for both groups. An unreachable output cannot confirm OFF. |
+| Retry station / RETRY STATION (OFF) | Confirms an ordinary faulted appliance OFF before clearing its fault. It does not restart a missed run. |
+| Rain Pause | Stops/blocks included stations in either group. Saved exemptions remain active. |
+| Show Tapo Details | Read-only measurements and clickable 24-hour graphs; failed telemetry is a gap, not zero. |
+
+The phone's three red stop buttons use smaller text in one compact, three-across
+row. They retain separate confirmations and tap targets at least 44 CSS pixels
+high. Garden and appliance health are shown separately below them.
+Closing the desktop, signing out or leaving the phone page does not stop equipment.
+Service shutdown/restart, restore hold and shared controller failures can still
+affect both groups; they share one computer and controller service.
 
 ## Setup and launch
 
@@ -56,10 +84,12 @@ systemctl --user disable --now garden-sprinkler.service
 Linger starts the user service manager at boot, without requiring a login.
 The enabled service survives logout and restarts after a process failure.
 Failed startup (for example the network/relay still booting) retries every
-15 seconds. Runtime hardware faults latch scheduling OFF rather than repeatedly
-retrying ON commands: check the equipment/log, then restart the service.
+15 seconds. Runtime hardware faults latch the affected garden group or appliance
+station rather than repeatedly retrying ON commands; see the independent-group
+policy below for garden restart versus appliance retry.
 Opening, closing, or reconnecting the desktop does not reset outputs.
-To stop watering, use Rain Pause or STOP ALL, not the window close button.
+To stop garden watering, use **Stop Garden (1-8)** or Rain Pause; use
+**Stop Everything** for both groups, not the window close button.
 After updating the project, restart the background service before reopening
 the desktop so both processes use the same settings format.
 
@@ -88,8 +118,37 @@ local Wi-Fi control for up to eight P110M plugs. No Home Assistant, Zigbee hub,
 or Matter controller is required. It uses the community `python-kasa` library,
 not a TP-Link-supported API. P110M AU hardware 1.0 / firmware 1.2.3 is listed in
 the library's [tested devices](https://python-kasa.readthedocs.io/en/latest/SUPPORTED.html#tapo-devices);
-the actual arriving hardware/firmware still needs testing. Energy monitoring
-and Matter pairing are not integrated.
+the actual arriving hardware/firmware still needs testing. Read-only energy
+monitoring and local measurement history are integrated; Matter pairing is not.
+
+**Newer TPAP firmware:** The normal dependency does not support every P110M.
+P110M firmware 1.4.4 was authenticated and switched in isolated tests and the
+experimental environment is in use on this installation with three assigned plugs.
+It uses an unmerged experimental `python-kasa` fork, pinned in
+`requirements-tapo-experimental.txt`. This fork is not a stable upstream
+release. The standard `requirements.txt` remains unchanged; do not install
+both requirement files into the same environment. To prepare a separate
+experimental environment, run:
+
+```sh
+python3 -m venv .venv-tapo
+.venv-tapo/bin/python -m pip install -r requirements-tapo-experimental.txt
+```
+
+Using it for the controller requires a systemd user-service `ExecStart`
+override pointing to `.venv-tapo/bin/python` and a restart. Stopping or
+restarting interrupts current watering; startup attempts OFF on every assigned
+output and active saved schedules can start again. Plug operations have a
+5-second overall limit plus bounded connection cleanup. Operations are
+sequential and can delay other controller work; a timeout can leave the plug
+state unknown and latch that appliance station's fault. No Wi-Fi software solution
+guarantees OFF after network or controller failure. Test with no equipment
+attached before use.
+
+Full-system backups record service overrides but currently include only the
+standard `requirements.txt`, not the experimental requirements file or virtual
+environment. For recovery, separately retain the experimental requirements
+file and recreate `.venv-tapo` before starting a restored service that uses it.
 
 Prepare the slots before plugs arrive:
 
@@ -134,7 +193,7 @@ When the plugs arrive:
    ```
 
    Replace both example identifiers with the real plug's values; repeat `assign`
-   for channels 10-13 while stopped. Starting the controller attempts **OFF on
+   for any additional channels 10-16 while stopped. Starting the controller attempts **OFF on
    every assigned output**; saved active schedules can then start. Make the
    first test with no equipment attached. MAC and P110M model checks precede
    switching, and state readback must match the request. Writes are not retried.
@@ -161,9 +220,10 @@ After expansion, export a new 16-channel backup: old eight-channel backups do
 not match the expanded channel count. Existing eight-channel timetable profiles
 remain usable in the channels 1-8 group.
 
-**Failure and status limits:** An assigned plug failure follows the existing
-global fail-safe policy: scheduling stops and OFF is attempted on all outputs,
-including the sprinkler board. Unreachable plugs can prevent startup. OFF cannot
+**Failure and status limits:** Stations 1-8 and 9-16 have independent hardware
+fault handling. A plug switching/status-read failure faults only its station;
+garden watering and other working appliances remain enabled. An unreachable
+plug at startup does not prevent garden operation. OFF cannot
 be guaranteed during Wi-Fi loss or loss of controller power; do not use this as
 a safety interlock. Commands are bounded, sequential network operations, not
 hard real-time switching. Normal status shows controller runs/last requested
@@ -172,6 +232,123 @@ app. Desktop **Read Relay Status** performs a fresh read. Verified plug state
 is not proof that the connected appliance operates or that electrical power is
 isolated.
 
+## Tapo details and 24-hour graphs
+
+**Show Tapo Details** opens a read-only table of all assigned P110M plugs on
+the desktop and a separate view on the phone. It shows reported ON/OFF state,
+power in watts, today's and this month's energy in kWh, voltage, current and
+the reading time. Opening the view or pressing **Refresh** requests one batch
+of readings; overlapping requests are combined and batches are limited to
+one per ten seconds. Reads run outside the controller's switching loop.
+Missing measurements are shown as unavailable, not zero. Failed refreshes
+retain previous values marked stale and do not stop watering. This does not
+change the controller's existing fault policy for switching failures. Readings
+are not proof of electrical isolation or appliance operation.
+
+Click a plug row (or select it and press Enter) for its last 24 hours of
+**controller switching history**. Desktop opens a graph window; phone opens a
+graph with Back to Tapo table. ON/OFF bands, local event times, period durations,
+reasons and total recorded ON time come from the retained activity log.
+Unrecorded periods, restarts and faults are Unknown until another switch event
+is recorded. The log retains at most 1,000 events, so a complete day is not
+guaranteed. Changes made through the physical button or Tapo app are not tracked;
+this is not a historical power-usage graph. Refresh history updates the view
+without reading or switching plugs.
+
+The controller now also records a snapshot from each assigned plug every
+15 minutes, even with desktop and phone closed. Sampling starts in the current
+quarter-hour slot after startup and runs in the telemetry worker, not the
+switching loop. The graph's measurement selector shows watts, volts, amps,
+reported state or daily/monthly energy counters, with a table of actual reading
+times. These are snapshots, not interval averages; brief runs can be missed.
+Missing or failed samples break the line, rather than becoming zero. Counters
+can reset at day/month boundaries and are not interval consumption.
+Recording cannot reconstruct earlier readings. The separate private
+`settings.json.tapo-samples.sqlite3` retains 25 hours, survives restarts and
+separates readings by plug MAC. It is not currently included in full-system
+backups. Sampling/storage failures are reported without latching a watering
+fault; switching failures follow the independent group/station policy below.
+
+## Independent garden and appliance fault groups
+
+When 16 outputs are configured (Tapo or a second relay board):
+
+- **Garden, stations 1-8:** a relay/pump command or status-read failure latches
+  the garden group OFF and attempts to stop only this group, pump first.
+  Appliance runs and hot-water requests are not cancelled. Check the garden
+  hardware and restart the controller before resuming garden operation.
+- **Appliances, stations 9-16:** a failed command or explicit status read latches
+  only that station's fault, cancels its logical run and marks its history Unknown.
+  A failed ON receives one safety OFF attempt, not a repeated ON. No automatic
+  restart/retry is performed for ordinary plugs. Reconnection or a successful
+  read alone does not clear the fault.
+- **Retry station (confirm OFF)** explicitly attempts OFF. Only confirmed success
+  clears an ordinary appliance's fault. The missed run is not resumed, and a
+  currently active schedule window stays suppressed; use Run for a new manual
+  request or wait for the next window. A service restart also attempts OFF and
+  can resume active saved schedules for successfully initialized stations.
+- Zone 16's explicitly enabled off-peak policy retains automatic reconciliation
+  of the current request, as described below, instead of latching ordinary
+  appliance faults.
+
+Desktop and phone show garden health and individual appliance faults, without
+disabling unaffected controls. **Stop Garden (1-8)** stops/suppresses only garden
+outputs; **Stop Appliances (9-16)** stops/suppresses only appliance outputs.
+**Stop Everything** (the former STOP ALL) attempts OFF on both groups, even if an
+output is unreachable. Failed OFF is never proof of physical isolation.
+Rain Pause still applies across groups according to saved exemptions.
+
+This is fault isolation, not two independent computers/processes: the controller,
+configuration, storage and power are shared. Service restart/shutdown, restore
+safety hold and shared controller/storage failures can still stop both groups.
+Bounded synchronous plug operations can briefly delay the shared loop; this is
+not hard real-time separation. An eight-output-only installation keeps its
+original whole-garden fail-safe behaviour.
+
+## Hot Water System on an intermittent off-peak supply
+
+Zone 16 can explicitly opt into a device-bound off-peak policy. Only use this
+after an electrician has confirmed the plug, connection and hot-water load are
+suitable and automatic reconnection is acceptable. With the controller stopped,
+assign its verified IP/MAC using
+`.venv-tapo/bin/python tapo_plugs.py assign 16 IP MAC --off-peak`
+(or the standard environment for firmware it supports).
+The optional `off_peak: true` field is retained in encrypted full-system backups.
+Reassigning without this option or unassigning removes the policy; it cannot be
+enabled on any other zone and is not inferred from the zone name.
+
+For this output only, switching requests are queued separately from confirmed
+plug state. An unreachable plug does **not** latch a sprinkler fault or stop the
+garden pump. Other appliances use individual latched faults; garden hardware
+faults remain within stations 1-8. Desktop/phone status and Tapo Details show requested ON/OFF, connection
+availability and the last confirmed state/time. Unknown is never presented as
+confirmed OFF. Reachable and ON do not prove the heater is heating.
+For isolated zone 16, **Read Relay Status** returns the background worker's
+latest confirmation, not a synchronous new network read; check its confirmation
+timestamp in zone status or Tapo Details.
+
+A single background worker checks at startup, on request changes and about every
+30 seconds. When reachable, it applies **only the current request**, never a queue
+of missed commands. Timer/schedule expiry, Stop, Stop Appliances, Stop Everything,
+a shared controller fault, restore hold and shutdown request OFF; Rain Pause still
+respects the exemption. A garden-only fault or Stop Garden does not cancel the
+hot-water request.
+A command already in flight cannot be recalled, but a superseding OFF cancels an
+unsent ON and is reconciled after an in-flight operation. Shutdown waits a bounded
+time for OFF and logs explicitly if it cannot be confirmed.
+
+The graph separates requested operation from last-confirmed ON/OFF history.
+An unreachable observation starts an Unknown period; no definite loss-of-supply
+time or cause is inferred. Outages can occur between checks. Last confirmation
+is a historical observation, not continuous proof. The 15-minute measurement
+graphs remain snapshots with gaps for failed readings.
+
+An unpowered plug cannot receive commands. "Unavailable" could mean off-peak
+supply loss, Wi-Fi trouble, credentials or firmware, not proof of any one cause.
+This feature does not inspect or change the plug's independent power-restoration
+setting, and cannot guarantee it stays OFF when supply first returns. Confirm
+that behaviour separately before relying on unattended hot-water control.
+
 ## Optional phone control over Tailscale
 
 The optional phone interface lets you check channel status, start a manual
@@ -179,6 +356,56 @@ timed run, switch a channel ON until stopped, stop an active channel, or stop al
 browser. It does not replace the background controller. The web server talks
 to that controller over its existing private local socket and binds only to
 `127.0.0.1`; it cannot be opened directly to the LAN or internet.
+
+The home page shows all 16 channel positions in a compact three-column grid
+(two columns on screens narrower than 360 CSS pixels). Each button shows a
+channel number, shortened name and text status. Unconfigured positions remain
+visible as unavailable. Tap a button to open a dedicated view containing only
+that channel's full name, status and controls, plus **Back to all zones** and
+the compact **Stop Everything / Stop Garden / Stop Appliances** row. The
+phone/browser Back action returns directly to the home grid;
+zone visits do not build a trail of screens. At home, press Back twice within
+two seconds to leave; the first press displays a reminder that watering
+continues. Waiting longer resets the exit confirmation. Leaving returns to the
+previous browser page where available; it does not forcibly close a browser tab.
+Selecting a channel never starts watering. Only one control panel is open at a
+time, and duration/reminder drafts are retained when switching channels.
+The duration picker stays open during automatic status refreshes until you
+choose a time or dismiss it. Changes affecting that zone's controls (such as
+a fault, Rain Pause or a run started elsewhere) still update them immediately.
+After choosing a duration, tap **RUN** once to start; leaving the picker does
+not rebuild the controls or interrupt the tap.
+When RUN is unavailable, the zone page explains why. In particular, Rain Pause
+blocks manual watering for non-exempt zones: return to **Back to all zones**
+and turn Rain Pause off if watering is intended. Schedule-group pauses are
+separate and do not override Rain Pause.
+Channel 8 shows automatic pump status rather than independent run controls.
+The zone view has four **Not Paused / Paused** schedule-group buttons matching
+the desktop. Each applies to its numbered Start/Stop group across all weekdays,
+not other groups, other zones or manual runs. Paused buttons are red. Unpausing
+waits for the next scheduled start rather than resuming the current period.
+Changes save immediately and reject stale edits from another window.
+Reminder settings expand only when needed.
+The three stop buttons sit **three across**, with smaller text and at least
+44 CSS pixels of tap height, on both home and station pages.
+**Rain Pause** and the running summary stay above the home grid.
+The group-health line distinguishes garden faults from individual appliance
+faults. A faulted ordinary appliance has **Retry station (confirm OFF)**; its
+RUN controls are disabled until that explicit retry succeeds. Working stations
+remain usable. A garden fault requires checking the hardware and restarting
+the controller; appliance controls remain available.
+Rain Pause changes require confirmation and preserve saved zone exemptions.
+Activity history opens in its own view only when its home-page button is tapped.
+Events are fetched only while requested, not automatically at sign-in. Filters,
+Older/Newer and Refresh remain available; Back returns directly to the home grid.
+Recording continues in the controller regardless of whether the log is open.
+Backup is in an expandable section; backup opens
+automatically during a restore hold so the resume control remains discoverable.
+
+If the page ever appears plain white with basic text and no normal colours or
+layout, reload it to request the stylesheet again. If it persists, check Tailscale
+connectivity and the phone service before changing settings. Refreshing the page
+does not stop equipment. After a phone-service restart, sign in again.
 
 Install and sign in to Tailscale on the controller PC and Android phone using
 your tailnet account. Tailscale Serve requires HTTPS certificates to be enabled
@@ -227,8 +454,14 @@ command in Chrome on the Android phone, with Tailscale connected. The browser
 will ask for the phone-control password. Tailscale Serve is tailnet-only; do
 not use Tailscale Funnel or configure router port forwarding for this service.
 
-Choose **10 minutes**, **30 minutes**, **1 hour**, or a custom whole number
-of minutes from 1 to 1440, then press **RUN**. The default is 10 minutes.
+Choose **10 minutes**, **30 minutes**, **1 hour**, or **Custom**, then press
+**RUN**. For Custom on phone or desktop, enter minutes (for example `30` or
+`90`) or append `h` for hours (`2h`, `2.5h`, `0.5h`). Uppercase `H` and
+surrounding spaces are accepted. Without `h`, the number means minutes.
+The summary shows the interpretation: `2.5h` is **2 hours 30 minutes (150 minutes)**.
+The result must be 1–1440 whole minutes (up to `24h`); fractional-minute
+results are rejected, never rounded. Saved per-channel maximums still apply.
+The default is 10 minutes.
 The computer can set an optional per-channel maximum; requests above it are rejected.
 **RUN UNTIL STOPPED** requires confirmation and has no automatic time limit.
 While active, its button turns blue and reads **Now running until stopped**;
@@ -240,11 +473,13 @@ continuous starts that violate these requirements. Removing a primary channel's
 exclusion stops its active continuous run instead of turning on the pump. Rain Pause exemption
 is a separate setting and is not required unless Rain Pause is enabled.
 It continues if you close the page, sign out, or disconnect your phone.
-Use **STOP** or **STOP ALL** to end it. Per-channel master pump exclusions
+Use **STOP**, the relevant group stop, or **Stop Everything** to end it.
+Per-channel master pump exclusions
 and Rain Pause exemptions apply to both options: pump-excluded channels do
 not start the pump, and Rain Pause stops/blocks non-exempt channels.
 Continuous runs are not saved and do not resume after controller restart;
-hardware faults still stop scheduling and attempt to switch outputs OFF.
+hardware faults stop the affected garden group or appliance station, not
+unrelated outputs.
 Saved schedules may independently start after a restart. If remote access
 is lost, use the computer's desktop controls to stop the channel.
 
@@ -314,7 +549,9 @@ active saved schedules. Removing configuration does not switch off an unreachabl
 or disconnected board.
 
 A configured board failure is **not** treated as an absent optional board:
-the existing fail-safe policy stops scheduling and attempts OFF on both boards.
+primary-board faults stop the garden group; secondary-board command failures
+fault the affected appliance station, and a failed secondary-board status read
+faults stations 9-16. Neither group's hardware faults stop the other group.
 Check the hardware and logs before restarting. Device ownership locks cover
 both endpoints, preventing another service instance from owning either board.
 
@@ -364,11 +601,19 @@ Open the service-connected desktop:
 ```
 
 The service connects to `192.168.0.99`, port `4196`, slave ID `1`. Service startup
-sends OFF commands to all configured relays and verifies each state, then starts any
-saved routines that are scheduled now, except zones included in Rain Pause.
+attempts OFF on configured outputs and verifies normal synchronous commands.
+When 16 outputs are configured, an unreachable appliance faults only its station;
+a garden hardware failure latches the garden group, not working appliances.
+Off-peak hot-water OFF is requested and confirmed asynchronously.
+Saved routines that are scheduled now can start on healthy outputs, except
+zones included in Rain Pause or blocked by a restore hold.
 Exempt zones can therefore energize a valve immediately on service start.
 The **Read Relay Status** button queries and displays the
-current physical states through the service without changing them.
+device-reported logical states through the service without intentionally changing
+them. A failed explicit read triggers the affected group/station fault policy,
+which can send safety OFF commands. This is different from the non-fault-latching
+telemetry reads in Show Tapo Details. Isolated hot-water state comes from its
+background worker's last confirmation, with a separate confirmation timestamp.
 
 There is no simulation mode or direct-hardware fallback. If the service is
 unavailable, the app displays an explicit error. If connection is lost while
@@ -386,16 +631,15 @@ checks response addresses, functions, CRCs, write echoes, and coil readback.
 Requests use a fresh TCP connection and a bounded transaction timeout (default
 1 second, configurable with `--timeout`, maximum 10). ON commands are never
 retried or treated as successful after a timeout; fault handling attempts OFF
-on all channels instead. Coil readback confirms the
+within the affected garden group or appliance station instead. Coil readback confirms the
 device's reported logical state, **not** valve movement, water flow, or contact
 integrity. Other programs and the board's digital inputs can change outputs;
 use command-compatible, non-linkage relay modes and avoid competing controllers.
 
-On a hardware communication error, the service stops scheduling, attempts OFF on
-every channel, records the failure in its log and requires a service restart.
-The app shows the service fault. Output state is labelled
-unknown when a fault occurs.
-STOP ALL remains available to retry OFF commands. Requests are synchronous:
+Hardware communication errors follow the garden/appliance fault policy above.
+An eight-output controller stops the whole garden; with 16 outputs the groups
+are isolated. The app shows affected group/station faults and uncertain output
+states. Stop Everything remains available to attempt OFF commands. Requests are synchronous:
 the GUI may pause during network operations; a failed all-channel OFF sequence
 can take up to sixteen transaction timeouts with two boards, plus connection overhead. A successful
 write also requires a separate readback transaction.
@@ -411,7 +655,7 @@ write also requires a separate readback transaction.
   interfaces show the output as unknown, not OFF.
 - **Activity** on the desktop and **Activity history** on the phone show recent
   controller-recorded starts, stops and reasons, including manual timers,
-  schedules, Rain Pause, STOP ALL, startup, shutdown and faults. Browse older
+  schedules, Rain Pause, group stops, Stop Everything, startup, shutdown and faults. Browse older
   pages or refresh to see new events. Newest events appear first, with dates and
   times shown as DD/MM HH:MM in the controller's local time at the event.
   Channel events show their channel number and name; system-wide events are
@@ -449,7 +693,8 @@ write also requires a separate readback transaction.
   garden relays, including the other bank.
 - The compact opening window is 940 x 760, with a minimum size of 940 x 620.
   One **RUN ZONE / STOP THIS ZONE** button handles timed watering and stopping.
-  STOP ALL and Save Settings stay fixed at the bottom. At smaller
+  Stop Everything, separate garden/appliance stops and Save Settings remain in the
+  footer. At smaller
   heights, scroll the configuration panel to reach lower fields using the mouse
   wheel over the panel (including on Linux) or the side scrollbar;
   the watering controls and Rain Pause remain visible outside that panel.
@@ -544,7 +789,11 @@ write also requires a separate readback transaction.
   Full-system backups cover both banks and include this named-profile file.
 - Red indicates a commanded/confirmed energized relay, bright green an enabled
   schedule that is active at the current time, and grey no current watering
-  window. Sidebar status uses the **saved/applied** routine.
+  window. A faulted garden group or ordinary appliance has a pale-red status dot.
+  Isolated hot water has an amber dot while unknown or awaiting confirmation,
+  red for confirmed ON and grey for confirmed OFF. Always read the status text;
+  colours alone are not proof of electrical state.
+  Sidebar schedule status uses the **saved/applied** routine.
 - **RUN ZONE** runs the selected zone for the chosen duration, regardless
   of whether a routine is enabled. During Rain Pause it can run only for zones
   marked with **R-** in the left sidebar. Its button becomes **STOP THIS ZONE**
@@ -553,7 +802,8 @@ write also requires a separate readback transaction.
   operation requires confirmation, and channels 1-7 also require a saved pump
   exclusion. Independent channels 9-16 do not. The duration
   selector is to the left of the run button; choosing a duration does not start
-  a run. For **Custom**, enter the minutes in the box that appears, then press
+  a run. For **Custom**, enter minutes or hours (for example **30** or **2.5h**)
+  in the box that appears, then press
   **RUN ZONE**. A summary shows the selected duration before starting.
 - **Running** on the desktop opens a live list of active channels, their source
   and approximate end time. The phone displays the list above the channels.
@@ -568,7 +818,10 @@ write also requires a separate readback transaction.
   This is application recovery, not an Ubuntu image: reinstall this repository and
   its requirements on a replacement computer; OS packages, the app executable,
   router/network settings, TLS/Tailscale configuration and unrelated OS secrets
-  are not included.
+  are not included. The separate 15-minute telemetry database is **not included**.
+  The device-bound hot-water `off_peak` mapping flag is included.
+  The experimental requirements file and virtual environment must be retained
+  or recreated separately when the controller uses `.venv-tapo`.
   - Choose a **separate backup password of 12–1024 characters**. Several unrelated
     words work well. Enter it twice; **Show password** lets you check typing.
     It is not your Tapo or phone sign-in password. Store it in a password manager
@@ -638,15 +891,19 @@ write also requires a separate readback transaction.
   first, and invalid edits must be fixed before enabling Rain Pause. Pause state
   survives restart. Turning it off asks for confirmation: a currently
   active saved routine may start immediately for its remaining time. Previous
-  STOP THIS ZONE/STOP ALL suppression still applies; an interrupted manual
+  Stop This Zone/group-stop/Stop Everything suppression still applies; an interrupted manual
   run does not restart.
   Pause state is stored beside the selected settings file, with
   `.rain-pause.json` appended to its name (normally
   `settings.json.rain-pause.json`); include this file in backups.
   A missing pause file means not paused. An invalid file prevents startup;
-  a save or relay failure displays an error and stops scheduling.
-- **STOP THIS ZONE** and **STOP ALL** act immediately and suppress the currently
-  active automatic watering window(s) until they end. Later scheduled windows
+  a settings-save failure can stop both groups, while a relay failure follows
+  the garden/appliance fault policy.
+- **STOP THIS ZONE**, the two **group stop** controls and **Stop Everything**
+  send OFF requests immediately and suppress the affected stations' currently
+  active automatic watering window(s) until they end. Group stops leave the other
+  group's runs and schedule windows untouched. Network timeouts can delay OFF;
+  an unreachable output is never guaranteed OFF. Later scheduled windows
   that day are unaffected. Another manual run can still be started, unless
   Rain Pause is on for that zone.
   Suppression is not persisted: restarting the service or PC during a saved
@@ -676,12 +933,14 @@ exclusion control; channels 9-16 are already independent of the pump.
 
 The app opens the first zone valve before starting the pump. The pump stays ON
 while non-excluded zones on channels 1-7 are running and stops before their last valve closes.
-Startup, STOP ALL, fault shutdown, and normal service shutdown attempt pump OFF
-first, then all configured relays. Rain Pause keeps the pump on only when an
+Startup, Stop Garden, Stop Everything, garden fault shutdown and normal service
+shutdown attempt pump OFF before the garden valves. Stop Appliances and
+appliance faults do not change pump demand. Rain Pause keeps the pump on only when a
 Rain Pause-exempt, pump-using zone on channels 1-7 is running.
 There are no added valve-travel or pump delays;
 command order is not proof that a physical valve has finished moving.
-Failed ON commands trigger an all-output OFF attempt and stop scheduling.
+Failed garden ON commands stop the garden group and attempt its outputs OFF;
+appliances are not stopped. Shared controller failures can still stop both groups.
 Communication failures can prevent OFF commands from reaching the device.
 
 The original channel 8 name and schedule are preserved in settings but ignored
@@ -713,7 +972,8 @@ is not a timezone-aware scheduling service. Multiple zones may run simultaneousl
 the master pump follows the combined demand of channels 1-7 only. There is no sequential queuing
 or flow/pressure monitoring.
 
-Normal service shutdown sends OFF to all configured outputs. Closing the desktop
+Normal service shutdown attempts OFF on all configured outputs; isolated hot water
+uses its bounded shutdown reconciliation. Closing the desktop
 leaves watering running. A killed service process, network
 failure, sleeping computer, or frozen event loop cannot guarantee shutdown.
 **Timers are software-only; they do not program a hardware auto-off or watchdog.**
@@ -734,19 +994,39 @@ The UI and scheduling code use the `RelayBackend` protocol in
 - [controller.py](controller.py): schedule engine, timed overrides, JSON persistence.
 - [waveshare_relay.py](waveshare_relay.py): RTU-over-TCP adapter and read-only
   status/discovery command.
+- [tapo_plugs.py](tapo_plugs.py): verified P110M transport, private setup/mapping
+  and opt-in hot-water reconciliation.
+- [tapo_details.py](tapo_details.py): read-only telemetry and persistent
+  quarter-hour measurements.
+- [activity_history.py](activity_history.py): bounded event history and 24-hour
+  requested/confirmed timelines.
+- [phone_server.py](phone_server.py), [phone_ui.html](phone_ui.html),
+  [phone_ui.css](phone_ui.css) and [phone_ui.js](phone_ui.js): authenticated
+  phone interface and compact group-stop controls.
+- [system_backup.py](system_backup.py): encrypted application backup and
+  fail-closed restore.
+- [timetable_profiles.py](timetable_profiles.py) and
+  [schedule_overview.py](schedule_overview.py): per-bank profiles and schedule views.
 - [test_controller.py](test_controller.py) and
   [test_waveshare_relay.py](test_waveshare_relay.py), and
   [test_app.py](test_app.py), and [test_service.py](test_service.py): automated tests.
   GUI checks require a display and
   use mocked relay writes.
+- [test_group_isolation.py](test_group_isolation.py),
+  [test_tapo_hot_water.py](test_tapo_hot_water.py) and the other Tapo tests cover
+  independent faults, explicit retry, hot-water reconciliation, telemetry and graphs.
 
 ## Tests
 
-The core and network adapter have no third-party dependencies and can be tested without Tk or a
-display:
+Install the selected environment's requirements first. The controller, transport,
+service, Tapo, phone and backup suites below do not need a graphical display:
 
 ```sh
-python3 -m unittest -v test_controller test_waveshare_relay test_service
+.venv/bin/python -m unittest -v \
+  test_controller test_waveshare_relay test_service \
+  test_group_isolation test_tapo_hot_water test_tapo_plugs \
+  test_tapo_details test_tapo_details_service test_tapo_samples \
+  test_tapo_timeline test_phone_server test_system_backup
 ```
 
 Tests cover validation, configuration round-trips and failure preservation,
@@ -760,3 +1040,10 @@ hardware, including logout-safe client closure, exclusive ownership, restart
 state, stale-edit rejection, Rain Pause and fault latching.
 Run `.venv/bin/python -m unittest -v` to include GUI checks with a display.
 Tests do not contact the physical relay board.
+Use `.venv-tapo/bin/python` instead when validating the experimental controller
+environment. Group-isolation tests simulate unreachable appliances, failed ON/OFF
+and reads, garden/pump faults, independent stop buttons, failed/successful explicit
+retries, suppressed missed windows and shared-failure shutdown. UI checks cover
+desktop retry and group controls; phone layout has also been checked in-browser
+at 320, 360, 412 and 768 CSS pixels, with all three stop buttons on one row,
+no horizontal overflow and tap heights of at least 44 CSS pixels.

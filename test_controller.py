@@ -20,12 +20,39 @@ from controller import (
     load_rain_pause,
     rain_pause_path,
     parse_time,
+    parse_manual_duration,
+    format_manual_duration,
     save_zones,
     save_rain_pause,
     validate_zones,
 )
 
 MONDAY = datetime(2026, 10, 26, 6, 0)
+
+
+class ManualDurationTests(unittest.TestCase):
+    def test_minutes_and_hours_convert_exactly(self) -> None:
+        for value, expected in (
+            ("30", 30), ("90", 90), ("2h", 120), ("2.5h", 150),
+            ("0.5h", 30), (" 2.5 H ", 150), ("0.1h", 6),
+            ("0.05h", 3), ("24h", 1440), ("1440", 1440), ("1", 1),
+            ("30.0", 30), ("0002.50h", 150),
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(parse_manual_duration(value), expected)
+
+    def test_invalid_or_fractional_minute_input_is_rejected(self) -> None:
+        for value in ("", "h", "2hours", "30m", "1e2", "-2", "+2", "2,5h",
+                      "1.5", "0.01h", "0", "0h", "24.1h", "1441", "２h",
+                      "NaN", "Infinity", "2h 30", "2.5hh"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                parse_manual_duration(value)
+
+    def test_readable_summary_includes_total_minutes(self) -> None:
+        self.assertEqual(format_manual_duration(150), "2 hours 30 minutes (150 minutes)")
+        self.assertEqual(format_manual_duration(60), "1 hour (60 minutes)")
+        self.assertEqual(format_manual_duration(61), "1 hour 1 minute (61 minutes)")
+        self.assertEqual(format_manual_duration(1), "1 minute")
 
 
 class FakeRelays:

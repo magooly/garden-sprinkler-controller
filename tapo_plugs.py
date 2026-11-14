@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from getpass import getpass
 import fcntl
 import ipaddress
@@ -13,6 +14,10 @@ import os
 from pathlib import Path
 import re
 import stat
+import logging
+import threading
+import time
+from typing import Callable
 
 from kasa import Credentials, Discover, KasaException
 from kasa.smart.smartdevice import SmartDevice
@@ -20,7 +25,7 @@ from kasa.smart.smartdevice import SmartDevice
 from controller import _save_json
 from waveshare_relay import WaveshareRelays
 
-OPERATION_SECONDS = 2
+OPERATION_SECONDS = 5
 
 
 def mapping_path(config: Path) -> Path:
@@ -42,6 +47,7 @@ def normalize_mac(value: str) -> str:
 class Plug:
     host: str
     mac: str
+    off_peak: bool = False
 
 
 def load_mapping(path: Path) -> tuple[Plug | None, ...]:
@@ -60,14 +66,17 @@ def decode_mapping(data: object) -> tuple[Plug | None, ...]:
         if record is None:
             result.append(None)
             continue
-        if not isinstance(record, dict) or set(record) != {"host", "mac"}:
+        if not isinstance(record, dict) or set(record) not in ({"host", "mac"}, {"host", "mac", "off_peak"}):
             raise ValueError("Each plug assignment needs host and mac.")
+        off_peak = record.get("off_peak", False)
+        if type(off_peak) is not bool or (off_peak and len(result) != 7):
+            raise ValueError("Off-peak isolation is only supported for zone 16.")
         if not isinstance(record["host"], str) or not isinstance(record["mac"], str):
             raise ValueError("Plug host and MAC must be strings.")
         address = ipaddress.IPv4Address(record["host"])
         if not address.is_private or address.is_loopback or address.is_unspecified or address.is_link_local:
             raise ValueError("Use the plug's private LAN IPv4 address.")
-        result.append(Plug(str(address), normalize_mac(record["mac"])))
+        result.append(Plug(str(address), normalize_mac(record["mac"]), off_peak))
     assigned = [plug for plug in result if plug is not None]
     if len({plug.host for plug in assigned}) != len(assigned) or len({plug.mac for plug in assigned}) != len(assigned):
         raise ValueError("Each plug IP and MAC can be assigned only once.")
@@ -88,7 +97,10 @@ def load_credentials(path: Path) -> Credentials:
     return Credentials(data["username"], data["password"])
 
 
-async def plug_operation(plug: Plug, credentials: Credentials, state: bool | None) -> bool:
+async def plug_operation(
+    plug: Plug, credentials: Credentials, state: bool | None,
+    *, permit_write: Callable[[], bool] | None = None,
+) -> bool:
     device = None
     try:
         async with asyncio.timeout(OPERATION_SECONDS):
@@ -106,7 +118,7 @@ async def plug_operation(plug: Plug, credentials: Credentials, state: bool | Non
             await device.update()
             if device.model.split("(", 1)[0].strip() != "P110M":
                 raise OSError("Assigned device is not a P110M; no switch command sent.")
-            if state is not None:
+            if state is not None and (permit_write is None or permit_write()):
                 # python-kasa's high-level switch methods retry writes by default.
                 await device.protocol.query({"set_device_info": {"device_on": state}}, retry_count=0)
                 await device.update()
@@ -125,6 +137,101 @@ async def plug_operation(plug: Plug, credentials: Credentials, state: bool | Non
                 raise OSError("Tapo connection could not be closed; state is unknown.") from None
 
 
+class HotWaterOutput:
+    """Requested operation is separate from confirmed state; never drives the pump."""
+
+    def __init__(self, plug: Plug, credentials: Credentials) -> None:
+        self.plug, self.credentials = plug, credentials
+        self.lock = threading.Lock()
+        self.desired = False
+        self.state: bool | None = None
+        self.confirmed: bool | None = None
+        self.error = ""
+        self.updated: str | None = None
+        self.generation = 0
+        self.completed = -1
+        self.last_check = float("-inf")
+        self.worker: threading.Thread | None = None
+        self.closing = False
+        self.activity: Callable[[int | None, str, str, str], None] | None = None
+
+    def request(self, state: bool) -> None:
+        with self.lock:
+            if self.closing and state:
+                raise RuntimeError("Hot Water System is shutting down; ON request rejected.")
+            self.desired = state
+            self.generation += 1
+
+    def status(self) -> dict[str, object]:
+        with self.lock:
+            return {
+                "off_peak": True, "requested_state": self.desired, "state": self.state,
+                "last_confirmed_state": self.confirmed, "confirmed_at": self.updated,
+                "error": self.error, "pending": self.completed != self.generation or self.state != self.desired,
+                "availability": "Unavailable: supply or connection unknown" if self.error
+                else "Checking" if self.state is None else "Reachable",
+            }
+
+    def reconcile(self) -> None:
+        with self.lock:
+            if self.worker is not None and self.worker.is_alive():
+                return
+            if self.completed == self.generation and time.monotonic() - self.last_check < 30:
+                return
+            self.worker = threading.Thread(target=self._run, daemon=True)
+            self.worker.start()
+
+    def _run(self) -> None:
+        while True:
+            with self.lock:
+                generation, desired = self.generation, self.desired
+            try:
+                state = asyncio.run(plug_operation(self.plug, self.credentials, None))
+                with self.lock:
+                    if generation != self.generation:
+                        continue
+                if state != desired:
+                    def current_request() -> bool:
+                        with self.lock:
+                            return self.generation == generation
+                    state = asyncio.run(plug_operation(
+                        self.plug, self.credentials, desired, permit_write=current_request,
+                    ))
+            except OSError as exc:
+                logging.warning("Hot Water System request not confirmed: %s", exc)
+                with self.lock:
+                    changed = not self.error
+                    self.state = None
+                    self.error = str(exc)
+                if changed and self.activity:
+                    self.activity(15, "Hot Water System", "UNAVAILABLE", "Supply or connection unknown; request not confirmed")
+            else:
+                with self.lock:
+                    changed = self.state is None or self.state != state or self.completed != generation
+                    self.state = self.confirmed = state
+                    self.updated = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                    self.error = ""
+                if changed and self.activity:
+                    self.activity(15, "Hot Water System", "ON" if state else "OFF", "Plug state confirmed during reconciliation")
+            with self.lock:
+                self.last_check = time.monotonic()
+                self.completed = generation
+                if self.generation == generation:
+                    return
+
+    def shutdown(self) -> None:
+        with self.lock:
+            self.closing = True
+        self.request(False)
+        self.reconcile()
+        worker = self.worker
+        if worker is not None:
+            worker.join(24)
+        status = self.status()
+        if status["state"] is not False or status["pending"]:
+            logging.error("Hot Water System shutdown OFF not confirmed; physical state is unknown.")
+
+
 class TapoRelays:
     """Keep Waveshare channels 1-8; map channels 9-16 to individually assigned plugs."""
 
@@ -140,6 +247,11 @@ class TapoRelays:
         )
         self.states: dict[int, bool | None] = {channel: None for channel in range(8, 16)}
         self.errors: dict[int, str] = {}
+        self.hot_water = (
+            HotWaterOutput(self.plugs[7], self.credentials)
+            if self.plugs[7] is not None and self.plugs[7].off_peak and self.credentials is not None else None
+        )
+        self.requested_channels = frozenset({15}) if self.hot_water else frozenset()
 
     def set_relay(self, channel: int, energized: bool) -> None:
         if type(channel) is not int or channel not in range(16) or type(energized) is not bool:
@@ -150,6 +262,9 @@ class TapoRelays:
         plug = self.plugs[channel - 8]
         if plug is None or self.credentials is None:
             raise ValueError(f"Channel {channel + 1}: Tapo plug is unassigned.")
+        if channel == 15 and self.hot_water is not None:
+            self.hot_water.request(energized)
+            return
         try:
             self.states[channel] = asyncio.run(plug_operation(plug, self.credentials, energized))
         except OSError as error:
@@ -162,13 +277,17 @@ class TapoRelays:
         primary = tuple(self.primary.read_states())
         for index, plug in enumerate(self.plugs, 8):
             if plug is not None and self.credentials is not None:
+                if index == 15 and self.hot_water is not None:
+                    self.states[index] = self.hot_water.status()["state"]
+                    continue
                 try:
                     self.states[index] = asyncio.run(plug_operation(plug, self.credentials, None))
                 except OSError as error:
                     self.states[index] = None
                     self.errors[index] = str(error)
-                    raise OSError(f"Channel {index + 1}: {error}") from None
-                self.errors.pop(index, None)
+                    logging.error("Station %s read unavailable: %s", index + 1, error)
+                else:
+                    self.errors.pop(index, None)
         return primary + tuple(self.states[channel] for channel in range(8, 16))
 
     def status(self) -> list[dict[str, object]]:
@@ -176,6 +295,7 @@ class TapoRelays:
             {"channel": channel, "assigned": plug is not None,
              "host": plug.host if plug else "", "mac": plug.mac if plug else "",
              "state": self.states[channel], "error": self.errors.get(channel, "")}
+            | (self.hot_water.status() if channel == 15 and self.hot_water is not None else {})
             for channel, plug in enumerate(self.plugs, 8)
         ]
 
@@ -215,6 +335,8 @@ def main() -> None:
     assign.add_argument("channel", type=int, choices=range(9, 17))
     assign.add_argument("host")
     assign.add_argument("mac")
+    assign.add_argument("--off-peak", action="store_true",
+                        help="Isolate zone 16 hot-water failures and reconcile current requests")
     unassign = commands.add_parser("unassign", help="Remove an assignment while the controller is stopped")
     unassign.add_argument("channel", type=int, choices=range(9, 17))
     commands.add_parser("show", help="Show assignments; never credentials")
@@ -236,7 +358,7 @@ def main() -> None:
                 raise ValueError("Username and password are required.")
             _save_json(credentials_path(config), {"username": username, "password": password})
             load_credentials(credentials_path(config))
-            print("Credentials saved privately. They are excluded from settings backups.")
+            print("Credentials saved privately. Encrypted full-system backups include them; settings exports do not.")
         elif args.command == "discover":
             credentials = load_credentials(credentials_path(config))
             try:
@@ -254,14 +376,17 @@ def main() -> None:
                 except BlockingIOError:
                     raise ValueError("Stop the controller service before changing plug assignments.") from None
                 plugs = load_mapping(path)
-                records = [None if plug is None else {"host": plug.host, "mac": plug.mac} for plug in plugs]
+                records = [None if plug is None else {
+                    "host": plug.host, "mac": plug.mac, **({"off_peak": True} if plug.off_peak else {}),
+                } for plug in plugs]
                 records[args.channel - 9] = (
-                    {"host": args.host, "mac": normalize_mac(args.mac)} if args.command == "assign" else None
+                    {"host": args.host, "mac": normalize_mac(args.mac),
+                     **({"off_peak": True} if args.off_peak else {})} if args.command == "assign" else None
                 )
                 data = {"version": 1, "plugs": records}
                 decode_mapping(data)
                 _save_json(path, data)
-            print("Assignment saved. Starting the controller will attempt all assigned plugs OFF.")
+            print("Assignment saved. Startup requests OFF; isolated hot water is confirmed asynchronously.")
         else:
             print(json.dumps([
                 {"channel": index, "host": plug.host if plug else None, "mac": plug.mac if plug else None}

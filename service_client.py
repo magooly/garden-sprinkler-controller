@@ -51,6 +51,9 @@ class ServiceClient:
         self.master_channel = data["master_channel"]
         self.pump_on = data["pump_on"]
         self.fault = data["fault"]
+        self.group_controls_supported = data.get("group_controls_supported") is True
+        self.garden_fault = data.get("garden_fault", "")
+        self.channel_faults = {int(channel): error for channel, error in data.get("channel_faults", {}).items()}
         self.full_backup_supported = data.get("full_backup_supported") is True
         self.operation_held = data.get("operation_held") is True
         self.restore_restart_required = data.get("restore_restart_required") is True
@@ -77,6 +80,12 @@ class ServiceClient:
     def sync(self) -> None:
         self._update(exchange(self.path, {"command": "status"}))
 
+    def tapo_details(self, refresh: bool = False) -> dict:
+        return exchange(self.path, {"command": "tapo_details", "refresh": refresh})
+
+    def tapo_timeline(self, channel: int) -> dict:
+        return exchange(self.path, {"command": "tapo_timeline", "channel": channel})
+
     def history(self, offset: int, category: str = "all") -> dict:
         if not self.history_supported:
             raise ValueError("Restart the updated controller service to view activity history.")
@@ -101,6 +110,12 @@ class ServiceClient:
         self._update(exchange(self.path, {"command": command, **arguments}))
         if self.fault:
             raise RuntimeError("Service fault: " + self.fault)
+        channel = arguments.get("channel")
+        if isinstance(channel, int) and channel in self.channel_faults:
+            raise ValueError(f"Station {channel + 1} fault; other stations remain enabled: "
+                             + self.channel_faults[channel])
+        if command in ("manual", "continuous", "test") and isinstance(channel, int) and channel < 8 and self.garden_fault:
+            raise ValueError("Garden group fault; appliances remain enabled: " + self.garden_fault)
 
     def tick(self, now: datetime) -> None:
         self.sync()
@@ -133,6 +148,14 @@ class ServiceClient:
     def stop_all(self, now: datetime) -> None:
         self.command("stop_all")
 
+    def stop_group(self, bank: int, now: datetime) -> None:
+        if bank not in (0, 8) or not self.group_controls_supported:
+            raise ValueError("Group controls unavailable; restart the updated controller.")
+        self.command("stop_garden" if bank == 0 else "stop_appliances")
+
+    def retry_station(self, channel: int, now: datetime) -> None:
+        self.command("retry_station", channel=channel)
+
     def start_manual(
         self, channel: int, now: datetime, *, duration_minutes: int = 10,
         continuous: bool = False,
@@ -154,7 +177,10 @@ class ServiceClient:
         result = exchange(self.path, {"command": "read_states"})
         if "states" not in result:
             self._update(result)
+            if self.garden_fault:
+                raise ValueError("Garden read failed; appliances remain enabled: " + self.garden_fault)
             raise RuntimeError("Service fault: " + self.fault)
+        self.sync()
         return result["states"]
 
     def close(self, now: datetime) -> None:

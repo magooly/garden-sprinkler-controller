@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import tempfile
@@ -22,6 +23,33 @@ TEST_SECONDS = 10 * 60
 MAX_MANUAL_MINUTES = 1440
 DAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 WINDOW_COUNT = 4
+
+
+def parse_manual_duration(value: str) -> int:
+    value = value.strip()
+    match = re.fullmatch(r"([0-9]+)(?:\.([0-9]+))?\s*([hH]?)", value)
+    if not match:
+        raise ValueError("Enter minutes, such as 30, or hours, such as 2.5h.")
+    whole, fraction, hours = match.groups()
+    fraction = fraction or ""
+    scale = 10 ** len(fraction)
+    amount = int(whole + fraction) * (60 if hours else 1)
+    minutes, remainder = divmod(amount, scale)
+    if remainder:
+        raise ValueError("Duration must convert to whole minutes; no rounding is applied.")
+    if not 1 <= minutes <= MAX_MANUAL_MINUTES:
+        raise ValueError("Duration must be 1 to 1440 minutes (up to 24h).")
+    return minutes
+
+
+def format_manual_duration(minutes: int) -> str:
+    if minutes < 60:
+        return f"{minutes} minute{'s' if minutes != 1 else ''}"
+    hours, remainder = divmod(minutes, 60)
+    text = f"{hours} hour{'s' if hours != 1 else ''}"
+    if remainder:
+        text += f" {remainder} minute{'s' if remainder != 1 else ''}"
+    return f"{text} ({minutes} minutes)"
 
 
 def empty_schedule() -> tuple[tuple[str, ...], ...]:
@@ -367,7 +395,7 @@ class RelayBackend(Protocol):
     """The controller initializes outputs OFF; adapters raise on failure."""
 
     def set_relay(self, channel: int, energized: bool) -> None:
-        """Set a zero-based channel; return only when the command succeeds."""
+        """Set a channel; requested_channels explicitly opt into queued semantics."""
         ...
 
 
@@ -411,15 +439,89 @@ class Controller:
         self.master_channel = MASTER_PUMP_CHANNEL
         self.pump_on = False
         self.activity = activity
+        self.split_groups = self.channel_count == 16
+        self.garden_fault = ""
+        self.channel_faults: dict[int, str] = {}
         errors: list[Exception] = []
         for channel in self._shutdown_channels():
+            if channel < 8 and self.garden_fault:
+                continue
             try:
-                self.backend.set_relay(channel, False)
+                self._write(channel, False)
             except (OSError, RuntimeError) as exc:
                 errors.append(exc)
         if errors:
             self.closed = True
             raise ExceptionGroup("Some relays could not be initialized OFF", errors)
+
+    def fail_station(self, channel: int, error: Exception) -> None:
+        self.channel_faults[channel] = str(error)
+        self.runs.pop(channel, None)
+        self._record(channel, "STATION FAULT", str(error))
+        logging.error("Station %s fault; other stations remain enabled: %s", channel + 1, error)
+
+    def _write(self, channel: int, state: bool) -> bool:
+        try:
+            self.backend.set_relay(channel, state)
+        except (OSError, RuntimeError) as error:
+            if not self.split_groups:
+                raise
+            if channel >= 8:
+                self.fail_station(channel, error)
+                if state:
+                    try:
+                        self.backend.set_relay(channel, False)
+                    except (OSError, RuntimeError) as shutdown:
+                        logging.error("Station %s safety OFF not confirmed: %s", channel + 1, shutdown)
+                    else:
+                        self._record(channel, "OFF", "Safety OFF after failed start; explicit retry required")
+            else:
+                self.garden_fault = str(error)
+                logging.error("Garden group stopped; appliances remain enabled: %s", error)
+                self._record(None, "GARDEN FAULT", str(error))
+                self.stop_group(0, datetime.now(), reason="Garden fault")
+            return False
+        return True
+
+    def stop_group(self, bank: int, now: datetime, *, reason: str = "Group stop") -> None:
+        if type(bank) is not int or bank not in (0, 8) or bank >= self.channel_count:
+            raise ValueError("Choose garden (0) or appliances (8).")
+        if not self.split_groups:
+            self.stop_all(now, reason=reason)
+            return
+        for channel in self._shutdown_channels():
+            if channel // 8 != bank // 8:
+                continue
+            try:
+                self.backend.set_relay(channel, False)
+            except (OSError, RuntimeError) as error:
+                if channel >= 8:
+                    self.fail_station(channel, error)
+                else:
+                    if not self.garden_fault:
+                        self._record(None, "GARDEN FAULT", str(error))
+                    self.garden_fault = str(error)
+                    logging.error("Garden OFF not confirmed on station %s: %s", channel + 1, error)
+                    self._record(channel, "UNAVAILABLE", str(error))
+            else:
+                self._record(channel, "OFF", reason)
+            self.runs.pop(channel, None)
+            if channel == self.master_channel:
+                self.pump_on = False
+            for window in self._current_windows(channel, now):
+                self._block(channel, window, self.blocked)
+
+    def retry_station(self, channel: int, now: datetime) -> None:
+        if type(channel) is not int or channel not in self.channel_faults or channel < 8:
+            raise ValueError("Choose a faulted appliance station.")
+        if self.operation_held or self.closed:
+            raise ValueError("Operation is held or controller is closed.")
+        if not self._write(channel, False):
+            return
+        del self.channel_faults[channel]
+        self._record(channel, "OFF", "Explicit retry confirmed OFF; select Run to start")
+        for window in self._current_windows(channel, now):
+            self._block(channel, window, self.blocked)
 
     def _current_windows(self, channel: int, now: datetime) -> tuple[tuple[date, str, str], ...]:
         if channel == self.master_channel or channel not in self.available_channels:
@@ -436,6 +538,8 @@ class Controller:
             blocked.setdefault(channel, set()).add(window)
 
     def _record(self, channel: int | None, event: str, reason: str) -> None:
+        if channel in getattr(self.backend, "requested_channels", ()) and event in ("ON", "OFF", "RUN UPDATED"):
+            event = "REQUESTED OFF" if event == "OFF" else "REQUESTED ON"
         if self.activity is not None:
             name = "Controller" if channel is None else (
                 "Master Pump" if channel == self.master_channel else self.zones[channel].name
@@ -448,16 +552,24 @@ class Controller:
             if self._uses_pump(channel) and self.pump_on and not any(
                 other != channel and self._uses_pump(other) for other in self.runs
             ):
-                self.backend.set_relay(self.master_channel, False)
+                if not self._write(self.master_channel, False):
+                    return
                 self.pump_on = False
                 pump_stopped = True
             try:
-                self.backend.set_relay(channel, False)
+                if not self._write(channel, False):
+                    return
             finally:
                 if pump_stopped:
                     self._record(self.master_channel, "OFF", reason)
             del self.runs[channel]
             self._record(channel, "OFF", reason)
+        elif channel in getattr(self.backend, "requested_channels", ()):
+            self._write(channel, False)
+            self._record(channel, "OFF", reason)
+        elif self.split_groups and channel >= 8:
+            if self._write(channel, False):
+                self._record(channel, "OFF", reason)
 
     def _shutdown_channels(self) -> tuple[int, ...]:
         channels = tuple(channel for channel in sorted(self.available_channels) if channel != self.master_channel)
@@ -471,12 +583,14 @@ class Controller:
 
     def _on(self, channel: int, run: Run, now: datetime) -> None:
         try:
-            self.backend.set_relay(channel, True)
+            if not self._write(channel, True):
+                return
             previous = self.runs.get(channel)
             self.runs[channel] = run
             pump_started = False
             if self._uses_pump(channel) and self.master_channel is not None and not self.pump_on:
-                self.backend.set_relay(self.master_channel, True)
+                if not self._write(self.master_channel, True):
+                    return
                 self.pump_on = True
                 pump_started = True
             self._record(channel, "ON" if previous is None else "RUN UPDATED", run.source)
@@ -521,6 +635,10 @@ class Controller:
             raise ValueError("Relay channel is not configured.")
         if channel not in self.available_channels:
             raise ValueError("This channel has no assigned output device.")
+        if channel in self.channel_faults:
+            raise ValueError("This appliance station is faulted. Use Retry station to confirm OFF before starting.")
+        if channel < 8 and self.garden_fault:
+            raise ValueError("Garden group is faulted. Check hardware and restart the controller.")
         if channel == self.master_channel:
             raise RuntimeError("The master pump is controlled automatically by garden zones.")
         if self.rain_paused and not self.zones[channel].rain_pause_exempt:
@@ -601,9 +719,9 @@ class Controller:
             pump_needed = any(self._uses_pump(channel) for channel in self.runs)
             if pump_needed != self.pump_on:
                 try:
-                    self.backend.set_relay(self.master_channel, pump_needed)
-                    self.pump_on = pump_needed
-                    self._record(self.master_channel, "ON" if pump_needed else "OFF", "Pump settings changed")
+                    if self._write(self.master_channel, pump_needed):
+                        self.pump_on = pump_needed
+                        self._record(self.master_channel, "ON" if pump_needed else "OFF", "Pump settings changed")
                 except (OSError, RuntimeError) as exc:
                     self.closed = True
                     try:
@@ -621,6 +739,8 @@ class Controller:
             return
         monotonic_now = self.clock()
         for channel, zone in enumerate(self.zones):
+            if channel in self.channel_faults or (channel < 8 and self.garden_fault):
+                continue
             if self.rain_paused and not zone.rain_pause_exempt:
                 continue
             if channel in self.blocked:
@@ -664,6 +784,12 @@ class Controller:
         if paused:
             errors: list[Exception] = []
             stopped: list[int] = []
+            requested = getattr(self.backend, "requested_channels", ())
+            for channel in requested:
+                if not self.zones[channel].rain_pause_exempt:
+                    if not self._write(channel, False):
+                        continue
+                    self._record(channel, "OFF", "Rain Pause")
             exempt_run_active = any(
                 self._uses_pump(channel) and zone.rain_pause_exempt
                 and channel in self.runs
@@ -676,13 +802,15 @@ class Controller:
                 elif self.zones[channel].rain_pause_exempt:
                     continue
                 try:
-                    self.backend.set_relay(channel, False)
+                    if channel not in requested:
+                        if not self._write(channel, False):
+                            continue
                     if channel == self.master_channel:
                         if self.pump_on:
                             stopped.append(channel)
                         self.pump_on = False
                     else:
-                        if channel in self.runs:
+                        if channel in self.runs and channel not in requested:
                             stopped.append(channel)
                         self.runs.pop(channel, None)
                 except (OSError, RuntimeError) as exc:
@@ -696,18 +824,29 @@ class Controller:
             self.tick(now)
 
     def stop_all(self, now: datetime, *, suppress: bool = True, reason: str = "Stop all") -> None:
+        if self.split_groups:
+            for channel in getattr(self.backend, "requested_channels", ()):
+                self.backend.set_relay(channel, False)
+            self.stop_group(0, now, reason=reason)
+            self.stop_group(8, now, reason=reason)
+            return
         errors: list[Exception] = []
         stopped: list[int] = []
+        requested = getattr(self.backend, "requested_channels", ())
+        for channel in requested:
+            self.backend.set_relay(channel, False)
+            self._record(channel, "OFF", reason)
         for channel in self._shutdown_channels():
             try:
                 # Send OFF even when local state already says OFF.
-                self.backend.set_relay(channel, False)
+                if channel not in requested:
+                    self.backend.set_relay(channel, False)
                 if channel == self.master_channel:
                     if self.pump_on:
                         stopped.append(channel)
                     self.pump_on = False
                 run = self.runs.get(channel)
-                if run is not None:
+                if run is not None and channel not in requested:
                     stopped.append(channel)
                 if suppress and run is not None and run.source == "Routine":
                     self._block(channel, run.window_key, self.blocked)

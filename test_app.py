@@ -25,6 +25,157 @@ from test_service import FakeDevice, RunningService
 
 @unittest.skipUnless(os.environ.get("DISPLAY"), "Requires a graphical display")
 class RainPauseGuiTests(unittest.TestCase):
+    def test_group_buttons_and_station_retry_do_not_fault_desktop_or_stop_garden(self):
+        from dataclasses import replace
+        secondary = FakeDevice()
+        secondary.host = "192.0.2.2"
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "settings.json"
+            save_zones(config, [replace(zone, rain_pause_exempt=True) for zone in default_zones(16)])
+            with RunningService(Path(directory), secondary) as running:
+                client = ServiceClient(running.path)
+                other = SprinklerApp(running.config, client)
+                try:
+                    client.start_manual(0, datetime.now())
+                    client.start_manual(9, datetime.now())
+                    secondary.fail = True
+                    with patch("app.messagebox.showerror") as error, patch("app.datetime", datetime):
+                        other.select_zone(8)
+                        other.manual()
+                        self.assertTrue(error.called)
+                        self.assertFalse(other.faulted)
+                        self.assertTrue(running.device.states[0])
+                        self.assertEqual(other.manual_button.cget("text"), "RETRY STATION (OFF)")
+                        self.assertIn("STATION FAULT", other.status.cget("text"))
+                        secondary.fail = False
+                        other.manual()
+                        self.assertEqual(other.manual_button.cget("text"), "RUN ZONE")
+                        self.assertNotIn(8, client.runs)
+                        self.assertIn(9, client.runs)
+                        other.stop_appliances_button.invoke()
+                        self.assertIn(0, client.runs)
+                        self.assertNotIn(9, client.runs)
+                        self.assertTrue(running.device.states[7])
+                        other.stop_garden_button.invoke()
+                        self.assertFalse(client.runs)
+                        self.assertFalse(running.device.states[7])
+                finally:
+                    secondary.fail = False
+                    other.on_close()
+
+    def test_tapo_timeline_graph_renders_recorded_and_unknown_periods(self) -> None:
+        from activity_history import ActivityHistory
+        import tkinter as tk
+        with tempfile.TemporaryDirectory() as directory:
+            with RunningService(Path(directory)) as running:
+                client = ServiceClient(running.path)
+                other = SprinklerApp(running.config, client)
+                result = ActivityHistory(running.config).timeline(8)
+                result["name"] = "Tapo Plug 1"
+                result["off_peak"] = True
+                result["samples"] = [{
+                    "timestamp": result["end"], "updated": result["end"], "state": False,
+                    "power_w": 12.5, "today_kwh": 0.1, "month_kwh": 1.0,
+                    "voltage_v": 240.0, "current_a": 0.05, "error": "",
+                }]
+                try:
+                    with patch("app.datetime", datetime), patch.object(client, "tapo_timeline", return_value=result) as read:
+                        other.show_tapo_timeline(8)
+                        window = next(w for w in other.winfo_children()
+                                      if isinstance(w, ctk.CTkToplevel) and "24-hour" in w.title())
+                        canvas = next(w for w in window.winfo_children() if isinstance(w, tk.Canvas))
+                        deadline = time.monotonic() + 2
+                        while not canvas.find_all() and time.monotonic() < deadline:
+                            other.update()
+                            time.sleep(0.01)
+                        self.assertTrue(canvas.find_all())
+                        self.assertTrue(any(
+                            canvas.type(item) == "rectangle" and canvas.coords(item)[1:4:2] == [63.0, 72.0]
+                            for item in canvas.find_all()
+                        ))
+                        sample_canvas = [w for w in window.winfo_children() if isinstance(w, tk.Canvas)][1]
+                        self.assertTrue(any(sample_canvas.type(item) == "oval" for item in sample_canvas.find_all()))
+                        labels = [w.cget("text") for w in window.winfo_children() if isinstance(w, ctk.CTkLabel)]
+                        self.assertTrue(any("Controller switching history only" in value for value in labels))
+                        read.assert_called_once_with(8)
+                finally:
+                    other.on_close()
+
+    def test_tapo_details_window_is_read_only_and_shows_unavailable_values(self) -> None:
+        from tkinter import ttk
+        with tempfile.TemporaryDirectory() as directory:
+            with RunningService(Path(directory)) as running:
+                client = ServiceClient(running.path)
+                other = SprinklerApp(running.config, client)
+                row = {
+                    "channel": 15, "name": "Hot Water System", "state": True,
+                    "power_w": 0.0, "today_kwh": None, "month_kwh": 1.25,
+                    "voltage_v": 234.0, "current_a": None,
+                    "updated": "2026-01-01T00:00:00+00:00", "error": "",
+                }
+                try:
+                    with (
+                        patch("app.datetime", datetime),
+                        patch.object(client, "tapo_details", return_value={"reading": False, "rows": [row]}) as read,
+                    ):
+                        other.show_tapo_details()
+                        deadline = time.monotonic() + 2
+                        table = next(w for w in other.tapo_window.winfo_children() if isinstance(w, ttk.Treeview))
+                        while not table.get_children() and time.monotonic() < deadline:
+                            other.update()
+                            time.sleep(0.01)
+                        values = table.item(table.get_children()[0], "values")
+                        self.assertEqual(values[:3], ("16", "Hot Water System", "ON"))
+                        self.assertIn("Unavailable", values)
+                        self.assertIn("Stale", values)
+                        read.assert_called_once_with(True)
+                        row.update({
+                            "state": None, "off_peak": True, "requested_state": True,
+                            "last_confirmed_state": True, "confirmed_at": row["updated"],
+                            "availability": "Unavailable: supply or connection unknown",
+                        })
+                        refresh = next(w for w in other.tapo_window.winfo_children()
+                                       if isinstance(w, ctk.CTkButton))
+                        refresh.invoke()
+                        deadline = time.monotonic() + 2
+                        while time.monotonic() < deadline:
+                            other.update()
+                            values = table.item(table.get_children()[0], "values")
+                            if "Requested ON" in str(values):
+                                break
+                            time.sleep(0.01)
+                        self.assertEqual(values[2], "Unavailable")
+                        self.assertIn("last confirmed ON", values[-1])
+                        self.assertIn("2026-01-01", values[-1])
+                        first = other.tapo_window
+                        other.show_tapo_details()
+                        self.assertIs(other.tapo_window, first)
+                finally:
+                    other.on_close()
+
+    def test_custom_hours_summary_run_and_maximum(self) -> None:
+        self.app.select_zone(1)
+        self.app.manual_duration.set("Custom")
+        self.app.custom_duration.set(" 2.5H ")
+        self.assertIn("2 hours 30 minutes (150 minutes)", self.app.duration_summary.cget("text"))
+        with patch.object(self.app.controller, "start_manual") as start:
+            self.app.manual()
+        self.assertEqual(start.call_args.kwargs["duration_minutes"], 150)
+        for value in ("0.01h", "1.5", "24.1h"):
+            self.app.custom_duration.set(value)
+            with patch("app.messagebox.showerror") as error, \
+                    patch.object(self.app.controller, "start_manual") as start:
+                self.app.manual()
+            error.assert_called_once()
+            start.assert_not_called()
+        self.app.fields[1].max_manual_minutes.set("30")
+        self.assertTrue(self.app.save())
+        self.app.custom_duration.set("2.5h")
+        with patch("app.messagebox.showerror") as error:
+            self.app.manual()
+        self.assertIn("maximum", error.call_args.args[1])
+        self.assertNotIn(1, self.app.controller.runs)
+
     def test_unassigned_tapo_channel_is_editable_but_cannot_run(self) -> None:
         import json
         from tapo_plugs import mapping_path

@@ -454,8 +454,9 @@ class ServiceTests(unittest.TestCase):
         secondary.fail = True
         with self.assertLogs(level="ERROR"):
             service.dispatch({"command": "manual", "channel": 8})
-        self.assertTrue(service.fault)
-        self.assertTrue(service.controller.closed)
+        self.assertFalse(service.fault)
+        self.assertTrue(service.controller.channel_faults[8])
+        self.assertFalse(service.controller.closed)
         self.assertFalse(any(self.device.states))
 
     def test_exempt_zone_manual_watering_is_allowed_during_rain_pause(self) -> None:
