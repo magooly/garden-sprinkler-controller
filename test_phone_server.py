@@ -34,6 +34,44 @@ def service_status() -> dict[str, object]:
 
 
 class PhoneServerTests(unittest.TestCase):
+    def test_saved_24_7_mode_requires_auth_csrf_revision_and_appliance_channel(self):
+        body = {"channel": 15, "enabled": True, "revision": "revision-1"}
+        self.assertEqual(self.request("POST", "/api/continuous-schedule", body)[0], 401)
+        cookie, csrf = self.login()
+        current = service_status()
+        current.update({
+            "settings": encode_zones(default_zones(16)), "channel_count": 16,
+            "continuous_schedule_supported": True,
+        })
+        self.mock_exchange.return_value = current
+        self.assertEqual(self.request("POST", "/api/continuous-schedule", body, cookie)[0], 403)
+        for invalid in ({"channel": 0}, {"enabled": "true"}, {"revision": "stale"}):
+            self.assertEqual(self.request("POST", "/api/continuous-schedule", {**body, **invalid}, cookie, csrf)[0], 400)
+        self.mock_exchange.reset_mock()
+        self.assertEqual(self.request("POST", "/api/continuous-schedule", body, cookie, csrf)[0], 200)
+        from controller import decode_zones
+        saved = decode_zones(self.mock_exchange.call_args.args[1]["settings"])
+        self.assertTrue(saved[15].continuous_schedule)
+        self.assertTrue(saved[15].enabled)
+        self.assertEqual(saved[:15], default_zones(16)[:15])
+
+    def test_phone_accepts_routine_without_deadline_only_for_saved_24_7_mode(self):
+        from dataclasses import replace
+        zones = default_zones(16)
+        zones[15] = replace(zones[15], enabled=True, continuous_schedule=True)
+        current = service_status()
+        current.update({
+            "settings": encode_zones(zones), "channel_count": 16,
+            "runs": [{"channel": 15, "source": "Routine", "remaining": None}],
+        })
+        self.mock_exchange.return_value = current
+        cookie, _ = self.login()
+        code, result, _ = self.request("GET", "/api/status", cookie=cookie)
+        self.assertEqual(code, 200)
+        self.assertTrue(result["status"]["channels"][15]["continuous_schedule"])
+        current["runs"][0]["channel"] = 0
+        self.assertEqual(self.request("GET", "/api/status", cookie=cookie)[0], 503)
+
     def test_group_stops_and_station_retry_require_auth_csrf_and_preserve_local_faults(self):
         for action in ("stop_garden", "stop_appliances", "retry_station"):
             body = {"action": action, "channel": 8}
@@ -69,12 +107,25 @@ class PhoneServerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(data["timeline"]["channel"], 8)
         self.mock_exchange.assert_called_once_with(
-            self.socket_path, {"command": "tapo_timeline", "channel": 8},
+            self.socket_path, {"command": "tapo_timeline", "channel": 8, "hours": 24},
         )
         self.mock_exchange.reset_mock()
-        for query in ("channel=7", "channel=16", "channel=8&channel=9", "channel=bad", "channel=8&extra=1"):
+        for query in ("channel=7", "channel=16", "channel=8&channel=9", "channel=bad", "channel=8&extra=1", "channel=8&hours=7", "channel=8&hours=6&hours=168"):
             self.assertEqual(self.request("GET", "/api/tapo-timeline?" + query, cookie=cookie)[0], 503)
         self.mock_exchange.assert_not_called()
+        for hours in (6, 24, 168):
+            self.mock_exchange.reset_mock()
+            self.assertEqual(self.request("GET", f"/api/tapo-timeline?channel=8&hours={hours}", cookie=cookie)[0], 200)
+            self.mock_exchange.assert_called_once_with(self.socket_path, {"command": "tapo_timeline", "channel": 8, "hours": hours})
+
+    def test_health_is_authenticated_read_only_and_reports_phone_service(self):
+        self.assertEqual(self.request("GET", "/api/system-health")[0], 401)
+        cookie, _ = self.login()
+        self.mock_exchange.return_value = {"checks": [], "checked_at": "2026-11-15T00:00:00Z"}
+        status, data, _ = self.request("GET", "/api/system-health", cookie=cookie)
+        self.assertEqual(status, 200)
+        self.assertEqual(data["health"]["checks"][0]["label"], "Phone service")
+        self.mock_exchange.assert_called_once_with(self.socket_path, {"command": "system_health"})
 
     def test_tapo_details_require_auth_and_only_route_read_command(self) -> None:
         self.assertEqual(self.request("GET", "/api/tapo-details")[0], 401)
@@ -278,7 +329,13 @@ class PhoneServerTests(unittest.TestCase):
         response = self.connection.getresponse()
         self.assertEqual(response.status, 200)
         self.assertIn("text/html", response.getheader("Content-Type"))
-        self.assertIn(b"Sprinklers", response.read())
+        page = response.read()
+        self.assertIn(b"Sprinklers", page)
+        self.assertIn(b'id="tapo-sample-graphs"', page)
+        self.assertNotIn(b'id="tapo-metric"', page)
+        self.assertIn(b'id="tapo-recorded-details" class="hidden"', page)
+        self.assertIn(b"Back to graphs", page)
+        self.assertIn(b"every 5 minutes", page)
         self.mock_exchange.assert_not_called()
 
     def test_status_and_commands_require_login_and_csrf(self) -> None:

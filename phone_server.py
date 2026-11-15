@@ -52,6 +52,7 @@ class PhoneControlServer(ThreadingHTTPServer):
         self, address: tuple[str, int], service_socket: Path, password: str,
     ) -> None:
         self.service_socket = service_socket
+        self.running_version = Path(__file__).with_name("VERSION").read_text().strip()
         self.expected_password = password
         self.sessions: dict[str, Session] = {}
         self.login_failures: list[float] = []
@@ -168,6 +169,7 @@ class PhoneRequestHandler(BaseHTTPRequestHandler):
             if (
                 not isinstance(item, dict)
                 or type(item.get("channel")) is not int
+                or item["channel"] not in range(channel_count)
                 or not isinstance(item.get("source"), str)
                 or (
                     item.get("remaining") is not None
@@ -175,7 +177,10 @@ class PhoneRequestHandler(BaseHTTPRequestHandler):
                 )
                 or (
                     item.get("remaining") is None
-                    and (item.get("source") != "Continuous" or "remaining" not in item)
+                    and ("remaining" not in item or not (
+                        item.get("source") == "Continuous"
+                        or (item.get("source") == "Routine" and zones[item["channel"]].continuous_schedule)
+                    ))
                 )
                 or type(item.get("remaining")) is bool
                 or (item.get("elapsed") is not None and (
@@ -218,6 +223,7 @@ class PhoneRequestHandler(BaseHTTPRequestHandler):
                 "pump_exempt": zone.pump_exempt,
                 "max_manual_minutes": zone.max_manual_minutes,
                 "continuous_reminder_minutes": zone.continuous_reminder_minutes,
+                "continuous_schedule": zone.continuous_schedule,
                 "master": channel == master_channel,
                 "running": runs.get(channel),
                 "pump_on": pump_on if channel == master_channel else False,
@@ -238,6 +244,7 @@ class PhoneRequestHandler(BaseHTTPRequestHandler):
             "history_supported": data.get("history_supported") is True,
             "history_filters_supported": data.get("history_filters_supported") is True,
             "continuous_reminders_supported": data.get("continuous_reminders_supported") is True,
+            "continuous_schedule_supported": data.get("continuous_schedule_supported") is True,
             "revision": data.get("revision"),
             "backup_supported": data.get("full_backup_supported") is True,
             "operation_held": data.get("operation_held") is True,
@@ -264,7 +271,7 @@ class PhoneRequestHandler(BaseHTTPRequestHandler):
                 return
             self._send(HTTPStatus.OK, body, content_type)
             return
-        if path not in ("/api/session", "/api/status", "/api/history", "/api/backup", "/api/tapo-details", "/api/tapo-timeline"):
+        if path not in ("/api/session", "/api/status", "/api/history", "/api/backup", "/api/tapo-details", "/api/tapo-timeline", "/api/system-health"):
             self._error(HTTPStatus.NOT_FOUND, "Not found.")
             return
         session_info = self._session()
@@ -276,13 +283,24 @@ class PhoneRequestHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.OK, {"csrf": session.csrf_token})
             return
         try:
+            if path == "/api/system-health":
+                result = exchange(self.server.service_socket, {"command": "system_health"})
+                installed = Path(__file__).with_name("VERSION").read_text().strip()
+                result["checks"].append({"label": "Phone service",
+                                         "value": f"Responding; version {self.server.running_version}; "
+                                         + ("restart required" if installed != self.server.running_version else "no version restart required")})
+                self._send_json(HTTPStatus.OK, {"health": result})
+                return
             if path == "/api/tapo-timeline":
                 query = parse_qs(url.query, keep_blank_values=True)
                 values = query.get("channel", [])
-                if set(query) != {"channel"} or len(values) != 1 or values[0] not in tuple(str(i) for i in range(8, 16)):
+                ranges = query.get("hours", ["24"])
+                if (set(query) - {"channel", "hours"} or len(values) != 1
+                    or values[0] not in tuple(str(i) for i in range(8, 16))
+                    or len(ranges) != 1 or ranges[0] not in ("6", "24", "168")):
                     raise ValueError("Choose an assigned Tapo channel.")
                 result = exchange(self.server.service_socket, {
-                    "command": "tapo_timeline", "channel": int(values[0]),
+                    "command": "tapo_timeline", "channel": int(values[0]), "hours": int(ranges[0]),
                 })
                 self._send_json(HTTPStatus.OK, {"timeline": result})
                 return
@@ -326,7 +344,7 @@ class PhoneRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlsplit(self.path).path
-        if path not in ("/api/login", "/api/logout", "/api/command", "/api/restore", "/api/reminder", "/api/window-pause",
+        if path not in ("/api/login", "/api/logout", "/api/command", "/api/restore", "/api/reminder", "/api/window-pause", "/api/continuous-schedule",
                         "/api/backup", "/api/backup-preview"):
             self._error(HTTPStatus.NOT_FOUND, "Not found.")
             return
@@ -393,12 +411,14 @@ class PhoneRequestHandler(BaseHTTPRequestHandler):
             except (OSError, RuntimeError) as error:
                 self._error(HTTPStatus.SERVICE_UNAVAILABLE, str(error))
             return
-        if path in ("/api/reminder", "/api/window-pause"):
+        if path in ("/api/reminder", "/api/window-pause", "/api/continuous-schedule"):
             try:
                 channel, minutes, revision = body.get("channel"), body.get("minutes"), body.get("revision")
                 if type(channel) is not int or channel not in range(16):
                     raise ValueError("Choose a configured channel.")
                 group, paused = body.get("group"), body.get("paused")
+                if path == "/api/continuous-schedule" and type(body.get("enabled")) is not bool:
+                    raise ValueError("24/7 routine enabled must be true or false.")
                 if path == "/api/window-pause" and (
                     type(group) is not int or group not in range(4) or type(paused) is not bool
                 ):
@@ -415,7 +435,11 @@ class PhoneRequestHandler(BaseHTTPRequestHandler):
                 zones = decode_zones(current["settings"])
                 if channel >= current["channel_count"] or channel == current["master_channel"]:
                     raise ValueError("Choose a configured non-pump channel.")
-                if path == "/api/window-pause":
+                if path == "/api/continuous-schedule":
+                    if channel < 8 or current.get("continuous_schedule_supported") is not True:
+                        raise ValueError("24/7 routines require stations 9-16 and the updated controller service.")
+                    zones[channel] = replace(zones[channel], continuous_schedule=body["enabled"], enabled=body["enabled"])
+                elif path == "/api/window-pause":
                     windows = list(zones[channel].paused_windows)
                     windows[group] = paused
                     zones[channel] = replace(zones[channel], paused_windows=tuple(windows))

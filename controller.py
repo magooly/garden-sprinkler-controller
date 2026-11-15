@@ -116,7 +116,7 @@ def overlapping_windows(row: tuple[str, ...]) -> tuple[tuple[int, int], ...]:
 
 
 def next_scheduled_start(zone: Zone, now: datetime) -> datetime | None:
-    if not zone.enabled:
+    if not zone.enabled or zone.continuous_schedule:
         return None
     candidates = []
     for offset in range(8):
@@ -145,6 +145,7 @@ class Zone:
     pump_exempt: bool = False
     max_manual_minutes: int | None = None
     continuous_reminder_minutes: int | None = None
+    continuous_schedule: bool = False
 
     def validate(self) -> None:
         if not isinstance(self.name, str) or not self.name.strip():
@@ -153,6 +154,8 @@ class Zone:
             raise ValueError("Zone names must be 40 characters or fewer.")
         if type(self.enabled) is not bool:
             raise ValueError("Routine enabled must be true or false.")
+        if type(self.continuous_schedule) is not bool:
+            raise ValueError("24/7 routine must be true or false.")
         if type(self.rain_pause_exempt) is not bool:
             raise ValueError("Rain Pause exemption must be true or false.")
         if type(self.pump_exempt) is not bool:
@@ -202,7 +205,7 @@ class Zone:
                     f"{DAY_NAMES[day]} Start/Stop group {first + 1} overlaps "
                     f"Start/Stop group {second + 1}."
                 )
-        if self.enabled and not has_window:
+        if self.enabled and not has_window and not self.continuous_schedule:
             raise ValueError("Set at least one daily time window for an enabled routine.")
 
     def scheduled(self, now: datetime) -> bool:
@@ -211,6 +214,8 @@ class Zone:
     def scheduled_windows(self, now: datetime) -> tuple[tuple[str, str], ...]:
         if not self.enabled:
             return ()
+        if self.continuous_schedule:
+            return () if self.paused_windows[0] else (("24/7", "24/7"),)
         minute = now.hour * 60 + now.minute
         row = self.schedule[now.weekday()]
         return tuple(sorted(
@@ -232,12 +237,14 @@ def default_zones(count: int = ZONE_COUNT) -> list[Zone]:
     ]
 
 
-def validate_zones(zones: list[Zone]) -> None:
+def validate_zones(zones: list[Zone], *, first_channel: int = 0) -> None:
     if len(zones) not in (ZONE_COUNT, MAX_ZONE_COUNT):
         raise ValueError("Exactly 8 or 16 zones are required.")
     for index, zone in enumerate(zones):
         try:
             zone.validate()
+            if zone.continuous_schedule and index + first_channel < 8:
+                raise ValueError("24/7 routines are available only for stations 9-16.")
         except ValueError as exc:
             raise ValueError(f"Zone {index + 1}: {exc}") from exc
 
@@ -249,8 +256,8 @@ def load_zones(path: Path) -> list[Zone]:
 
 
 def decode_zones(data: object) -> list[Zone]:
-    if not isinstance(data, dict) or type(data.get("version")) is not int or data["version"] not in (1, 2, 3, 4, 5, 6, 7, 8, 9):
-        raise ValueError("Unsupported settings format; expected version 1 through 9.")
+    if not isinstance(data, dict) or type(data.get("version")) is not int or data["version"] not in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10):
+        raise ValueError("Unsupported settings format; expected version 1 through 10.")
     records = data.get("zones")
     if not isinstance(records, list):
         raise ValueError("Settings must contain a list of zones.")
@@ -288,6 +295,8 @@ def decode_zones(data: object) -> list[Zone]:
                 expected_fields.add("max_manual_minutes")
             if data["version"] >= 9:
                 expected_fields.add("continuous_reminder_minutes")
+            if data["version"] >= 10:
+                expected_fields.add("continuous_schedule")
             if set(record) != expected_fields:
                 raise ValueError("Zone settings contain unexpected or missing fields.")
             if not isinstance(record["schedule"], list):
@@ -321,6 +330,7 @@ def decode_zones(data: object) -> list[Zone]:
             pump_exempt=record["pump_exempt"] if data["version"] >= 7 else False,
             max_manual_minutes=record["max_manual_minutes"] if data["version"] >= 8 else None,
             continuous_reminder_minutes=record["continuous_reminder_minutes"] if data["version"] >= 9 else None,
+            continuous_schedule=record["continuous_schedule"] if data["version"] >= 10 else False,
         ))
     validate_zones(zones)
     return zones
@@ -334,7 +344,7 @@ def save_zones(path: Path, zones: list[Zone]) -> None:
 def encode_zones(zones: list[Zone]) -> dict[str, object]:
     validate_zones(zones)
     return {
-        "version": 9,
+        "version": 10,
         "zones": [
             {
                 "name": zone.name.strip(),
@@ -345,6 +355,7 @@ def encode_zones(zones: list[Zone]) -> dict[str, object]:
                 "pump_exempt": zone.pump_exempt,
                 "max_manual_minutes": zone.max_manual_minutes,
                 "continuous_reminder_minutes": zone.continuous_reminder_minutes,
+                "continuous_schedule": zone.continuous_schedule,
             }
             for zone in zones
         ],
@@ -483,7 +494,7 @@ class Controller:
             return False
         return True
 
-    def stop_group(self, bank: int, now: datetime, *, reason: str = "Group stop") -> None:
+    def stop_group(self, bank: int, now: datetime, *, reason: str = "Group stop", suppress: bool = True) -> None:
         if type(bank) is not int or bank not in (0, 8) or bank >= self.channel_count:
             raise ValueError("Choose garden (0) or appliances (8).")
         if not self.split_groups:
@@ -508,6 +519,8 @@ class Controller:
             self.runs.pop(channel, None)
             if channel == self.master_channel:
                 self.pump_on = False
+            if suppress and self.zones[channel].continuous_schedule:
+                self.zones[channel] = replace(self.zones[channel], enabled=False)
             for window in self._current_windows(channel, now):
                 self._block(channel, window, self.blocked)
 
@@ -519,6 +532,8 @@ class Controller:
         if not self._write(channel, False):
             return
         del self.channel_faults[channel]
+        if self.zones[channel].continuous_schedule:
+            self.zones[channel] = replace(self.zones[channel], enabled=False)
         self._record(channel, "OFF", "Explicit retry confirmed OFF; select Run to start")
         for window in self._current_windows(channel, now):
             self._block(channel, window, self.blocked)
@@ -526,8 +541,9 @@ class Controller:
     def _current_windows(self, channel: int, now: datetime) -> tuple[tuple[date, str, str], ...]:
         if channel == self.master_channel or channel not in self.available_channels:
             return ()
+        # A continuous routine has one stable window identity across every midnight.
         return tuple(
-            (now.date(), start, stop)
+            (date.min if self.zones[channel].continuous_schedule else now.date(), start, stop)
             for start, stop in self.zones[channel].scheduled_windows(now)
         )
 
@@ -614,6 +630,8 @@ class Controller:
             raise RuntimeError("The master pump is controlled automatically by garden zones.")
         run = self.runs.get(channel)
         self._off(channel, reason)
+        if self.zones[channel].continuous_schedule:
+            self.zones[channel] = replace(self.zones[channel], enabled=False)
         if run is not None and run.source == "Routine":
             self._block(channel, run.window_key, self.blocked)
         for window in self._current_windows(channel, now):
@@ -678,8 +696,13 @@ class Controller:
         # A changed routine cancels its scheduled run; manual runs are independent.
         for channel, zone in enumerate(zones):
             previous = self.zones[channel]
+            if zone.continuous_schedule and (
+                not previous.continuous_schedule or (zone.enabled and not previous.enabled)
+                or (previous.paused_windows[0] and not zone.paused_windows[0])
+            ):
+                self.blocked.pop(channel, None)
             for slot, (was_paused, paused) in enumerate(zip(previous.paused_windows, zone.paused_windows)):
-                if was_paused and not paused:
+                if was_paused and not paused and not zone.continuous_schedule:
                     start, stop = zone.schedule[now.weekday()][slot * 2:slot * 2 + 2]
                     if start and stop and parse_time(start) <= now.hour * 60 + now.minute < parse_time(stop):
                         self._block(channel, (now.date(), start, stop), self.blocked)
@@ -745,7 +768,7 @@ class Controller:
                 continue
             if channel in self.blocked:
                 self.blocked[channel] = {
-                    window for window in self.blocked[channel] if window[0] == now.date()
+                    window for window in self.blocked[channel] if window[0] in (now.date(), date.min)
                 }
                 if not self.blocked[channel]:
                     del self.blocked[channel]
@@ -765,6 +788,9 @@ class Controller:
             )
             if next_window is not None:
                 _, start, stop = next_window
+                if zone.continuous_schedule:
+                    self._on(channel, Run("Routine", None, next_window), now)
+                    continue
                 end = now.replace(
                     hour=parse_time(stop) // 60,
                     minute=parse_time(stop) % 60,
@@ -827,8 +853,8 @@ class Controller:
         if self.split_groups:
             for channel in getattr(self.backend, "requested_channels", ()):
                 self.backend.set_relay(channel, False)
-            self.stop_group(0, now, reason=reason)
-            self.stop_group(8, now, reason=reason)
+            self.stop_group(0, now, reason=reason, suppress=suppress)
+            self.stop_group(8, now, reason=reason, suppress=suppress)
             return
         errors: list[Exception] = []
         stopped: list[int] = []
@@ -863,4 +889,4 @@ class Controller:
 
     def close(self, now: datetime) -> None:
         self.closed = True
-        self.stop_all(now, reason="Controller shutdown")
+        self.stop_all(now, suppress=False, reason="Controller shutdown")

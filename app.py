@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from typing import Callable
+from typing import Callable, Iterable
 
 import customtkinter as ctk
 import system_backup
@@ -117,6 +117,7 @@ class ZoneFields:
     pump_exempt: tk.BooleanVar
     max_manual_minutes: tk.StringVar
     continuous_reminder_minutes: tk.StringVar
+    continuous_schedule: tk.BooleanVar
 
     def manual_maximum(self) -> int | None:
         maximum = self.max_manual_minutes.get().strip()
@@ -143,6 +144,7 @@ class ZoneFields:
             self.pump_exempt.get(),
             self.manual_maximum(),
             int(reminder) if reminder else None,
+            self.continuous_schedule.get(),
         )
 
 
@@ -227,6 +229,7 @@ class SprinklerApp(ctk.CTk):
                 tk.BooleanVar(self, zone.pump_exempt),
                 tk.StringVar(self, str(zone.max_manual_minutes) if zone.max_manual_minutes else ""),
                 tk.StringVar(self, str(zone.continuous_reminder_minutes) if zone.continuous_reminder_minutes else ""),
+                tk.BooleanVar(self, zone.continuous_schedule),
             )
             for zone in zones
         ]
@@ -240,6 +243,7 @@ class SprinklerApp(ctk.CTk):
                 fields.pump_exempt,
                 fields.max_manual_minutes,
                 fields.continuous_reminder_minutes,
+                fields.continuous_schedule,
                 *(time for day in fields.schedule for time in day),
                 *fields.paused_windows,
             ):
@@ -424,10 +428,14 @@ class SprinklerApp(ctk.CTk):
             footer, text="Activity", command=self.show_history, width=90,
         )
         self.history_button.grid(row=0, column=1, padx=4)
+        detail_controls = ctk.CTkFrame(footer, fg_color="transparent")
+        detail_controls.grid(row=2, column=0, columnspan=5, pady=(0, 8))
         self.tapo_button = ctk.CTkButton(
-            footer, text="Show Tapo Details", command=self.show_tapo_details, width=140,
+            detail_controls, text="Show Tapo Details", command=self.show_tapo_details, width=140,
         )
-        self.tapo_button.grid(row=2, column=0, columnspan=5, pady=(0, 8))
+        self.tapo_button.pack(side="left", padx=6)
+        ctk.CTkButton(detail_controls, text="System health", command=self.show_system_health,
+                      width=120).pack(side="left", padx=6)
         self.backup_button = ctk.CTkButton(
             footer, text="Backup", command=self.show_backup, width=80,
         )
@@ -636,6 +644,57 @@ class SprinklerApp(ctk.CTk):
             messagebox.showerror("Cannot resume operation", str(error), parent=self)
         self._refresh()
 
+    def show_system_health(self) -> None:
+        if not isinstance(self.controller, ServiceClient):
+            messagebox.showinfo("System health", "System health requires the background service.", parent=self)
+            return
+        client = self.controller
+        window = ctk.CTkToplevel(self)
+        window.title("System health (read-only)")
+        window.geometry("900x600")
+        window.grid_columnconfigure(0, weight=1)
+        window.grid_rowconfigure(0, weight=1)
+        contents = ctk.CTkTextbox(window, wrap="word")
+        contents.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
+        replies: queue.Queue[dict | Exception] = queue.Queue()
+
+        def display(text: str) -> None:
+            contents.configure(state="normal")
+            contents.delete("1.0", "end")
+            contents.insert("end", text)
+            contents.configure(state="disabled")
+
+        def fetch() -> None:
+            try:
+                replies.put(client.system_health())
+            except (OSError, RuntimeError, ValueError) as exc:
+                replies.put(exc)
+
+        def receive() -> None:
+            if not window.winfo_exists():
+                return
+            try:
+                result = replies.get_nowait()
+            except queue.Empty:
+                window.after(100, receive)
+                return
+            button.configure(state="normal")
+            if isinstance(result, Exception):
+                display(f"System health unavailable: {result}")
+            else:
+                display(f"Checked: {result['checked_at']}\n\n" + "\n\n".join(
+                    f"{row['label']}\n{row['value']}" for row in result["checks"]))
+
+        def refresh() -> None:
+            button.configure(state="disabled")
+            display("Checking system health...")
+            threading.Thread(target=fetch, daemon=True).start()
+            receive()
+
+        button = ctk.CTkButton(window, text="Refresh health", command=refresh)
+        button.grid(row=1, column=0, pady=8)
+        refresh()
+
     def show_tapo_details(self) -> None:
         if not isinstance(self.controller, ServiceClient):
             messagebox.showinfo("Tapo details", "Tapo details require the background service.", parent=self)
@@ -754,29 +813,89 @@ class SprinklerApp(ctk.CTk):
         client = self.controller
         window = ctk.CTkToplevel(self)
         window.title(f"Zone {channel + 1}: 24-hour controller history")
-        window.geometry("900x760")
+        width = min(1120, window.winfo_screenwidth() - 80)
+        height = min(940, window.winfo_screenheight() - 100)
+        window.geometry(f"{width}x{height}+30+30")
         window.grid_columnconfigure(0, weight=1)
-        window.grid_rowconfigure(5, weight=1)
+        window.grid_rowconfigure(3, weight=1)
         label = ctk.CTkLabel(window, text="Loading controller switching history...", wraplength=850)
         label.grid(row=0, column=0, sticky="ew", padx=12, pady=12)
-        canvas = tk.Canvas(window, height=110, background="#202020", highlightthickness=0)
+        canvas = tk.Canvas(window, height=100, background="#202020", highlightthickness=0)
         canvas.grid(row=1, column=0, sticky="ew", padx=12)
         ctk.CTkLabel(window, text="Green: recorded ON   Blue: recorded OFF   Grey: Unknown").grid(row=2, column=0)
         metrics = {
             "Power (W)": "power_w", "Voltage (V)": "voltage_v", "Current (A)": "current_a",
-            "Today counter (kWh)": "today_kwh", "Month counter (kWh)": "month_kwh",
             "Reported state (ON=1, OFF=0)": "state",
+            "Today cumulative counter (kWh)": "today_kwh", "Month cumulative counter (kWh)": "month_kwh",
         }
-        metric = tk.StringVar(window, "Power (W)")
-        menu = ctk.CTkOptionMenu(window, variable=metric, values=list(metrics),
-                                command=lambda _value: draw())
-        menu.grid(row=3, column=0, pady=6)
-        sample_canvas = tk.Canvas(window, height=160, background="#202020", highlightthickness=0)
-        sample_canvas.grid(row=4, column=0, sticky="ew", padx=12)
-        text = ctk.CTkTextbox(window, wrap="word")
-        text.grid(row=5, column=0, sticky="nsew", padx=12, pady=8)
+        graphs = ctk.CTkScrollableFrame(window)
+        graphs.grid(row=3, column=0, sticky="nsew", padx=12, pady=8)
+        graphs.grid_columnconfigure((0, 1), weight=1, uniform="graphs")
+        sample_canvases: dict[str, tk.Canvas] = {}
+        reading_labels: dict[str, ctk.CTkLabel] = {}
+        reading_times: dict[str, ctk.CTkLabel] = {}
+        units = {"power_w": "W", "voltage_v": "V", "current_a": "A",
+                 "today_kwh": "kWh", "month_kwh": "kWh"}
+        panel_colors = ("#17283b", "#193326", "#30223b", "#173438", "#392d1c", "#29313d")
+        for index, (title, key) in enumerate(metrics.items()):
+            color = panel_colors[index]
+            panel = ctk.CTkFrame(graphs, fg_color=color, border_color="white",
+                                 border_width=1, corner_radius=6)
+            panel.grid(row=index // 2, column=index % 2, sticky="ew", padx=4, pady=4)
+            panel.grid_columnconfigure(0, weight=1)
+            sample_canvas = tk.Canvas(panel, height=130, width=300, background=color,
+                                      highlightthickness=0)
+            sample_canvas.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 0))
+            ctk.CTkLabel(panel, text=title, text_color="white", height=20).grid(row=1, column=0, padx=6)
+            reading = ctk.CTkLabel(panel, text="Unavailable", text_color="white",
+                                   height=28, font=ctk.CTkFont(size=24, weight="bold"))
+            reading.grid(row=2, column=0, padx=6)
+            recorded = ctk.CTkLabel(panel, text="No recorded sample", text_color="white", height=20)
+            recorded.grid(row=3, column=0, padx=6, pady=(0, 6))
+            sample_canvases[key] = sample_canvas
+            reading_labels[key] = reading
+            reading_times[key] = recorded
+
+        def fit_graphs(_event=None) -> None:
+            viewport_height = graphs._parent_canvas.winfo_height()
+            if viewport_height <= 1:
+                return
+            panel = next(iter(sample_canvases.values())).master
+            plot = next(iter(sample_canvases.values()))
+            overhead = panel.winfo_reqheight() - plot.winfo_reqheight()
+            plot_height = max(90, (viewport_height - 24) // 3 - overhead - 8)
+            for sample_canvas in sample_canvases.values():
+                if int(sample_canvas.cget("height")) != plot_height:
+                    sample_canvas.configure(height=plot_height)
+
+        graphs._parent_canvas.bind("<Configure>", fit_graphs, add="+")
+
+        def scroll_graphs(event: tk.Event) -> None:
+            widget = event.widget
+            while widget is not None:
+                if widget == graphs:
+                    graphs._parent_canvas.yview_scroll(-1 if event.num == 4 else 1, "units")
+                    return
+                widget = getattr(widget, "master", None)
+
+        window.bind("<Button-4>", scroll_graphs, add="+")
+        window.bind("<Button-5>", scroll_graphs, add="+")
+        controls = ctk.CTkFrame(window, fg_color="transparent")
+        controls.grid(row=4, column=0, pady=8)
+        details_window: ctk.CTkToplevel | None = None
+        text: ctk.CTkTextbox | None = None
         replies: queue.Queue[dict | Exception] = queue.Queue()
         data: dict = {}
+        history_error = ""
+        history_range = tk.StringVar(window, "24 hours")
+        ranges = {"6 hours": 6, "24 hours": 24, "7 days": 168}
+        range_menu = ctk.CTkOptionMenu(controls, variable=history_range, values=list(ranges),
+                                       command=lambda _value: refresh())
+        range_menu.grid(row=0, column=2, padx=6)
+
+        def graph_time(stamp: datetime) -> str:
+            local = stamp.astimezone()
+            return f"{local.hour % 12 or 12}:{local.minute:02} {'am' if local.hour < 12 else 'pm'}"
 
         def draw(_event=None) -> None:
             if not data:
@@ -784,57 +903,97 @@ class SprinklerApp(ctk.CTk):
             canvas.delete("all")
             width = max(1, canvas.winfo_width() - 24)
             start = datetime.fromisoformat(data["start"])
+            duration = (datetime.fromisoformat(data["end"]) - start).total_seconds()
             for segment in data["segments"]:
-                left = (datetime.fromisoformat(segment["start"]) - start).total_seconds() / 86400
-                right = (datetime.fromisoformat(segment["end"]) - start).total_seconds() / 86400
+                left = (datetime.fromisoformat(segment["start"]) - start).total_seconds() / duration
+                right = (datetime.fromisoformat(segment["end"]) - start).total_seconds() / duration
                 canvas.create_rectangle(12 + width * left, 20, 12 + width * right, 60,
                                         fill={"ON": "#238636", "OFF": "#3178b6", "Unknown": "#777777"}[segment["state"]],
                                         outline="")
-            for hours in (0, 6, 12, 18, 24):
-                stamp = (start + timedelta(hours=hours)).astimezone()
-                canvas.create_text(12 + width * hours / 24, 85, text=stamp.strftime("%d/%m %H:%M"),
-                                   fill="white", anchor="w" if hours == 0 else "e" if hours == 24 else "center")
+            for fraction in (0, .25, .5, .75, 1):
+                stamp = (start + timedelta(seconds=duration * fraction)).astimezone()
+                canvas.create_text(12 + width * fraction, 85,
+                                   text=f"{stamp:%d/%m} {graph_time(stamp)}",
+                                   fill="white", anchor="w" if fraction == 0 else "e" if fraction == 1 else "center")
             if data.get("off_peak"):
                 for segment in data.get("requested_segments", []):
-                    left = (datetime.fromisoformat(segment["start"]) - start).total_seconds() / 86400
-                    right = (datetime.fromisoformat(segment["end"]) - start).total_seconds() / 86400
+                    left = (datetime.fromisoformat(segment["start"]) - start).total_seconds() / duration
+                    right = (datetime.fromisoformat(segment["end"]) - start).total_seconds() / duration
                     canvas.create_rectangle(12 + width * left, 63, 12 + width * right, 72,
                                             fill={"ON": "#238636", "OFF": "#3178b6", "Unknown": "#777777"}[segment["state"]],
                                             outline="")
+            for key, sample_canvas in sample_canvases.items():
+                draw_samples(key, sample_canvas, start)
+
+        def draw_samples(key: str, sample_canvas: tk.Canvas, start: datetime) -> None:
             sample_canvas.delete("all")
+            samples = data.get("samples", [])
+            latest = max(samples, key=lambda row: datetime.fromisoformat(row["timestamp"])) if samples else None
+            value = latest.get(key) if latest is not None else None
+            if latest is None or latest["error"] or value is None:
+                reading_labels[key].configure(text="Unavailable")
+            elif key == "state":
+                reading_labels[key].configure(text="ON" if value else "OFF")
+            else:
+                reading_labels[key].configure(text=f"{float(value):.3f} {units[key]}")
+            if latest is None:
+                recorded = "No recorded sample"
+            else:
+                timestamp = latest["timestamp"] if latest["error"] else latest["updated"] or latest["timestamp"]
+                stamp = datetime.fromisoformat(timestamp).astimezone()
+                prefix = "Sample failed" if latest["error"] else "Recorded"
+                recorded = f"{prefix}: {stamp:%d/%m} {graph_time(stamp)}"
+                age = max(0, int((datetime.now(stamp.tzinfo) - stamp).total_seconds() // 60))
+                recorded += f" ({age} min ago)"
+            reading_times[key].configure(text=recorded + (" (stale)" if history_error else ""))
             values = []
-            key = metrics[metric.get()]
-            for row in data.get("samples", []):
+            for row in samples:
                 value = row.get(key)
                 values.append(None if row["error"] or value is None else float(value))
             maximum = max([1.0] + [value for value in values if value is not None])
-            sample_width = max(1, sample_canvas.winfo_width() - 70)
+            scale_font = ("TkDefaultFont", 13, "bold")
+            scale_text = f"{maximum:.3f}"
+            scale_item = sample_canvas.create_text(3, 25, text=scale_text, fill="white",
+                                                  anchor="w", font=scale_font)
+            scale_bounds = sample_canvas.bbox(scale_item)
+            left_margin = max(70, scale_bounds[2] + 12) if scale_bounds else 70
+            sample_width = max(1, sample_canvas.winfo_width() - left_margin - 15)
+            plot_bottom = max(35, sample_canvas.winfo_height() - 50)
+            axis_y = plot_bottom + 20
             previous = None
             count = 0
             for row, value in zip(data.get("samples", []), values):
                 if value is None:
                     previous = None
                     continue
-                x = 55 + (datetime.fromisoformat(row["timestamp"]) - start).total_seconds() / 86400 * sample_width
-                y = 125 - value / maximum * 100
+                duration = (datetime.fromisoformat(data["end"]) - start).total_seconds()
+                x = left_margin + (datetime.fromisoformat(row["timestamp"]) - start).total_seconds() / duration * sample_width
+                y = plot_bottom - value / maximum * (plot_bottom - 25)
                 if previous is not None:
                     sample_canvas.create_line(*previous, x, y, fill="#f6b73c", width=2)
                 sample_canvas.create_oval(x - 3, y - 3, x + 3, y + 3, fill="#f6b73c", outline="")
                 previous = (x, y)
                 count += 1
-            sample_canvas.create_text(3, 25, text=f"{maximum:.3f}", fill="white", anchor="w")
-            sample_canvas.create_text(3, 125, text="0", fill="white", anchor="w")
-            sample_canvas.create_text(55, 145, text=f"24h ago — {count} available 15-minute snapshots; gaps are not zero",
+            sample_canvas.create_text(3, plot_bottom, text="0", fill="white", anchor="w", font=scale_font)
+            duration = (datetime.fromisoformat(data["end"]) - start).total_seconds()
+            for fraction in (0, .5, 1):
+                stamp = (start + timedelta(seconds=duration * fraction)).astimezone()
+                sample_canvas.create_text(
+                    left_margin + sample_width * fraction, axis_y,
+                    text=(stamp.strftime("%d/%m ") if duration > 86400 else "") + graph_time(stamp),
+                    fill="white", anchor="w" if fraction == 0 else "e" if fraction == 1 else "center",
+                )
+            sample_canvas.create_text(left_margin, axis_y + 18, text=f"{count} snapshots; gaps are not zero",
                                       fill="white", anchor="w")
-            sample_canvas.create_text(55 + sample_width, 145, text="Now", fill="white", anchor="e")
 
-        def fetch() -> None:
+        def fetch(hours: int) -> None:
             try:
-                replies.put(client.tapo_timeline(channel))
+                replies.put(client.tapo_timeline(channel, hours))
             except (OSError, RuntimeError, ValueError) as exc:
                 replies.put(exc)
 
         def receive() -> None:
+            nonlocal history_error
             if not window.winfo_exists():
                 return
             try:
@@ -843,17 +1002,35 @@ class SprinklerApp(ctk.CTk):
                 window.after(100, receive)
                 return
             button.configure(state="normal")
+            range_menu.configure(state="normal")
             if isinstance(result, Exception):
+                history_error = f"History unavailable: {result}. Previous details are stale.\n\n"
                 label.configure(text=f"History unavailable: {result}. Previous graph, if any, is stale.")
+                update_details()
+                draw()
                 return
+            history_error = ""
             data.clear()
             data.update(result)
-            label.configure(text=f"{result['name']} — last 24 hours. Recorded ON: "
+            label.configure(text=f"{result['name']} — {history_range.get()}. Recorded ON: "
                             f"{result['on_seconds'] / 3600:.2f} hours.\n{result['description']}\n"
                             f"{result['warning']} {result.get('samples_warning', '')}")
+            details_button.configure(state="normal")
+            update_details()
+            draw()
+
+        def update_details() -> None:
+            if text is None or not text.winfo_exists():
+                return
+            result = data
             text.configure(state="normal")
             text.delete("1.0", "end")
+            text.insert("end", history_error)
             text.insert("end", "Recorded periods (local time)\n")
+            text.insert("end", "\nDaily energy (not inferred from graph lines)\n")
+            for row in result.get("daily_energy", []):
+                total = "Incomplete" if row["kwh"] is None else f"{row['kwh']:.3f} kWh"
+                text.insert("end", f"{row['date']}: {total} — {row['status']}\n")
             if result.get("off_peak"):
                 text.insert("end", "Upper band: last confirmed state. Thin lower band: requested operation.\n"
                             "Unavailable means supply or connection unknown; not proven off-peak loss.\n")
@@ -867,7 +1044,8 @@ class SprinklerApp(ctk.CTk):
             for row in result["events"]:
                 stamp = datetime.fromisoformat(row["timestamp"]).astimezone().strftime("%d/%m %H:%M:%S")
                 text.insert("end", f"{stamp}: {row['event']} — {row['reason']}\n")
-            text.insert("end", "\n15-minute snapshots (not averages; short runs can occur between samples)\n"
+            interval_minutes = result.get("sample_interval_seconds", 300) // 60
+            text.insert("end", f"\n{interval_minutes}-minute snapshots (not averages; short runs can occur between samples)\n"
                         "Time | State | W | Today kWh | Month kWh | V | A | Status\n")
             for row in result.get("samples", []):
                 stamp = datetime.fromisoformat(row["timestamp"]).astimezone().strftime("%d/%m %H:%M")
@@ -878,17 +1056,35 @@ class SprinklerApp(ctk.CTk):
                 text.insert("end", f"{stamp} | {state} | {' | '.join(values)} | {row['error'] or 'Read'} "
                             f"(actual read: {actual})\n")
             text.configure(state="disabled")
-            draw()
+
+        def show_details() -> None:
+            nonlocal details_window, text
+            if details_window is not None and details_window.winfo_exists():
+                details_window.lift()
+                return
+            details_window = ctk.CTkToplevel(window)
+            details_window.title(f"Zone {channel + 1}: Recorded periods & details")
+            details_window.geometry("900x600")
+            details_window.grid_columnconfigure(0, weight=1)
+            details_window.grid_rowconfigure(0, weight=1)
+            text = ctk.CTkTextbox(details_window, wrap="word")
+            text.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
+            update_details()
 
         def refresh() -> None:
             button.configure(state="disabled")
-            threading.Thread(target=fetch, daemon=True).start()
+            range_menu.configure(state="disabled")
+            threading.Thread(target=fetch, args=(ranges[history_range.get()],), daemon=True).start()
             receive()
 
         canvas.bind("<Configure>", draw)
-        sample_canvas.bind("<Configure>", draw)
-        button = ctk.CTkButton(window, text="Refresh history", command=refresh)
-        button.grid(row=6, column=0, pady=8)
+        for sample_canvas in sample_canvases.values():
+            sample_canvas.bind("<Configure>", draw)
+        button = ctk.CTkButton(controls, text="Refresh history", command=refresh)
+        button.grid(row=0, column=0, padx=6)
+        details_button = ctk.CTkButton(controls, text="Recorded periods & details",
+                                     command=show_details, state="disabled", width=220)
+        details_button.grid(row=0, column=1, padx=6)
         refresh()
 
     def show_history(self) -> None:
@@ -1134,6 +1330,7 @@ class SprinklerApp(ctk.CTk):
                 self.fields[bank:bank + 8], self.controller.zones[bank:bank + 8],
             ):
                 fields.enabled.set(zone.enabled)
+                fields.continuous_schedule.set(zone.continuous_schedule)
                 for variables, row in zip(fields.schedule, zone.schedule):
                     for variable, value in zip(variables, row):
                         variable.set(value)
@@ -1214,6 +1411,9 @@ class SprinklerApp(ctk.CTk):
         self.channel_summary: ctk.CTkLabel | None = None
         self.pump_setting: ctk.CTkSwitch | None = None
         self.rain_setting: ctk.CTkSwitch | None = None
+        self.appliance_all_day_var: tk.BooleanVar | None = None
+        self.appliance_all_day_switch: ctk.CTkSwitch | None = None
+        self.appliance_all_day_help: ctk.CTkLabel | None = None
         self.window_pause_buttons = []
         self.schedule_entries: dict[tuple[int, int], ctk.CTkEntry] = {}
         if channel == self.controller.master_channel:
@@ -1318,8 +1518,37 @@ class SprinklerApp(ctk.CTk):
         ctk.CTkLabel(self.editor, text="DAILY SCHEDULE - UP TO FOUR WINDOWS", anchor="w").grid(
             row=3, column=0, columnspan=2, padx=12, pady=(6, 0), sticky="ew"
         )
+        schedule_row_offset = 0
+        if channel >= 8:
+            schedule_row_offset = 2
+            self.appliance_all_day_var = fields.continuous_schedule
+            self.appliance_all_day_switch = ctk.CTkSwitch(
+                self.editor,
+                text="Run continuously - 24/7 (saved routine)",
+                variable=self.appliance_all_day_var,
+                command=self._toggle_appliance_all_day,
+            )
+            self.appliance_all_day_switch.grid(
+                row=4, column=0, columnspan=2, padx=12, pady=(2, 0), sticky="w"
+            )
+            self.appliance_all_day_help = ctk.CTkLabel(
+                self.editor,
+                text="No midnight OFF/ON cycle. ON enables a continuous routine; OFF disables it. "
+                "Timed windows are preserved but ignored in 24/7 mode. "
+                "Start 1 Pause controls the whole 24/7 routine; unpausing resumes immediately.",
+                text_color=GREY,
+                anchor="w",
+                justify="left",
+                wraplength=700,
+            )
+            self.appliance_all_day_help.grid(
+                row=5, column=0, columnspan=2, padx=12, pady=(0, 2), sticky="ew"
+            )
         copy_controls = ctk.CTkFrame(self.editor, fg_color="transparent")
-        copy_controls.grid(row=4, column=0, columnspan=2, padx=12, pady=(4, 0), sticky="w")
+        options.grid_configure(row=8 + schedule_row_offset)
+        copy_controls.grid(
+            row=4 + schedule_row_offset, column=0, columnspan=2, padx=12, pady=(4, 0), sticky="w"
+        )
         self.schedule_day_menu = ctk.CTkOptionMenu(
             copy_controls, variable=self.schedule_day, values=list(DAY_NAMES), width=85,
             command=lambda _day: self._update_schedule_view(),
@@ -1359,7 +1588,9 @@ class SprinklerApp(ctk.CTk):
         )
         self.copy_day_button.pack(side="left")
         times = ctk.CTkFrame(self.editor, fg_color="transparent")
-        times.grid(row=5, column=0, columnspan=2, padx=12, pady=(4, 4), sticky="ew")
+        times.grid(
+            row=5 + schedule_row_offset, column=0, columnspan=2, padx=12, pady=(4, 4), sticky="ew"
+        )
         times.grid_columnconfigure(0, weight=0)
         for column in range(1, WINDOW_COUNT * 2 + 1):
             times.grid_columnconfigure(column, weight=0)
@@ -1425,7 +1656,9 @@ class SprinklerApp(ctk.CTk):
         self._update_schedule_view()
         self._update_window_pause_buttons()
         self.validation = ctk.CTkLabel(self.editor, text="", anchor="w", wraplength=700)
-        self.validation.grid(row=6, column=0, columnspan=2, padx=12, pady=(0, 4), sticky="ew")
+        self.validation.grid(
+            row=6 + schedule_row_offset, column=0, columnspan=2, padx=12, pady=(0, 4), sticky="ew"
+        )
         ctk.CTkLabel(
             self.editor,
             text="Enter 815, 0815, or 08:15 (24-hour time). Leave a pair blank to skip it. "
@@ -1437,13 +1670,27 @@ class SprinklerApp(ctk.CTk):
             text_color=GREY,
             anchor="w",
             wraplength=700,
-        ).grid(row=7, column=0, columnspan=2, padx=12, pady=(0, 4), sticky="ew")
+        ).grid(
+            row=7 + schedule_row_offset, column=0, columnspan=2, padx=12, pady=(0, 4), sticky="ew"
+        )
         self._validate()
         self._refresh()
 
     def _toggle_schedule_view(self) -> None:
         self.schedule_week_view = not self.schedule_week_view
         self._update_schedule_view()
+
+    def _toggle_appliance_all_day(self) -> None:
+        if self.appliance_all_day_var is None:
+            return
+        fields = self.fields[self.selected]
+        enable = self.appliance_all_day_var.get()
+        self.syncing = True
+        try:
+            fields.enabled.set(enable)
+        finally:
+            self.syncing = False
+        self._edited()
 
     def _update_schedule_view(self) -> None:
         selected_day = DAY_NAMES.index(self.schedule_day.get())
@@ -1503,6 +1750,21 @@ class SprinklerApp(ctk.CTk):
     def _update_window_pause_buttons(self) -> None:
         if self.selected == self.controller.master_channel:
             return
+        all_day = self.fields[self.selected].continuous_schedule.get()
+        if self.appliance_all_day_var is not None:
+            schedule_state = "disabled" if all_day else "normal"
+            assert self.appliance_all_day_switch is not None
+            self.appliance_all_day_switch.configure(
+                state="disabled" if self.faulted or (
+                    isinstance(self.controller, ServiceClient)
+                    and not self.controller.continuous_schedule_supported
+                ) else "normal"
+            )
+            self.schedule_day_menu.configure(state=schedule_state)
+            self.schedule_view_button.configure(state=schedule_state)
+            self.copy_day_button.configure(state=schedule_state)
+            for entry in self.schedule_entries.values():
+                entry.configure(state=schedule_state)
         for button, variable in zip(
             self.window_pause_buttons, self.fields[self.selected].paused_windows
         ):
@@ -1510,7 +1772,11 @@ class SprinklerApp(ctk.CTk):
                 text="Paused" if variable.get() else "Not Paused",
                 fg_color=RED if variable.get() else "#35465a",
                 hover_color="#92313c" if variable.get() else "#445b73",
-                state="disabled" if self.faulted else "normal",
+                state=(
+                    "disabled"
+                    if self.faulted or (self.appliance_all_day_var is not None and all_day and button is not self.window_pause_buttons[0])
+                    else "normal"
+                ),
             )
 
     def _validate(self) -> None:
@@ -1754,7 +2020,7 @@ class SprinklerApp(ctk.CTk):
                 )
         if run is not None:
             if run.deadline is None:
-                text = "RELAY ON / Continuous / Until stopped"
+                text = "RELAY ON / 24/7 routine / No daily stop" if run.source == "Routine" else "RELAY ON / Continuous / Until stopped"
             else:
                 seconds = max(0, math.ceil(run.deadline - self.controller.clock()))
                 ends = (now + timedelta(seconds=seconds)).strftime("%a %H:%M")
@@ -1777,7 +2043,9 @@ class SprinklerApp(ctk.CTk):
             text = "UNASSIGNED TAPO PLUG / output unavailable\nSchedules blocked until a device is assigned."
         elif not master_selected:
             next_start = next_scheduled_start(self.controller.zones[self.selected], now)
-            next_text = next_start.strftime("%a %d %b %H:%M") if next_start else "none"
+            next_text = ("24/7 routine (no daily start/stop)"
+                         if self.controller.zones[self.selected].continuous_schedule
+                         else next_start.strftime("%a %d %b %H:%M") if next_start else "none")
             text += "\nNext scheduled start: " + next_text
             if self.controller.rain_paused and not self.controller.zones[self.selected].rain_pause_exempt:
                 text += " (blocked while Rain Pause is on)"
@@ -1993,8 +2261,10 @@ class SprinklerApp(ctk.CTk):
         try:
             if self.selected in self.controller.channel_faults:
                 self.controller.retry_station(self.selected, datetime.now())
+                self._persist_continuous_stops((self.selected,))
             elif self.selected in self.controller.runs:
                 self.controller.stop(self.selected, datetime.now())
+                self._persist_continuous_stops((self.selected,))
             else:
                 fields = self.fields[self.selected]
                 maximum = fields.manual_maximum()
@@ -2070,6 +2340,7 @@ class SprinklerApp(ctk.CTk):
     def stop_all(self) -> None:
         try:
             self.controller.stop_all(datetime.now())
+            self._persist_continuous_stops(range(self.controller.channel_count))
         except (OSError, RuntimeError, ValueError, ExceptionGroup) as exc:
             self._fault("Relay shutdown failed", exc)
         self._refresh()
@@ -2077,11 +2348,31 @@ class SprinklerApp(ctk.CTk):
     def stop_group(self, bank: int) -> None:
         try:
             self.controller.stop_group(bank, datetime.now())
+            self._persist_continuous_stops(range(bank, bank + 8))
         except ValueError as exc:
             messagebox.showerror("Group stop rejected", str(exc), parent=self)
         except (OSError, RuntimeError, ExceptionGroup) as exc:
             self._fault("Group stop failed", exc)
         self._refresh()
+
+    def _persist_continuous_stops(self, channels: Iterable[int]) -> None:
+        stopped = [
+            channel for channel in channels
+            if self.controller.zones[channel].continuous_schedule
+            and not self.controller.zones[channel].enabled
+        ]
+        if not stopped:
+            return
+        if not self.remote:
+            save_zones(self.settings_path, self.controller.zones)
+        elif not self.dirty:
+            self.edit_revision = self.controller.revision
+        self.syncing = True
+        try:
+            for channel in stopped:
+                self.fields[channel].enabled.set(False)
+        finally:
+            self.syncing = False
 
     def _tick(self) -> None:
         if isinstance(self.controller, ServiceClient):
@@ -2103,6 +2394,8 @@ class SprinklerApp(ctk.CTk):
                                 fields.name.set(zone.name)
                             if fields.enabled.get() != zone.enabled:
                                 fields.enabled.set(zone.enabled)
+                            if fields.continuous_schedule.get() != zone.continuous_schedule:
+                                fields.continuous_schedule.set(zone.continuous_schedule)
                             if fields.rain_pause_exempt.get() != zone.rain_pause_exempt:
                                 fields.rain_pause_exempt.set(zone.rain_pause_exempt)
                             if fields.pump_exempt.get() != zone.pump_exempt:

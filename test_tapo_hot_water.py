@@ -224,6 +224,21 @@ class HotWaterServiceTests(unittest.TestCase):
         self.assertTrue(self.service.controller.garden_fault)
         self.assertTrue(self.output.status()["requested_state"])
 
+    def test_saved_24_7_keeps_hot_water_request_on_across_midnight_and_supply_loss(self):
+        from datetime import timedelta
+        zones = list(self.service.controller.zones)
+        zones[15] = replace(zones[15], enabled=True, continuous_schedule=True)
+        before_midnight = self.now.replace(hour=23, minute=58)
+        self.service.controller.apply(zones, before_midnight)
+        self.assertTrue(self.output.status()["requested_state"])
+        generation = self.output.generation
+        self.output.state = None
+        self.output.error = "Supply or connection unknown"
+        for offset in (timedelta(minutes=1), timedelta(minutes=2), timedelta(days=1)):
+            self.service.controller.tick(before_midnight + offset)
+            self.assertTrue(self.output.status()["requested_state"])
+            self.assertEqual(self.output.generation, generation)
+
     def test_details_and_timeline_expose_policy_and_not_confirmed_on(self):
         self.service.controller.start_manual(15, self.now)
         details = self.service.dispatch({"command": "tapo_details"})["rows"]

@@ -11,6 +11,31 @@ from test_service import FakeDevice
 
 
 class DetailsServiceTests(unittest.TestCase):
+    def test_health_is_read_only_and_disk_failure_is_reported(self):
+        with tempfile.TemporaryDirectory() as directory:
+            primary = FakeDevice()
+            service = Service(Path(directory) / "settings.json", primary)
+            before = list(primary.calls)
+            result = service.dispatch({"command": "system_health"})
+            checks = {row["label"]: row["value"] for row in result["checks"]}
+            self.assertIn("Responding", checks["Controller"])
+            self.assertEqual(checks["Restart required"], "No")
+            self.assertIn("GiB", checks["Free configuration disk space"])
+            from types import SimpleNamespace
+            with patch("service.shutil.disk_usage", return_value=SimpleNamespace(free=10)):
+                result = service.dispatch({"command": "system_health"})
+                self.assertIn("LOW", next(row["value"] for row in result["checks"]
+                                         if row["label"] == "Free configuration disk space"))
+            service.running_version = "old-test-version"
+            checks = {row["label"]: row["value"] for row in service.system_health()["checks"]}
+            self.assertEqual(checks["Restart required"], "Yes")
+            with patch("service.shutil.disk_usage", side_effect=OSError("Disk unavailable")):
+                result = service.dispatch({"command": "system_health"})
+                self.assertIn("Unavailable", next(row["value"] for row in result["checks"]
+                                                 if row["label"] == "Free configuration disk space"))
+            self.assertEqual(primary.calls, before)
+            self.assertFalse(service.fault)
+
     def test_timeline_rejects_unassigned_or_invalid_channel_without_fault(self):
         with tempfile.TemporaryDirectory() as directory:
             primary = FakeDevice()

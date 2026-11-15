@@ -24,20 +24,77 @@ let tapoGraphChannel = null;
 let tapoGraphRequestId = 0;
 const tapoGraph = document.querySelector("#tapo-graph");
 let tapoSampleData = null;
+const healthDialog = document.querySelector("#health-dialog");
+let healthRequestId = 0;
+document.querySelector("#health-close").addEventListener("click", () => { healthRequestId += 1; healthDialog.close(); });
+document.querySelector("#health-refresh").addEventListener("click", loadHealth);
+document.querySelector("#open-health").addEventListener("click", () => { healthDialog.showModal(); loadHealth(); });
 
-document.querySelector("#tapo-metric").addEventListener("change", drawTapoSamples);
+async function loadHealth() {
+  const id = ++healthRequestId;
+  const status = document.querySelector("#health-status");
+  const checks = document.querySelector("#health-checks");
+  checks.replaceChildren();
+  status.textContent = "Checking system health...";
+  try {
+    const {health} = await request("/api/system-health");
+    if (id !== healthRequestId || !healthDialog.open) return;
+    status.textContent = `Checked: ${new Date(health.checked_at).toLocaleString()}`;
+    for (const row of health.checks) {
+      const label = document.createElement("dt");
+      label.textContent = row.label;
+      const value = document.createElement("dd");
+      value.textContent = row.value;
+      checks.append(label, value);
+    }
+  } catch (error) {
+    if (id === healthRequestId) status.textContent = `System health unavailable: ${error.message}`;
+  }
+}
+
+function showTapoRecordedDetails(show) {
+  document.querySelector("#tapo-graph-overview").classList.toggle("hidden", show);
+  document.querySelector("#tapo-recorded-details").classList.toggle("hidden", !show);
+  document.querySelector(show ? "#tapo-details-back" : "#tapo-details-open").focus();
+}
+document.querySelector("#tapo-details-open").addEventListener("click", () => showTapoRecordedDetails(true));
+document.querySelector("#tapo-details-back").addEventListener("click", () => showTapoRecordedDetails(false));
+
+function tapoGraphTime(value, includeDate = false) {
+  const date = new Date(value);
+  const time = `${date.getHours() % 12 || 12}:${String(date.getMinutes()).padStart(2, "0")} ${date.getHours() < 12 ? "am" : "pm"}`;
+  return includeDate ? `${date.getDate()}/${date.getMonth() + 1} ${time}` : time;
+}
 
 function drawTapoSamples() {
-  const svg = document.querySelector("#tapo-sample-graph");
-  svg.replaceChildren();
+  const cards = document.querySelector("#tapo-sample-graphs");
+  cards.replaceChildren();
   if (!tapoSampleData) return;
-  const metric = document.querySelector("#tapo-metric").value;
+  const metrics = [
+    ["power_w", "Power (W)", "W", "#17283b"],
+    ["voltage_v", "Voltage (V)", "V", "#193326"],
+    ["current_a", "Current (A)", "A", "#30223b"],
+    ["state", "Reported state (ON=1, OFF=0)", "", "#173438"],
+    ["today_kwh", "Today cumulative counter (kWh)", "kWh", "#392d1c"],
+    ["month_kwh", "Month cumulative counter (kWh)", "kWh", "#29313d"],
+  ];
+  const rows = tapoSampleData.samples || [];
+  const latest = rows.reduce((last, row) => !last || Date.parse(row.timestamp) > Date.parse(last.timestamp) ? row : last, null);
+  for (const [metric, heading, unit, color] of metrics) {
+  const card = document.createElement("section");
+  card.className = "tapo-sample-card";
+  card.style.backgroundColor = color;
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 400 180");
+  svg.setAttribute("role", "img");
+  svg.setAttribute("aria-label", `${heading}: recorded measurements over selected period`);
+  card.append(svg);
   const value = row => row.error || row[metric] === null || row[metric] === undefined
     ? null : metric === "state" ? Number(row.state) : row[metric];
-  const rows = tapoSampleData.samples || [];
   const valid = rows.map(value).filter(v => v !== null && Number.isFinite(v));
   const max = Math.max(1, ...valid);
   const start = Date.parse(tapoSampleData.start);
+  const duration = Date.parse(tapoSampleData.end) - start;
   const ns = "http://www.w3.org/2000/svg";
   let previous = null;
   for (const row of rows) {
@@ -46,7 +103,7 @@ function drawTapoSamples() {
       previous = null;
       continue;
     }
-    const x = 50 + (Date.parse(row.timestamp) - start) / 86400000 * 735;
+    const x = 75 + (Date.parse(row.timestamp) - start) / duration * 310;
     const y = 140 - number / max * 115;
     if (previous) {
       const line = document.createElementNS(ns, "line");
@@ -59,17 +116,43 @@ function drawTapoSamples() {
     dot.setAttribute("cx", String(x)); dot.setAttribute("cy", String(y));
     dot.setAttribute("r", "3"); dot.setAttribute("fill", "#f6b73c");
     const title = document.createElementNS(ns, "title");
-    title.textContent = `${new Date(row.updated || row.timestamp).toLocaleString()}: ${number}`;
+    title.textContent = `${tapoGraphTime(row.updated || row.timestamp, true)}: ${number}`;
     dot.append(title); svg.append(dot);
     previous = {x,y};
   }
-  for (const [x,y,text] of [[3,25,max.toFixed(3)],[3,140,"0"],[50,170,"24h ago"],[710,170,"Now"]]) {
+  for (const [x,y,text] of [[3,25,max.toFixed(3)],[3,140,"0"],
+    [75,170,tapoGraphTime(start, duration > 86400000)],[230,170,tapoGraphTime(start + duration / 2, duration > 86400000)],
+    [385,170,tapoGraphTime(start + duration, duration > 86400000)]]) {
     const label = document.createElementNS(ns, "text");
     label.setAttribute("x", String(x)); label.setAttribute("y", String(y)); label.setAttribute("fill", "white");
+    label.setAttribute("font-size", y === 170 ? "12" : "14");
+    label.setAttribute("text-anchor", x === 385 ? "end" : x === 230 ? "middle" : "start");
     label.textContent = text; svg.append(label);
   }
+  const title = document.createElement("h4");
+  title.textContent = heading;
+  const reading = document.createElement("p");
+  reading.className = "tapo-sample-reading";
+  const latestValue = latest ? value(latest) : null;
+  reading.textContent = latestValue === null || !Number.isFinite(latestValue) ? "Unavailable"
+    : metric === "state" ? latestValue ? "ON" : "OFF" : `${latestValue.toFixed(3)} ${unit}`;
+  const recorded = document.createElement("p");
+  recorded.className = "tapo-sample-recorded";
+  recorded.textContent = latest
+    ? `${latest.error ? "Sample failed" : "Recorded"}: ${tapoGraphTime(latest.error ? latest.timestamp : latest.updated || latest.timestamp, true)}`
+    : "No recorded sample";
+  if (latest) {
+    const stamp = latest.error ? latest.timestamp : latest.updated || latest.timestamp;
+    recorded.textContent += ` (${Math.max(0, Math.floor((Date.now() - Date.parse(stamp)) / 60000))} min ago)`;
+  }
+  const count = document.createElement("p");
+  count.className = "tapo-sample-recorded";
+  count.textContent = `${valid.length} snapshots; gaps are not zero`;
+  card.append(title, reading, recorded, count);
+  cards.append(card);
+  }
   document.querySelector("#tapo-sample-status").textContent =
-    `${valid.length} available ${document.querySelector("#tapo-metric").selectedOptions[0].textContent} readings out of ${rows.length} intervals. `
+    `${rows.length} intervals (${tapoSampleData.sample_interval_seconds / 60} minutes each). `
     + "Recording starts when enabled; earlier measurements cannot be reconstructed. "
     + (tapoSampleData.samples_warning || "");
 }
@@ -78,6 +161,8 @@ function closeTapoGraph() {
   tapoGraphChannel = null;
   tapoGraphRequestId += 1;
   tapoGraph.classList.add("hidden");
+  document.querySelector("#tapo-graph-overview").classList.remove("hidden");
+  document.querySelector("#tapo-recorded-details").classList.add("hidden");
   document.querySelector(".tapo-table-scroll").classList.remove("hidden");
   tapoRefresh.classList.remove("hidden");
 }
@@ -282,9 +367,14 @@ document.querySelector("#tapo-graph-back").addEventListener("click", () => {
   loadTapo();
 });
 document.querySelector("#tapo-graph-refresh").addEventListener("click", () => openTapoGraph(tapoGraphChannel));
+document.querySelector("#tapo-range").addEventListener("change", () => openTapoGraph(tapoGraphChannel));
 
 async function openTapoGraph(channel) {
   if (channel === null || !tapoView) return;
+  if (tapoGraphChannel !== channel) {
+    document.querySelector("#tapo-graph-overview").classList.remove("hidden");
+    document.querySelector("#tapo-recorded-details").classList.add("hidden");
+  }
   tapoGraphChannel = channel;
   tapoRequestId += 1;
   window.clearTimeout(tapoTimer);
@@ -304,17 +394,25 @@ async function openTapoGraph(channel) {
   drawTapoSamples();
   document.querySelector("#tapo-sample-rows").replaceChildren();
   document.querySelector("#tapo-sample-status").textContent = "";
+  document.querySelector("#tapo-daily-energy").replaceChildren();
   periods.replaceChildren();
   events.replaceChildren();
   document.querySelector("#tapo-timeline-range").textContent = "";
   status.textContent = "Loading controller history...";
   refreshButton.disabled = true;
   try {
-    const {timeline} = await request(`/api/tapo-timeline?channel=${channel}`);
+    const {timeline} = await request(`/api/tapo-timeline?channel=${channel}&hours=${document.querySelector("#tapo-range").value}`);
     if (id !== tapoGraphRequestId || !tapoView || tapoGraphChannel !== channel) return;
+    document.querySelector("#tapo-graph-heading").textContent =
+      `${document.querySelector("#tapo-range").selectedOptions[0].textContent} controller switching history`;
     status.textContent = `${timeline.name} — confirmed/recorded ON: ${(timeline.on_seconds / 3600).toFixed(2)} hours. ${timeline.description} ${timeline.warning}`;
     tapoSampleData = timeline;
     drawTapoSamples();
+    for (const row of timeline.daily_energy || []) {
+      const item = document.createElement("li");
+      item.textContent = `${row.date}: ${row.kwh === null ? "Incomplete" : row.kwh.toFixed(3) + " kWh"} — ${row.status}`;
+      document.querySelector("#tapo-daily-energy").append(item);
+    }
     const sampleRows = document.querySelector("#tapo-sample-rows");
     for (const row of timeline.samples || []) {
       const tr = document.createElement("tr");
@@ -330,12 +428,12 @@ async function openTapoGraph(channel) {
       }
       sampleRows.append(tr);
     }
-    const local = value => new Date(value).toLocaleString();
+    const local = value => tapoGraphTime(value, true);
     document.querySelector("#tapo-timeline-range").textContent = `${local(timeline.start)} — ${local(timeline.end)}`;
     for (const row of timeline.segments) {
       const label = `${local(row.start)} — ${local(row.end)}: ${row.state} (${(row.seconds / 60).toFixed(1)} minutes)`;
       const band = document.createElement("span");
-      band.style.width = `${row.seconds / 86400 * 100}%`;
+      band.style.width = `${row.seconds / ((Date.parse(timeline.end) - Date.parse(timeline.start)) / 1000) * 100}%`;
       band.style.backgroundColor = {ON:"#238636",OFF:"#3178b6",Unknown:"#777777"}[row.state];
       band.title = label;
       graph.append(band);
@@ -354,7 +452,7 @@ async function openTapoGraph(channel) {
     if (timeline.off_peak) {
       for (const row of timeline.requested_segments || []) {
         const band = document.createElement("span");
-        band.style.width = `${row.seconds / 86400 * 100}%`;
+        band.style.width = `${row.seconds / ((Date.parse(timeline.end) - Date.parse(timeline.start)) / 1000) * 100}%`;
         band.style.backgroundColor = {ON:"#238636",OFF:"#3178b6",Unknown:"#777777"}[row.state];
         band.title = `Requested ${row.state}: ${local(row.start)} — ${local(row.end)}`;
         requestedGraph.append(band);
@@ -407,6 +505,9 @@ function signedIn() {
 }
 
 function signedOut() {
+  healthRequestId += 1;
+  healthDialog.close();
+  document.querySelector("#health-checks").replaceChildren();
   closeTapoGraph();
   resetExitPrompt();
   historyRequestId += 1;
@@ -651,7 +752,7 @@ function renderStatus(status) {
         Date.now() + zone.running.remaining * 1000,
       ).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
       state.textContent = zone.running.remaining === null
-        ? "Continuous · ON until stopped"
+        ? zone.running.source === "Routine" ? "24/7 routine · ON · no daily stop" : "Continuous · ON until stopped"
         : `${zone.running.source} · ON until about ${end} · ${formatRemaining(zone.running.remaining)}`;
     } else {
       state.textContent = "Off";
@@ -679,8 +780,10 @@ function renderStatus(status) {
     if (!zone.master && !status.fault && zone.available !== false && status.next_schedule_supported) {
       const next = document.createElement("p");
       next.className = "channel-state";
-      next.textContent = `Next scheduled start (controller local time): ${zone.next_start
-        ? zone.next_start.replace("T", " ") : "none"}`;
+      next.textContent = zone.continuous_schedule
+        ? `24/7 routine: ${zone.enabled ? "enabled — no daily OFF/ON cycle" : "stopped — resume explicitly"}`
+        : `Next scheduled start (controller local time): ${zone.next_start
+          ? zone.next_start.replace("T", " ") : "none"}`;
       if (status.rain_paused && !zone.rain_pause_exempt) {
         next.textContent += " — blocked while Rain Pause is on";
       }
@@ -834,7 +937,37 @@ function renderStatus(status) {
       scheduleTitle.textContent = "Scheduled watering";
       const pauseHelp = document.createElement("p");
       pauseHelp.className = "channel-state";
-      pauseHelp.textContent = "Each group applies across all weekdays. Pausing stops that group's scheduled run, not manual watering. Unpausing waits for its next start.";
+      pauseHelp.textContent = zone.continuous_schedule
+        ? "Group 1 pauses the entire 24/7 routine. Unpausing resumes immediately. Other groups and timed windows are ignored."
+        : "Each group applies across all weekdays. Pausing stops that group's scheduled run, not manual watering. Unpausing waits for its next start.";
+      if (zone.channel >= 8) {
+        const continuousSchedule = document.createElement("button");
+        continuousSchedule.type = "button";
+        continuousSchedule.className = "quiet";
+        continuousSchedule.textContent = zone.continuous_schedule
+          ? zone.enabled ? "Turn off 24/7 routine" : "Resume 24/7 routine" : "Enable saved 24/7 routine";
+        continuousSchedule.disabled = !status.continuous_schedule_supported || Boolean(
+          status.fault || status.restore_restart_required || zone.fault || zone.available === false,
+        );
+        continuousSchedule.addEventListener("click", async () => {
+          const enabled = !zone.continuous_schedule || !zone.enabled;
+          if (!window.confirm(enabled
+            ? "Enable saved 24/7 operation? There is no daily OFF cycle. It can start immediately and resumes after restart unless stopped or paused."
+            : "Disable the saved 24/7 routine? Timed windows are preserved but the routine is disabled.")) return;
+          continuousSchedule.disabled = true;
+          try {
+            const result = await request("/api/continuous-schedule", {
+              method: "POST",
+              body: JSON.stringify({channel: zone.channel, enabled, revision: status.revision}),
+            });
+            renderStatus(result.status);
+          } catch (error) {
+            await refresh();
+            showNotice(`Cannot change 24/7 routine: ${error.message}`);
+          }
+        });
+        schedules.append(continuousSchedule);
+      }
       const groups = document.createElement("div");
       groups.className = "pause-groups";
       for (let group = 0; group < 4; group += 1) {
@@ -844,7 +977,7 @@ function renderStatus(status) {
         pause.className = paused ? "danger" : "quiet";
         pause.textContent = `Group ${group + 1}: ${paused ? "Paused" : "Not Paused"}`;
         pause.setAttribute("aria-pressed", String(Boolean(paused)));
-        pause.disabled = typeof paused !== "boolean" || Boolean(
+        pause.disabled = (zone.continuous_schedule && group > 0) || typeof paused !== "boolean" || Boolean(
           status.fault || status.restore_restart_required || zone.available === false,
         );
         pause.addEventListener("click", async () => {

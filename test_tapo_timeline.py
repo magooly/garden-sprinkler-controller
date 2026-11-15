@@ -29,6 +29,14 @@ class TimelineTests(unittest.TestCase):
         self.assertEqual(result["segments"][0]["seconds"], 86400)
         self.assertEqual(result["on_seconds"], 0)
 
+    def test_history_ranges_cover_requested_duration(self):
+        for hours in (6, 24, 168):
+            result = self.history.timeline(8, self.now, hours)
+            self.assertEqual(sum(row["seconds"] for row in result["segments"]), hours * 3600)
+        for hours in (True, 0, "24", 7):
+            with self.assertRaises(ValueError):
+                self.history.timeline(8, self.now, hours)
+
     def test_prior_state_boundaries_duration_and_other_channels(self):
         self.event(-25, "ON")
         self.event(-20, "OFF")

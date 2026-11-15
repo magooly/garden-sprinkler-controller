@@ -1,12 +1,13 @@
 # Garden Sprinkler Controller
 
-Version **1.4.0**
+Version **1.5.0**
 
 Documentation updated **14 November 2026**.
 
-Version 1.4.0 includes independent garden/appliance fault handling, off-peak
-hot-water reconciliation, Tapo details and 24-hour graphs with 15-minute
-measurements, and compact phone stop controls.
+Version 1.5.0 adds true saved 24/7 appliance routines, desktop/phone graph
+dashboards, system-health views, quieter telemetry warnings, and 6-hour,
+24-hour and 7-day histories with five-minute measurements. Garden/appliance
+fault isolation, off-peak reconciliation and compact phone stops are preserved.
 
 [Read the printable user and installation guide (PDF)](README.pdf).
 The guide includes a clickable contents page, numbered pages and formatted
@@ -27,13 +28,13 @@ An optional phone web interface can be reached privately over Tailscale.
 | Control or status | What it means |
 |---|---|
 | Stations 1-8 | Seven garden zones and the automatic station 8 master pump. Garden hardware faults stop only this group when 16 outputs are configured. |
-| Stations 9-16 | Independent appliance outputs. An ordinary plug fault affects only that station, not the garden or other working appliances. |
+| Stations 9-16 | Independent appliance outputs. An ordinary plug fault affects only that station. **Run continuously - 24/7** is a saved mode with no daily OFF/ON cycle. |
 | Stop Garden (1-8) | Attempts OFF only for the garden group, pump first. Current garden schedule windows are suppressed. |
 | Stop Appliances (9-16) | Attempts OFF only for appliances. Current appliance schedule windows are suppressed. |
 | Stop Everything | Attempts OFF for both groups. An unreachable output cannot confirm OFF. |
 | Retry station / RETRY STATION (OFF) | Confirms an ordinary faulted appliance OFF before clearing its fault. It does not restart a missed run. |
 | Rain Pause | Stops/blocks included stations in either group. Saved exemptions remain active. |
-| Show Tapo Details | Read-only measurements and clickable 24-hour graphs; failed telemetry is a gap, not zero. |
+| Show Tapo Details | Read-only measurements and clickable 6-hour/24-hour/7-day graphs; failed telemetry is a gap, not zero. |
 
 The phone's three red stop buttons use smaller text in one compact, three-across
 row. They retain separate confirmations and tap targets at least 44 CSS pixels
@@ -41,6 +42,30 @@ high. Garden and appliance health are shown separately below them.
 Closing the desktop, signing out or leaving the phone page does not stop equipment.
 Service shutdown/restart, restore hold and shared controller failures can still
 affect both groups; they share one computer and controller service.
+
+For stations **9-16**, select **Run continuously - 24/7 (saved routine)** on
+the desktop, or **Enable saved 24/7 routine** on the phone. This is a separate
+saved scheduling mode, not a `00:00-23:59` time window. It keeps requesting ON
+across midnight and weekdays without a timer or daily relay cycle. Existing
+timed windows are preserved but ignored while this mode is selected. Turning
+the mode off disables the routine; re-enable the timed routine separately if needed.
+Existing `00:00-23:59` schedules are **not automatically converted**; explicitly
+select the new mode after updating.
+
+An enabled 24/7 routine resumes after a normal service restart, subject to Rain
+Pause, restore holds, availability and faults. Start 1 / Group 1 pauses the
+whole 24/7 routine; unpausing it resumes immediately (there is no next start).
+Other group pause buttons are ignored/disabled in this mode. **Stop**, **Stop
+Appliances**, **Stop Everything**, and successful ordinary-station retry disable
+the affected saved 24/7 routines. That stopped state is saved and survives a
+restart. To resume, re-enable the desktop routine (or toggle 24/7 off/on), or
+press **Resume 24/7 routine** on the phone. For off-peak hot water, ON remains a
+request, not proof of available supply or heating; it is reconciled when the
+plug becomes reachable.
+
+Update/restart **both services** and reopen the desktop before using this
+feature. Settings now use format version 10; versions 1-9 still load without
+changing their schedules. Older application versions cannot read version 10.
 
 ## Setup and launch
 
@@ -247,7 +272,7 @@ Telemetry failures do not stop watering. This does not
 change the controller's existing fault policy for switching failures. Readings
 are not proof of electrical isolation or appliance operation.
 
-Click a plug row (or select it and press Enter) for its last 24 hours of
+Click a plug row (or select it and press Enter) for its selected period of
 **controller switching history**. Desktop opens a graph window; phone opens a
 graph with Back to Tapo table. ON/OFF bands, local event times, period durations,
 reasons and total recorded ON time come from the retained activity log.
@@ -258,18 +283,79 @@ this is not a historical power-usage graph. Refresh history updates the view
 without reading or switching plugs.
 
 The controller now also records a snapshot from each assigned plug every
-15 minutes, even with desktop and phone closed. Sampling starts in the current
-quarter-hour slot after startup and runs in the telemetry worker, not the
-switching loop. The graph's measurement selector shows watts, volts, amps,
-reported state or daily/monthly energy counters, with a table of actual reading
-times. These are snapshots, not interval averages; brief runs can be missed.
+five minutes, even with desktop and phone closed. Sampling starts in the current
+five-minute slot after startup and runs in the telemetry worker, not the
+switching loop. On the desktop, all six measurement graphs appear together in
+two columns: power and voltage, current and reported state, then today's and
+this month's cumulative energy counters. Each graph has its own scale and a
+matching time axis for the selected period; there is no measurement dropdown. The window opens
+to suit the screen and adjusts plot heights so all three rows fit without
+scrolling at normal desktop sizes. Each complete panel has a thin white border
+and its own dark background, with white labels. On unusually small windows,
+mouse-wheel scrolling and the scrollbar remain available rather than clipping
+readings or making plots unreadably small.
+Graph headings sit below each plot, followed by a large bold latest recorded
+value with units (or ON/OFF) and its recorded time. Failed or missing latest
+samples show Unavailable, not an older value; failed history refreshes mark
+retained readings stale. Scale numbers are larger, and graph axes and reading
+times use 12-hour am/pm notation, including the top switching timeline.
+**Recorded periods & details** opens a separate window with the switching
+periods, events/reasons and a table of actual reading times; an open details
+window updates when you use **Refresh history**. On the phone, all six graphs
+are stacked vertically with no measurement selector. Each full-width panel
+uses the same white border, distinct dark background, heading below the plot,
+large recorded value and am/pm timestamp as the desktop. **Recorded periods &
+details** opens a separate view for the periods, events and measurement table;
+**Back to graphs** returns to the plots. Refresh history and Back to Tapo table
+remain available in either view. Reload the phone page to load this layout.
+These are snapshots, not interval averages; brief runs can be missed.
+Use **History period** on the phone or the desktop range menu to choose
+**6 hours**, **24 hours** (default), or **7 days**. Both the switching bands
+and measurement plots use the selected period. The event log is still bounded
+to 1,000 events: seven days of switching events are not guaranteed. Measurement
+history has its own eight-day retention and missing data remains gaps.
+Recorded readings show their age in minutes; that is not a live power guarantee.
+Daily energy appears under **Recorded periods & details**. A full-day total
+is shown only when actual readings bracket both exact local midnights, with
+uninterrupted samples and a monotonic monthly counter. Missing boundaries,
+counter resets (including month changes), gaps and the current partial day
+show **Incomplete**. Values are never estimated by joining graph points.
 Missing or failed samples break the line, rather than becoming zero. Counters
 can reset at day/month boundaries and are not interval consumption.
-Recording cannot reconstruct earlier readings. The separate private
-`settings.json.tapo-samples.sqlite3` retains 25 hours, survives restarts and
+Recording cannot reconstruct earlier readings.
+Existing quarter-hour readings are preserved after the five-minute upgrade;
+the new intermediate slots remain gaps until recorded. Restart the background
+controller service to activate the new cadence, then reopen desktop/reload phone.
+The separate private
+`settings.json.tapo-samples.sqlite3` retains eight days, survives restarts and
 separates readings by plug MAC. It is not currently included in full-system
 backups. Sampling/storage failures are reported without latching a watering
 fault; switching failures follow the independent group/station policy below.
+Five-minute polling and off-peak control retries are unchanged. Identical
+per-plug telemetry failures are logged on the first failure and every twelfth
+repeat, with changes and recovery logged separately. Each failed scheduled
+sample is still stored as a gap; reduced logging does not hide the UI warning.
+
+### System health and recovery practice
+
+Use **System health** on desktop or phone for a read-only snapshot of controller
+response, running/installed version, restart requirement, recorded board and
+station faults, storage errors, free configuration-disk space and each plug's
+requested operation, last-confirmed state/time and telemetry age. The phone
+also confirms that its own service responded. **Refresh health** updates this
+snapshot; it does not switch outputs or probe the plugs. A board with no
+recorded fault is not proof of present connectivity or electrical operation.
+Unavailable monitoring and disk checks are reported explicitly.
+
+Keep the phone listener on `127.0.0.1`, use private Tailscale HTTPS, and do not
+port-forward it to the internet. Credentials and runtime databases must remain
+outside Git. Preserve a complete encrypted local backup after releases and
+copy it to a separate drive yourself; retain the password separately in a
+trusted password manager or another secure place. A lost password cannot be
+recovered. Test recovery into a private temporary directory with hardware
+access disabled, never over the live installation. The manual COMPLETE archive
+includes the telemetry database and environments; the application's portable
+`.sprinkler-backup` has the narrower scope described below.
 
 ## Independent garden and appliance fault groups
 
@@ -342,7 +428,7 @@ time for OFF and logs explicitly if it cannot be confirmed.
 The graph separates requested operation from last-confirmed ON/OFF history.
 An unreachable observation starts an Unknown period; no definite loss-of-supply
 time or cause is inferred. Outages can occur between checks. Last confirmation
-is a historical observation, not continuous proof. The 15-minute measurement
+is a historical observation, not continuous proof. The five-minute measurement
 graphs remain snapshots with gaps for failed readings.
 
 An unpowered plug cannot receive commands. "Unavailable" could mean off-peak
@@ -479,7 +565,7 @@ Use **STOP**, the relevant group stop, or **Stop Everything** to end it.
 Per-channel master pump exclusions
 and Rain Pause exemptions apply to both options: pump-excluded channels do
 not start the pump, and Rain Pause stops/blocks non-exempt channels.
-Continuous runs are not saved and do not resume after controller restart;
+Manual **Until stopped** runs are not saved and do not resume after controller restart;
 hardware faults stop the affected garden group or appliance station, not
 unrelated outputs.
 Saved schedules may independently start after a restart. If remote access
@@ -489,7 +575,7 @@ Restart both the controller and phone services and reopen the desktop app when
 installing this change. Restarting the controller attempts to turn all outputs
 off; active saved schedules may start again, but manual runs do not resume.
 Choose a safe time to restart. Manual timers are disabled until the updated
-controller is running. Settings saved by the updated app use version 9 and cannot
+controller is running. Settings saved by the updated app use version 10 and cannot
 be read by an older controller. Service
 protocol 2 represents continuous remaining time as JSON `null`, and older
 desktop processes will report an incompatible service until reopened.
@@ -540,8 +626,8 @@ names, schedules, autosave, manual operation, and Rain Pause exemptions just
 like other zones, but **never operate channel 8's master pump**. Channel 8 serves
 only zones 1-7. Daily and weekly overviews include configured second-board channels.
 New second-board schedules start disabled. Settings for either board count
-are saved in version 9, including per-zone master pump exclusions, manual limits,
-and optional continuous-run reminders.
+are saved in version 10, including per-zone master pump exclusions, manual limits,
+optional continuous-run reminders, and appliance 24/7 routine mode.
 
 To disable the second board, stop the service while it is still reachable
 (so its outputs can be switched OFF), remove its `--second-*` arguments, and
@@ -750,7 +836,8 @@ write also requires a separate readback transaction.
   Existing zones remain included in Rain Pause. Version 5 and 6 settings also
   load without losing either board's configuration. Master pump participation
   is unchanged by migration; version 7 settings also load with no manual limit.
-  Version 8 loads with reminders disabled; version 9 is written on the next save.
+  Version 8 loads with reminders disabled. Version 9 loads with 24/7 mode off;
+  version 10 is written on the next save.
 - Validation updates while typing. Valid edits are saved and applied
   automatically about one second after you stop editing, across **all stored zones
   and the preserved channel 8 settings**. Incomplete or invalid settings are
@@ -820,7 +907,7 @@ write also requires a separate readback transaction.
   This is application recovery, not an Ubuntu image: reinstall this repository and
   its requirements on a replacement computer; OS packages, the app executable,
   router/network settings, TLS/Tailscale configuration and unrelated OS secrets
-  are not included. The separate 15-minute telemetry database is **not included**.
+  are not included. The separate five-minute telemetry database is **not included**.
   The device-bound hot-water `off_peak` mapping flag is included.
   The experimental requirements file and virtual environment must be retained
   or recreated separately when the controller uses `.venv-tapo`.
@@ -908,9 +995,10 @@ write also requires a separate readback transaction.
   an unreachable output is never guaranteed OFF. Later scheduled windows
   that day are unaffected. Another manual run can still be started, unless
   Rain Pause is on for that zone.
-  Suppression is not persisted: restarting the service or PC during a saved
+  For timed windows, suppression is not persisted: restarting the service or PC during a saved
   window starts that routine again unless Rain Pause is enabled for that zone. Closing or
-  reopening the desktop does not clear suppression.
+  reopening the desktop does not clear suppression. In contrast, stopping a saved
+  24/7 routine disables it persistently until explicitly re-enabled.
 - A manual watering run replaces that zone's current scheduled run; when the
   timed override ends, the routine does not resume in the same window.
   Disabling a routine and saving stops its scheduled run, but does not cancel
@@ -999,8 +1087,8 @@ The UI and scheduling code use the `RelayBackend` protocol in
 - [tapo_plugs.py](tapo_plugs.py): verified P110M transport, private setup/mapping
   and opt-in hot-water reconciliation.
 - [tapo_details.py](tapo_details.py): read-only telemetry and persistent
-  quarter-hour measurements.
-- [activity_history.py](activity_history.py): bounded event history and 24-hour
+  five-minute measurements.
+- [activity_history.py](activity_history.py): bounded event history and selectable
   requested/confirmed timelines.
 - [phone_server.py](phone_server.py), [phone_ui.html](phone_ui.html),
   [phone_ui.css](phone_ui.css) and [phone_ui.js](phone_ui.js): authenticated
@@ -1028,7 +1116,8 @@ service, Tapo, phone and backup suites below do not need a graphical display:
   test_controller test_waveshare_relay test_service \
   test_group_isolation test_tapo_hot_water test_tapo_plugs \
   test_tapo_details test_tapo_details_service test_tapo_samples \
-  test_tapo_timeline test_phone_server test_system_backup
+  test_tapo_timeline test_phone_server test_system_backup test_continuous_schedule \
+  test_activity_history test_history_display test_timetable_profiles test_schedule_overview
 ```
 
 Tests cover validation, configuration round-trips and failure preservation,
@@ -1049,3 +1138,16 @@ retries, suppressed missed windows and shared-failure shutdown. UI checks cover
 desktop retry and group controls; phone layout has also been checked in-browser
 at 320, 360, 412 and 768 CSS pixels, with all three stop buttons on one row,
 no horizontal overflow and tap heights of at least 44 CSS pixels.
+
+Before each release, run the non-GUI suite and the desktop GUI suite with a
+display, then check phone graphs/navigation at small and wide viewport sizes.
+Include midnight/restart continuous-mode checks, persistent Stop, appliance
+fault isolation, missing telemetry versus real zero, all history ranges,
+incomplete energy totals and health-service failures. GitHub Actions runs all
+Python tests with a virtual display and simulated hardware on pushes and pull
+requests; physical devices are not contacted. For a release, update VERSION
+and all guide formats, commit/push tested source (never private settings),
+then create a complete encrypted archive with its commit identifier.
+Verify decryption, all file hashes, SQLite integrity and isolated extraction;
+check that the restored code can run the simulated tests without starting
+services. Do not start restored controllers against real hardware.

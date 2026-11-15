@@ -346,7 +346,7 @@ class PersistenceTests(unittest.TestCase):
                            continuous_reminder_minutes=30)
         save_zones(self.path, zones)
         self.assertEqual(load_zones(self.path), zones)
-        self.assertEqual(json.loads(self.path.read_text())["version"], 9)
+        self.assertEqual(json.loads(self.path.read_text())["version"], 10)
 
     def test_invalid_save_preserves_file(self) -> None:
         zones = default_zones()
@@ -432,13 +432,14 @@ class PersistenceTests(unittest.TestCase):
             self.assertEqual(zone.schedule, (tuple(row) + ("",) * 4,) * 7)
         self.assertEqual(self.path.read_text(), original)
         save_zones(self.path, zones)
-        self.assertEqual(json.loads(self.path.read_text())["version"], 9)
+        self.assertEqual(json.loads(self.path.read_text())["version"], 10)
         self.assertEqual(load_zones(self.path), zones)
 
     def test_version_three_settings_migrate_with_unpaused_windows(self) -> None:
         data = encode_zones(default_zones())
         data["version"] = 3
         for zone in data["zones"]:
+            del zone["continuous_schedule"]
             del zone["continuous_reminder_minutes"]
             del zone["max_manual_minutes"]
             del zone["paused_windows"]
@@ -454,6 +455,7 @@ class PersistenceTests(unittest.TestCase):
         data = encode_zones(default_zones())
         data["version"] = 4
         for zone in data["zones"]:
+            del zone["continuous_schedule"]
             del zone["continuous_reminder_minutes"]
             del zone["max_manual_minutes"]
             del zone["rain_pause_exempt"]
@@ -469,6 +471,7 @@ class PersistenceTests(unittest.TestCase):
             data = encode_zones(default_zones(count))
             data["version"] = version
             for record in data["zones"]:
+                del record["continuous_schedule"]
                 del record["continuous_reminder_minutes"]
                 del record["max_manual_minutes"]
                 del record["pump_exempt"]
@@ -480,6 +483,7 @@ class PersistenceTests(unittest.TestCase):
         data = encode_zones(default_zones())
         data["version"] = 7
         for zone in data["zones"]:
+            del zone["continuous_schedule"]
             del zone["continuous_reminder_minutes"]
             del zone["max_manual_minutes"]
         self.path.parent.mkdir(exist_ok=True)
@@ -490,6 +494,7 @@ class PersistenceTests(unittest.TestCase):
         data = encode_zones(default_zones())
         data["version"] = 8
         for zone in data["zones"]:
+            del zone["continuous_schedule"]
             del zone["continuous_reminder_minutes"]
         self.path.parent.mkdir(exist_ok=True)
         self.path.write_text(json.dumps(data))

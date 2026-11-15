@@ -33,6 +33,12 @@ def overview_rows(
     for channel, zone in enumerate(zones):
         if channel == master_channel or (hide_disabled and not zone.enabled):
             continue
+        if zone.continuous_schedule:
+            rows.append(ScheduleRow(
+                channel, zone.name or "(Unnamed)", 1, "24/7", "No stop",
+                zone.enabled, 0, 1440, paused=zone.paused_windows[0],
+            ))
+            continue
         for period, (start, stop) in enumerate(
             zip(zone.schedule[day][::2], zone.schedule[day][1::2]), start=1
         ):
@@ -56,9 +62,11 @@ def overview_rows(
     for index, row in enumerate(rows):
         if not row.enabled or row.paused or row.warning:
             continue
+        if row.channel >= 8:
+            continue
         peers = [
             other for other in rows
-            if other.channel != row.channel and other.enabled and not other.paused and not other.warning
+            if other.channel < 8 and other.channel != row.channel and other.enabled and not other.paused and not other.warning
         ]
         # Collect warnings separately so marking one row cannot hide it from peers.
         duplicate = any(other.start_minute == row.start_minute for other in peers)
@@ -262,7 +270,11 @@ class WeeklyOverview(ctk.CTkToplevel):
             for day, rows in enumerate(days):
                 periods = {row.period: row for row in rows if row.channel == channel}
                 lines = []
+                if zone.continuous_schedule:
+                    lines.append("24/7 - no daily stop" + (" (Paused)" if zone.paused_windows[0] else ""))
                 for period in range(1, 5):
+                    if zone.continuous_schedule:
+                        break
                     item = periods.get(period)
                     text = f"{period}: {item.start or '?'}-{item.stop or '?'}" if item else f"{period}: --"
                     if item and item.paused:

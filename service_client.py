@@ -62,6 +62,7 @@ class ServiceClient:
         self.history_supported = data.get("history_supported") is True
         self.history_filters_supported = data.get("history_filters_supported") is True
         self.continuous_reminders_supported = data.get("continuous_reminders_supported") is True
+        self.continuous_schedule_supported = data.get("continuous_schedule_supported") is True
         self.history_warning = data.get("history_warning", "")
         self.timetables = data.get("timetables")
         self.timetable_groups = data.get("timetable_groups")
@@ -83,8 +84,14 @@ class ServiceClient:
     def tapo_details(self, refresh: bool = False) -> dict:
         return exchange(self.path, {"command": "tapo_details", "refresh": refresh})
 
-    def tapo_timeline(self, channel: int) -> dict:
-        return exchange(self.path, {"command": "tapo_timeline", "channel": channel})
+    def system_health(self) -> dict:
+        return exchange(self.path, {"command": "system_health"})
+
+    def tapo_timeline(self, channel: int, hours: int = 24) -> dict:
+        result = exchange(self.path, {"command": "tapo_timeline", "channel": channel, "hours": hours})
+        if result.get("history_hours", 24) != hours:
+            raise OSError("History range unsupported. Restart the controller service and reopen the app.")
+        return result
 
     def history(self, offset: int, category: str = "all") -> dict:
         if not self.history_supported:
@@ -122,6 +129,8 @@ class ServiceClient:
 
     def apply(self, zones: list[Zone], now: datetime) -> None:
         try:
+            if any(zone.continuous_schedule for zone in zones) and not self.continuous_schedule_supported:
+                raise ValueError("Restart the updated controller service and reopen the desktop before saving a 24/7 routine.")
             self.command("save", settings=encode_zones(zones), revision=self.revision)
         except ValueError as exc:
             if str(exc).startswith("Unsupported settings format"):

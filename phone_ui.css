@@ -389,7 +389,22 @@ body.tapo-view #channels {
 #tapo-timeline, #tapo-requested-timeline { display: flex; height: 50px; width: 100%; background: #777; }
 #tapo-timeline span { min-width: 0; }
 .tapo-row-link { cursor: pointer; }
-#tapo-sample-graph { display: block; width: 100%; background: #202020; }
+.tapo-sample-card {
+  border: 1px solid white;
+  border-radius: 6px;
+  padding: 10px;
+  margin: 14px 0;
+  color: white;
+  text-align: center;
+}
+.tapo-sample-card svg { display: block; width: 100%; }
+.tapo-sample-card h4 { margin: 6px 0; color: white; }
+.tapo-sample-reading { font-size: 1.6rem; font-weight: bold; margin: 4px 0; }
+.tapo-sample-recorded { font-size: .85rem; margin: 4px 0; }
+#health-dialog { width: min(90vw, 700px); max-height: 85vh; overflow-y: auto; background: #202a31; color: white; border: 1px solid white; }
+#health-dialog::backdrop { background: #000a; }
+#health-checks dt { font-weight: bold; margin-top: 16px; }
+#health-checks dd { margin: 4px 0; overflow-wrap: anywhere; }
 #tapo-sample-rows td { padding: 6px; white-space: nowrap; }
 
 .pause-groups {

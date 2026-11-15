@@ -85,11 +85,13 @@ class ActivityHistory:
             "warning": self.error,
         }
 
-    def timeline(self, channel: int, now: datetime | None = None) -> dict[str, object]:
+    def timeline(self, channel: int, now: datetime | None = None, hours: int = 24) -> dict[str, object]:
         if type(channel) is not int or channel not in range(8, 16):
             raise ValueError("Choose a Tapo channel.")
+        if type(hours) is not int or hours not in (6, 24, 168):
+            raise ValueError("Choose 6, 24 or 168 hours of history.")
         end = (now or datetime.now().astimezone()).astimezone(timezone.utc)
-        start = end - timedelta(hours=24)
+        start = end - timedelta(hours=hours)
         try:
             with closing(self._connect()) as connection:
                 records = connection.execute(
@@ -167,7 +169,7 @@ class ActivityHistory:
             requested_segments = [{"start": start.isoformat(), "end": end.isoformat(),
                                    "state": "Unknown", "seconds": (end - start).total_seconds()}]
         return {
-            "channel": channel, "start": start.isoformat(), "end": end.isoformat(),
+            "channel": channel, "start": start.isoformat(), "end": end.isoformat(), "history_hours": hours,
             "segments": segments, "events": visible,
             "requested_segments": requested_segments,
             "on_seconds": sum(row["seconds"] for row in segments if row["state"] == "ON"),

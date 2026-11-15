@@ -421,7 +421,7 @@ class ServiceTests(unittest.TestCase):
             "command": "save", "revision": service.revision,
             "settings": encode_zones(zones),
         })
-        self.assertEqual(encode_zones(load_zones(self.path))["version"], 9)
+        self.assertEqual(encode_zones(load_zones(self.path))["version"], 10)
         service.dispatch({"command": "manual", "channel": 15})
         self.assertTrue(secondary.states[7])
         deadline = service.controller.runs[15].deadline

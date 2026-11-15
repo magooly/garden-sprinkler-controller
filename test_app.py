@@ -25,6 +25,36 @@ from test_service import FakeDevice, RunningService
 
 @unittest.skipUnless(os.environ.get("DISPLAY"), "Requires a graphical display")
 class RainPauseGuiTests(unittest.TestCase):
+    def test_system_health_is_read_only_and_refreshes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with RunningService(Path(directory)) as running:
+                client = ServiceClient(running.path)
+                other = SprinklerApp(running.config, client)
+                result = {"checked_at": "2026-11-15T12:00:00+10:00",
+                          "checks": [{"label": "Controller", "value": "Responding"}]}
+                try:
+                    with patch.object(client, "system_health", return_value=result) as read:
+                        other.show_system_health()
+                        window = next(w for w in other.winfo_children()
+                                      if isinstance(w, ctk.CTkToplevel) and "System health" in w.title())
+                        contents = next(w for w in window.winfo_children() if isinstance(w, ctk.CTkTextbox))
+                        button = next(w for w in window.winfo_children() if isinstance(w, ctk.CTkButton))
+                        deadline = time.monotonic() + 2
+                        while "Responding" not in contents.get("1.0", "end") and time.monotonic() < deadline:
+                            other.update()
+                            time.sleep(.01)
+                        self.assertIn("Responding", contents.get("1.0", "end"))
+                        self.assertEqual(contents._textbox.cget("state"), "disabled")
+                        read.side_effect = OSError("Service unavailable")
+                        button.invoke()
+                        deadline = time.monotonic() + 2
+                        while button.cget("state") != "normal" and time.monotonic() < deadline:
+                            other.update()
+                            time.sleep(.01)
+                        self.assertIn("System health unavailable", contents.get("1.0", "end"))
+                finally:
+                    other.on_close()
+
     def test_group_buttons_and_station_retry_do_not_fault_desktop_or_stop_garden(self):
         from dataclasses import replace
         secondary = FakeDevice()
@@ -78,6 +108,21 @@ class RainPauseGuiTests(unittest.TestCase):
                     "power_w": 12.5, "today_kwh": 0.1, "month_kwh": 1.0,
                     "voltage_v": 240.0, "current_a": 0.05, "error": "",
                 }]
+                from datetime import timedelta
+                sample = result["samples"][0]
+                end = datetime.fromisoformat(result["end"])
+                result["samples"] = [
+                    dict(sample, timestamp=(end - timedelta(minutes=45)).isoformat()),
+                    dict(sample, timestamp=(end - timedelta(minutes=30)).isoformat(), error="Offline"),
+                    dict(sample, timestamp=(end - timedelta(minutes=15)).isoformat()),
+                    dict(sample),
+                ]
+
+                def descendants(widget):
+                    for child in widget.winfo_children():
+                        yield child
+                        yield from descendants(child)
+
                 try:
                     with patch("app.datetime", datetime), patch.object(client, "tapo_timeline", return_value=result) as read:
                         other.show_tapo_timeline(8)
@@ -88,16 +133,155 @@ class RainPauseGuiTests(unittest.TestCase):
                         while not canvas.find_all() and time.monotonic() < deadline:
                             other.update()
                             time.sleep(0.01)
+                        other.update()
                         self.assertTrue(canvas.find_all())
                         self.assertTrue(any(
                             canvas.type(item) == "rectangle" and canvas.coords(item)[1:4:2] == [63.0, 72.0]
                             for item in canvas.find_all()
                         ))
-                        sample_canvas = [w for w in window.winfo_children() if isinstance(w, tk.Canvas)][1]
-                        self.assertTrue(any(sample_canvas.type(item) == "oval" for item in sample_canvas.find_all()))
+                        children = list(descendants(window))
+                        sample_canvases = [
+                            w for w in children if type(w) is tk.Canvas
+                            and isinstance(w.master, ctk.CTkFrame)
+                            and w.master.master == next(w for w in children if isinstance(w, ctk.CTkScrollableFrame))
+                        ]
+                        self.assertEqual(len(sample_canvases), 6)
+                        self.assertEqual(len({w.cget("background") for w in sample_canvases}), 6)
+                        expected_readings = ("12.500 W", "240.000 V", "0.050 A", "OFF", "0.100 kWh", "1.000 kWh")
+                        for sample_canvas, expected in zip(sample_canvases, expected_readings):
+                            items = sample_canvas.find_all()
+                            self.assertEqual(sum(sample_canvas.type(item) == "oval" for item in items), 3)
+                            self.assertEqual(sum(sample_canvas.type(item) == "line" for item in items), 1)
+                            graph_text = [sample_canvas.itemcget(item, "text") for item in items
+                                          if sample_canvas.type(item) == "text"]
+                            self.assertIn("3 snapshots; gaps are not zero", graph_text)
+                            panel_labels = [w for w in sample_canvas.master.winfo_children()
+                                            if isinstance(w, ctk.CTkLabel)]
+                            self.assertEqual(sample_canvas.master.cget("border_color"), "white")
+                            self.assertEqual(sample_canvas.master.cget("border_width"), 1)
+                            self.assertTrue(all(w.cget("text_color") == "white" for w in panel_labels))
+                            reading = next(w for w in panel_labels if w.cget("text") == expected)
+                            self.assertEqual(reading.cget("font").cget("size"), 24)
+                            self.assertEqual(reading.cget("font").cget("weight"), "bold")
+                            self.assertTrue(any("Recorded:" in w.cget("text") and
+                                                ("am" in w.cget("text") or "pm" in w.cget("text"))
+                                                for w in panel_labels))
+                            self.assertTrue(all(int(w.grid_info()["row"]) > int(sample_canvas.grid_info()["row"])
+                                                for w in panel_labels))
+                            axis_items = [item for item in items if sample_canvas.type(item) == "text"
+                                          and sample_canvas.itemcget(item, "text").endswith(("am", "pm"))]
+                            self.assertEqual(len(axis_items), 3)
+                            self.assertTrue(all(sample_canvas.itemcget(item, "text").endswith(("am", "pm"))
+                                                for item in axis_items))
+                            scale = next(item for item in items if sample_canvas.type(item) == "text"
+                                         and sample_canvas.coords(item)[1] == 25)
+                            self.assertIn("13 bold", sample_canvas.itemcget(scale, "font"))
+                            for item in items:
+                                if sample_canvas.type(item) == "text":
+                                    bounds = sample_canvas.bbox(item)
+                                    self.assertGreaterEqual(bounds[1], 0)
+                                    self.assertLessEqual(bounds[3], sample_canvas.winfo_height())
+                        menus = [w for w in children if isinstance(w, ctk.CTkOptionMenu)]
+                        self.assertEqual(len(menus), 1)
+                        self.assertEqual(menus[0].cget("values"), ["6 hours", "24 hours", "7 days"])
+                        self.assertFalse(any(isinstance(w, ctk.CTkTextbox) for w in children))
+                        titles = [w.cget("text") for w in children if isinstance(w, ctk.CTkLabel)]
+                        for title in ("Power (W)", "Voltage (V)", "Current (A)",
+                                      "Reported state (ON=1, OFF=0)", "Today cumulative counter (kWh)",
+                                      "Month cumulative counter (kWh)"):
+                            self.assertIn(title, titles)
+                        graphs = next(w for w in children if isinstance(w, ctk.CTkScrollableFrame))
+                        for geometry in ("1120x940", "1060x900", "1000x850"):
+                            window.geometry(geometry)
+                            deadline = time.monotonic() + 0.3
+                            while time.monotonic() < deadline:
+                                other.update()
+                                time.sleep(0.01)
+                            self.assertAlmostEqual(graphs._parent_canvas.yview()[0], 0.0)
+                            self.assertAlmostEqual(graphs._parent_canvas.yview()[1], 1.0)
+                            for sample_canvas in sample_canvases:
+                                panel = sample_canvas.master
+                                self.assertLessEqual(panel.winfo_y() + panel.winfo_height(),
+                                                     graphs._parent_canvas.winfo_height())
+                        window.geometry("900x500")
+                        other.update()
+                        before = graphs._parent_canvas.yview()
+                        sample_canvases[0].event_generate("<Button-5>", x=100, y=50)
+                        other.update()
+                        self.assertGreater(graphs._parent_canvas.yview()[0], before[0])
+                        details_button = next(w for w in children if isinstance(w, ctk.CTkButton)
+                                              and w.cget("text") == "Recorded periods & details")
+                        details_button.invoke()
+                        details = next(w for w in window.winfo_children()
+                                       if isinstance(w, ctk.CTkToplevel))
+                        contents = next(w for w in details.winfo_children() if isinstance(w, ctk.CTkTextbox))
+                        self.assertIn("Recorded periods (local time)", contents.get("1.0", "end"))
+                        self.assertIn("Events and reasons", contents.get("1.0", "end"))
+                        self.assertIn("5-minute snapshots", contents.get("1.0", "end"))
+                        self.assertEqual(contents._textbox.cget("state"), "disabled")
+                        details_button.invoke()
+                        self.assertEqual(sum(isinstance(w, ctk.CTkToplevel)
+                                             for w in window.winfo_children()), 1)
                         labels = [w.cget("text") for w in window.winfo_children() if isinstance(w, ctk.CTkLabel)]
                         self.assertTrue(any("Controller switching history only" in value for value in labels))
-                        read.assert_called_once_with(8)
+                        read.assert_called_once_with(8, 24)
+                        menus[0].set("7 days")
+                        menus[0].cget("command")("7 days")
+                        deadline = time.monotonic() + 2
+                        while menus[0].cget("state") != "normal" and time.monotonic() < deadline:
+                            other.update()
+                            time.sleep(.01)
+                        self.assertEqual(read.call_args.args, (8, 168))
+                        refresh = next(w for w in children if isinstance(w, ctk.CTkButton)
+                                       and w.cget("text") == "Refresh history")
+                        timeline_text = [canvas.itemcget(item, "text") for item in canvas.find_all()
+                                         if canvas.type(item) == "text"]
+                        self.assertTrue(all(value.endswith(("am", "pm")) for value in timeline_text))
+                        result["samples"][-1] = dict(sample, error="Offline")
+                        refresh.invoke()
+                        deadline = time.monotonic() + 2
+                        while refresh.cget("state") != "normal" and time.monotonic() < deadline:
+                            other.update()
+                            time.sleep(0.01)
+                        for sample_canvas in sample_canvases:
+                            panel_text = [w.cget("text") for w in sample_canvas.master.winfo_children()
+                                          if isinstance(w, ctk.CTkLabel)]
+                            self.assertIn("Unavailable", panel_text)
+                            self.assertTrue(any(value.startswith("Sample failed:") for value in panel_text))
+                        result["samples"] = [dict(sample, power_w=0.0)]
+                        refresh.invoke()
+                        deadline = time.monotonic() + 2
+                        while refresh.cget("state") != "normal" and time.monotonic() < deadline:
+                            other.update()
+                            time.sleep(0.01)
+                        power_labels = [w.cget("text") for w in sample_canvases[0].master.winfo_children()
+                                        if isinstance(w, ctk.CTkLabel)]
+                        self.assertIn("0.000 W", power_labels)
+                        result["samples"] = []
+                        refresh.invoke()
+                        deadline = time.monotonic() + 2
+                        while refresh.cget("state") != "normal" and time.monotonic() < deadline:
+                            other.update()
+                            time.sleep(0.01)
+                        self.assertEqual(read.call_count, 5)
+                        self.assertNotIn("240.000", contents.get("1.0", "end"))
+                        for sample_canvas in sample_canvases:
+                            self.assertFalse(any(sample_canvas.type(item) == "oval"
+                                                 for item in sample_canvas.find_all()))
+                        read.side_effect = RuntimeError("History offline")
+                        refresh.invoke()
+                        deadline = time.monotonic() + 2
+                        while refresh.cget("state") != "normal" and time.monotonic() < deadline:
+                            other.update()
+                            time.sleep(0.01)
+                        self.assertIn("Previous details are stale", contents.get("1.0", "end"))
+                        details.destroy()
+                        details_button.invoke()
+                        self.assertTrue(any(isinstance(w, ctk.CTkToplevel)
+                                            for w in window.winfo_children()))
+                        reopened = next(w for w in window.winfo_children() if isinstance(w, ctk.CTkToplevel))
+                        reopened_text = next(w for w in reopened.winfo_children() if isinstance(w, ctk.CTkTextbox))
+                        self.assertIn("Previous details are stale", reopened_text.get("1.0", "end"))
                 finally:
                     other.on_close()
 
@@ -629,6 +813,47 @@ class RainPauseGuiTests(unittest.TestCase):
         self.assertFalse(self.app.schedule_entries[2, 0].winfo_ismapped())
         self.assertEqual(self.app.save_button.cget("state"), "disabled")
         self.assertIsNone(self.app.autosave_timer)
+
+    def test_appliance_24_7_option_preserves_windows_and_saves_continuous_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "settings.json"
+            zones = default_zones(16)
+            zones[8] = Zone("Appliance", False, schedule_for((0,), first=("09:00", "09:15")))
+            save_zones(path, zones)
+            with patch("app.datetime") as mocked_datetime:
+                mocked_datetime.now.return_value = datetime(2026, 10, 26, 6, 0)
+                other = SprinklerApp(path, WaveshareRelays())
+                other.AUTOSAVE_DELAY_MS = 60_000
+                try:
+                    other.select_zone(8)
+                    self.assertIsNotNone(other.appliance_all_day_switch)
+                    self.assertFalse(other.appliance_all_day_var.get())
+                    other.appliance_all_day_switch.toggle()
+                    other.update()
+                    self.assertTrue(other.fields[8].enabled.get())
+                    self.assertTrue(other.fields[8].continuous_schedule.get())
+                    self.assertEqual(other.fields[8].read().schedule, zones[8].schedule)
+                    self.assertEqual(other.schedule_day_menu.cget("state"), "disabled")
+                    self.assertEqual(other.copy_day_button.cget("state"), "disabled")
+                    self.assertEqual(other.window_pause_buttons[0].cget("state"), "normal")
+                    self.assertTrue(all(
+                        button.cget("state") == "disabled"
+                        for button in other.window_pause_buttons[1:]
+                    ))
+                    self.assertTrue(other.save())
+                    saved = load_zones(path)[8]
+                    self.assertTrue(saved.enabled)
+                    self.assertTrue(saved.continuous_schedule)
+
+                    other.appliance_all_day_switch.toggle()
+                    other.update()
+                    self.assertFalse(other.fields[8].enabled.get())
+                    self.assertFalse(other.fields[8].continuous_schedule.get())
+                    self.assertEqual(other.fields[8].read().schedule, zones[8].schedule)
+                    self.assertEqual(other.schedule_day_menu.cget("state"), "normal")
+                finally:
+                    other.dirty = False
+                    other.on_close()
 
     def test_group_pause_button_stops_only_its_group_and_resume_waits(self) -> None:
         self.app.update()

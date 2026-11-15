@@ -17,9 +17,11 @@ import socket
 import socketserver
 import threading
 import uuid
+import shutil
+import time
 
 from controller import (
-    Controller, decode_zones, default_zones, encode_zones, load_rain_pause, load_zones,
+    Controller, Zone, decode_zones, default_zones, encode_zones, load_rain_pause, load_zones,
     next_scheduled_start, save_rain_pause, save_zones,
 )
 from activity_history import ActivityHistory
@@ -51,6 +53,8 @@ class Service:
         self, config: Path, relay: WaveshareRelays, secondary: WaveshareRelays | None = None,
     ) -> None:
         self.config = config
+        self.started_at = datetime.now().astimezone().isoformat(timespec="seconds")
+        self.running_version = Path(__file__).with_name("VERSION").read_text().strip()
         restore_held = system_backup.held(config)
         self.restore_restart_required = False
         self.recovery_backup = ""
@@ -93,7 +97,7 @@ class Service:
         logging.error("Scheduling stopped: %s", self.fault)
         self.controller.closed = True
         try:
-            self.controller.stop_all(datetime.now(), reason="Controller fault")
+            self.controller.stop_all(datetime.now(), suppress=False, reason="Controller fault")
         except ExceptionGroup as shutdown:
             self.fault += "; OFF failures: " + error_details(shutdown)
             logging.error("Shutdown failed: %s", error_details(shutdown))
@@ -119,6 +123,7 @@ class Service:
             "history_supported": True,
             "history_filters_supported": True,
             "continuous_reminders_supported": True,
+            "continuous_schedule_supported": True,
             "history_warning": self.history.error,
             "next_starts": [
                 (start.isoformat(timespec="minutes") if start else None)
@@ -159,12 +164,62 @@ class Service:
             ],
         }
 
+    def _persist_stopped_routines(self, previous_zones: list[Zone]) -> None:
+        if self.controller.zones != previous_zones:
+            save_zones(self.config, self.controller.zones)
+            self.revision = uuid.uuid4().hex
+
+    def system_health(self) -> dict[str, object]:
+        installed = Path(__file__).with_name("VERSION").read_text().strip()
+        checks = [
+            {"label": "Controller", "value": f"Responding; started {self.started_at}"},
+            {"label": "Running version", "value": self.running_version},
+            {"label": "Installed version", "value": installed},
+            {"label": "Restart required", "value": "Yes" if installed != self.running_version or self.restore_restart_required else "No"},
+            {"label": "Controller fault", "value": self.fault or "None recorded"},
+            {"label": "Garden fault", "value": self.controller.garden_fault or "None recorded"},
+            {"label": "History recording", "value": self.history.error or "No recorded storage error"},
+            {"label": "Telemetry recording", "value": (self.tapo_details.store.error if self.tapo_details.store else "Not configured")
+             or "No recorded storage error; five-minute samples, eight-day retention"},
+            {"label": "Safety", "value": "Requested operation and last-confirmed readings do not prove electrical power or isolation."},
+        ]
+        try:
+            usage = shutil.disk_usage(self.config.parent)
+            checks.append({"label": "Free configuration disk space",
+                           "value": f"{usage.free / 1024 ** 3:.2f} GiB" + (" - LOW (under 1 GiB)" if usage.free < 1024 ** 3 else "")})
+        except OSError as exc:
+            logging.error("Disk health unavailable: %s", exc)
+            checks.append({"label": "Free configuration disk space", "value": f"Unavailable: {exc}"})
+        for index, device in enumerate(self.relay.devices):
+            fault = self.controller.garden_fault if index == 0 else "; ".join(self.controller.channel_faults.values())
+            checks.append({"label": f"Relay board {index + 1} ({device.host})",
+                           "value": fault or "No recorded command fault; not a live connectivity/electrical test"})
+        details = self.dispatch({"command": "tapo_details"})
+        for row in details["rows"]:
+            stamp = row["updated"]
+            age = max(0, int(time.time() - datetime.fromisoformat(stamp).timestamp())) if stamp else None
+            state = "Unknown" if row["error"] or row["state"] is None else "ON" if row["state"] else "OFF"
+            requested = row.get("requested_state", row["channel"] in self.controller.runs)
+            confirmed = row.get("last_confirmed_state", row["state"] if not row["error"] else None)
+            confirmation = "Unknown" if confirmed is None else "ON" if confirmed else "OFF"
+            checks.append({"label": f"Station {row['channel'] + 1}: {row['name']}",
+                           "value": f"Requested: {'ON' if requested else 'OFF'}; "
+                           f"last confirmed: {confirmation} at {row.get('confirmed_at') or stamp or 'never'}; "
+                           f"connection: {('Unavailable: ' + row['error']) if row['error'] else row.get('availability') or ('Last read succeeded' if stamp else 'Unknown')}; "
+                           f"measurement: {state}, recorded {stamp or 'never'}"
+                           + (f" ({age // 60} min ago)" if age is not None else "")
+                           + (f"; station fault: {row['station_fault']}" if row.get("station_fault") else "")})
+        return {"checks": checks, "checked_at": datetime.now().astimezone().isoformat(timespec="seconds")}
+
     def dispatch(self, request: object) -> dict[str, object]:
         if not isinstance(request, dict) or not isinstance(request.get("command"), str):
             raise ValueError("Expected an object with a command.")
         command = request["command"]
+        previous_zones = list(self.controller.zones)
         if command == "status":
             return self.status()
+        if command == "system_health":
+            return self.system_health()
         if command == "tapo_details":
             refresh = request.get("refresh", False)
             if type(refresh) is not bool:
@@ -184,6 +239,9 @@ class Service:
             return details
         if command == "tapo_timeline":
             channel = request.get("channel")
+            hours = request.get("hours", 24)
+            if type(hours) is not int or hours not in (6, 24, 168):
+                raise ValueError("Choose 6, 24 or 168 hours of history.")
             if type(channel) is not int or channel not in range(8, 16):
                 raise ValueError("Choose an assigned Tapo channel.")
             if not isinstance(self.relay, TapoRelays):
@@ -191,20 +249,21 @@ class Service:
             plug = self.relay.plugs[channel - 8]
             if plug is None:
                 raise ValueError("This Tapo channel is unassigned.")
-            timeline = self.history.timeline(channel)
+            timeline = self.history.timeline(channel, hours=hours)
             if self.tapo_details.store is None:
                 raise OSError("Tapo sample storage is unavailable.")
             return {
                 **timeline, "name": self.controller.zones[channel].name,
                 "off_peak": plug.off_peak,
                 **self.tapo_details.store.history(
-                    plug.mac, datetime.fromisoformat(timeline["end"]),
+                    plug.mac, datetime.fromisoformat(timeline["end"]), hours,
                 ),
             }
         if command == "history":
             return self.history.page(request.get("offset", 0), request.get("filter", "all"))
         if command in ("stop_garden", "stop_appliances"):
             self.controller.stop_group(0 if command == "stop_garden" else 8, datetime.now())
+            self._persist_stopped_routines(previous_zones)
             return self.status()
         if command == "stop_all":
             try:
@@ -212,6 +271,7 @@ class Service:
             except ExceptionGroup as error:
                 self.fail(error)
             self.history.record(None, "Controller", "STOP ALL", "Requested")
+            self._persist_stopped_routines(previous_zones)
             return self.status()
         if self.fault:
             raise ValueError("Service fault: " + self.fault + ". Check hardware and restart the service.")
@@ -313,6 +373,7 @@ class Service:
                     self.controller.retry_station(channel, now)
                 else:
                     self.controller.stop(channel, now)
+                self._persist_stopped_routines(previous_zones)
             elif command == "read_states":
                 try:
                     states = self.relay.read_states()
