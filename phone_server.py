@@ -345,7 +345,7 @@ class PhoneRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = urlsplit(self.path).path
         if path not in ("/api/login", "/api/logout", "/api/command", "/api/restore", "/api/reminder", "/api/window-pause", "/api/continuous-schedule",
-                        "/api/backup", "/api/backup-preview"):
+                        "/api/backup", "/api/backup-preview", "/api/tapo-rate"):
             self._error(HTTPStatus.NOT_FOUND, "Not found.")
             return
         try:
@@ -379,6 +379,27 @@ class PhoneRequestHandler(BaseHTTPRequestHandler):
                     f"{SESSION_COOKIE}=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Strict"
                 )},
             )
+            return
+        if path == "/api/tapo-rate":
+            try:
+                from tapo_details import parse_electricity_rate
+                if set(body) != {"channel", "rate", "expected_rate"}:
+                    raise ValueError("Choose a plug and enter its electricity rate.")
+                if type(body["channel"]) is not int or body["channel"] not in range(8, 16):
+                    raise ValueError("Choose an assigned Tapo channel.")
+                parse_electricity_rate(body["rate"])
+                expected = body["expected_rate"]
+                if expected is not None and (not isinstance(expected, str)
+                                             or parse_electricity_rate(expected) != expected):
+                    raise ValueError("Refresh history before saving the rate.")
+                result = exchange(self.server.service_socket, {
+                    "command": "tapo_rate", **body,
+                })
+                self._send_json(HTTPStatus.OK, result)
+            except ValueError as error:
+                self._error(HTTPStatus.BAD_REQUEST, str(error))
+            except OSError as error:
+                self._error(HTTPStatus.SERVICE_UNAVAILABLE, str(error))
             return
         if path in ("/api/restore", "/api/backup", "/api/backup-preview"):
             try:

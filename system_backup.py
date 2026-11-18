@@ -16,12 +16,14 @@ from pathlib import Path
 import sqlite3
 import stat
 import tempfile
+import energy_ledger
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 
 from controller import _save_json, decode_zones, encode_zones, load_zones, load_rain_pause
+from tapo_details import TapoSamples, validate_electricity_rates
 from tapo_plugs import credentials_path, decode_mapping, load_credentials, mapping_path
 from timetable_profiles import TimetableProfiles
 from waveshare_relay import WaveshareRelays
@@ -176,6 +178,8 @@ def capture(config: Path, relay, history, zones=None) -> dict:
         "mapping": mapping, "credentials": credentials, "phone_password": phone_password,
         "history": events, "service_files": units, "source_hashes": versions,
         "requirements": (root / "requirements.txt").read_text(encoding="utf-8"),
+        "electricity_rates": TapoSamples(config).rates(),
+        "yearly_energy": TapoSamples(config).yearly_backup(),
     }
     validate(payload)
     return payload
@@ -188,12 +192,15 @@ def validate(payload: object) -> None:
         "service_files", "source_hashes", "requirements",
     }
     if (
-        not isinstance(payload, dict) or set(payload) != required
+        not isinstance(payload, dict) or not required <= set(payload)
+        or not set(payload) <= required | {"electricity_rates", "yearly_energy"}
         or payload["format"] != "garden-sprinkler-system"
         or type(payload["version"]) is not int or payload["version"] != 1
     ):
         raise ValueError("Unsupported full-system backup contents.")
     zones = decode_zones(payload["settings"])
+    validate_electricity_rates(payload.get("electricity_rates", {}))
+    energy_ledger.validate(payload.get("yearly_energy", {"years": [], "cursors": []}))
     if not isinstance(payload["created"], str):
         raise ValueError("Invalid backup creation date.")
     datetime.fromisoformat(payload["created"])
@@ -268,7 +275,9 @@ def summary(payload: dict) -> str:
         f"{len(payload['history'])} history events.\n"
         f"Tapo credentials: {'included' if payload['credentials'] else 'not configured'}. "
         f"Phone password: {'included' if payload['phone_password'] else 'not configured'}.\n"
-        "Includes Rain Pause, relay connections, Tapo assignments, service configuration "
+        f"Electricity rates: {len(payload.get('electricity_rates', {}))} saved.\n"
+        f"Yearly electricity totals: {len(payload.get('yearly_energy', {}).get('years', []))} plug-years saved.\n"
+        "Includes Rain Pause, relay connections, Tapo assignments, electricity rates and yearly tallies, service configuration "
         "and application version fingerprints. Does not include Ubuntu, app binaries, "
         "network/router configuration or active runs."
     )
@@ -296,6 +305,9 @@ def install(config: Path, payload: dict, history) -> None:
     _save_json(sidecar(config, ".timetables.json"), payload["timetables"])
     _save_json(sidecar(config, ".rain-pause.json"), {"rain_paused": payload["rain_paused"]})
     _save_json(sidecar(config, ".connections.json"), {"boards": payload["boards"]})
+    TapoSamples(config).restore_electricity(
+        payload.get("electricity_rates", {}), payload.get("yearly_energy", {"years": [], "cursors": []}),
+    )
     for path, value in (
         (mapping_path(config), payload["mapping"]),
         (credentials_path(config), payload["credentials"]),

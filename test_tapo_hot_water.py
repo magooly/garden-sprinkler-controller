@@ -252,10 +252,38 @@ class HotWaterServiceTests(unittest.TestCase):
         self.assertEqual(result["requested_segments"][-1]["state"], "ON")
         self.assertEqual(sum(row["seconds"] for row in result["segments"]), 86400)
         self.assertEqual(sum(row["seconds"] for row in result["requested_segments"]), 86400)
+        self.assertEqual(result["sample_interval_seconds"], 60)
+        self.assertEqual(len(result["samples"]), 1440)
+        self.assertEqual(result["voltage_periods"][0]["state"], "Unknown")
+        self.assertAlmostEqual(sum(row["seconds"] for row in result["voltage_periods"]), 86400)
         public = PhoneRequestHandler._public_status(self.service.status())
         self.assertTrue(public["channels"][15]["tapo"]["off_peak"])
         self.assertTrue(public["channels"][15]["tapo"]["requested_state"])
         self.assertNotIn("private", json.dumps(public))
+
+    def test_electricity_rate_updates_do_not_switch_or_change_routines(self):
+        self.service.controller.start_manual(15, self.now)
+        before = list(self.primary.calls)
+        generation = self.output.generation
+        result = self.service.dispatch({"command": "tapo_rate", "channel": 15,
+                                        "rate": "30", "expected_rate": None})
+        self.assertEqual(result, {"rate_cents_per_kwh": "30"})
+        timeline = self.service.dispatch({"command": "tapo_timeline", "channel": 15})
+        self.assertEqual(timeline["rate_cents_per_kwh"], "30")
+        self.assertIsNone(timeline["estimated_costs"]["today_kwh"])
+        for request in (
+            {"channel": 0, "rate": "30", "expected_rate": None},
+            {"channel": 8, "rate": "30", "expected_rate": None},
+            {"channel": 15, "rate": "-30", "expected_rate": "30"},
+            {"channel": 15, "rate": "40"},
+            {"channel": 15, "rate": "40", "expected_rate": None},
+        ):
+            with self.assertRaises(ValueError):
+                self.service.dispatch({"command": "tapo_rate", **request})
+        self.assertEqual(self.primary.calls, before)
+        self.assertEqual(self.output.generation, generation)
+        self.assertIn(15, self.service.controller.runs)
+        self.operation.assert_not_called()
 
     def test_stop_with_no_run_still_requests_off(self):
         self.output.request(True)

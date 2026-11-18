@@ -1,0 +1,61 @@
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/scroll"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fillViewport="true">
+    <LinearLayout
+        android:id="@+id/content"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="24dp">
+        <ImageView
+            android:layout_width="80dp" android:layout_height="80dp"
+            android:importantForAccessibility="no"
+            android:src="@drawable/ic_sprinkler" />
+        <TextView
+            android:id="@+id/heading"
+            android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:text="@string/heading" android:textColor="#FFFFFF"
+            android:textSize="30sp" android:textStyle="bold" />
+        <TextView
+            android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:layout_marginTop="8dp" android:text="@string/intro"
+            android:textColor="#D0E5D9" android:textSize="18sp" />
+        <TextView
+            android:id="@+id/status"
+            android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:layout_marginTop="24dp" android:layout_marginBottom="16dp"
+            android:accessibilityLiveRegion="polite"
+            android:text="@string/checking" android:textColor="#FFFFFF"
+            android:textSize="18sp" />
+        <Button
+            android:id="@+id/connect"
+            android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:minHeight="56dp" android:text="@string/connect_tailscale"
+            android:textAllCaps="false" android:textSize="18sp" />
+        <Button
+            android:id="@+id/check"
+            android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:minHeight="56dp" android:text="@string/check_again"
+            android:textAllCaps="false" android:textSize="18sp" />
+        <Button
+            android:id="@+id/install"
+            android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:minHeight="48dp" android:text="@string/install_tailscale"
+            android:textAllCaps="false" android:visibility="gone" />
+        <TextView
+            android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:layout_marginTop="20dp" android:text="@string/instructions"
+            android:textColor="#D0E5D9" android:textSize="17sp" />
+        <TextView
+            android:id="@+id/address"
+            android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:layout_marginTop="20dp" android:textColor="#D0E5D9"
+            android:textIsSelectable="true" android:textSize="14sp" />
+        <TextView
+            android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:layout_marginTop="16dp" android:text="@string/privacy"
+            android:textColor="#D0E5D9" android:textSize="14sp" />
+    </LinearLayout>
+</ScrollView>

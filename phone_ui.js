@@ -24,6 +24,7 @@ let tapoGraphChannel = null;
 let tapoGraphRequestId = 0;
 const tapoGraph = document.querySelector("#tapo-graph");
 let tapoSampleData = null;
+let tapoRateSaving = false;
 const healthDialog = document.querySelector("#health-dialog");
 let healthRequestId = 0;
 document.querySelector("#health-close").addEventListener("click", () => { healthRequestId += 1; healthDialog.close(); });
@@ -52,6 +53,28 @@ async function loadHealth() {
   }
 }
 
+function showYearlyEnergy(years) {
+  const target = document.querySelector("#tapo-yearly-energy");
+  target.replaceChildren();
+  if (!Array.isArray(years)) {
+    target.textContent = "Yearly tally unavailable. Restart the updated controller to enable it.";
+    return;
+  }
+  if (!years.length) {
+    target.textContent = "Waiting for recorded counters.";
+    return;
+  }
+  for (const year of years) {
+    const row = document.createElement("p");
+    const cost = Number(year.unpriced_kwh) > 0
+      ? `$${year.cost} priced portion; ${year.unpriced_kwh} kWh unpriced` : `$${year.cost} estimated`;
+    row.textContent = `${year.year}: ${year.kwh} kWh — ${cost}. `
+      + `Tracking ${new Date(year.since).toLocaleString()} to ${new Date(year.last).toLocaleString()}.`
+      + (year.incomplete ? " Incomplete: gaps or counter resets; known usage only." : "");
+    target.append(row);
+  }
+}
+
 function showTapoRecordedDetails(show) {
   document.querySelector("#tapo-graph-overview").classList.toggle("hidden", show);
   document.querySelector("#tapo-recorded-details").classList.toggle("hidden", !show);
@@ -64,6 +87,161 @@ function tapoGraphTime(value, includeDate = false) {
   const date = new Date(value);
   const time = `${date.getHours() % 12 || 12}:${String(date.getMinutes()).padStart(2, "0")} ${date.getHours() < 12 ? "am" : "pm"}`;
   return includeDate ? `${date.getDate()}/${date.getMonth() + 1} ${time}` : time;
+}
+
+function voltageInterruptions(periods) {
+  const interruptions = [];
+  let current = null;
+  for (const [index, period] of periods.entries()) {
+    if (period.state === "Voltage") {
+      if (current) {
+        current.return = period.start;
+        interruptions.push(current);
+        current = null;
+      }
+    } else {
+      if (!current) current = {start: period.start, return: null, atRangeStart: index === 0, zero: false, unknown: false};
+      current.zero ||= period.state === "Zero";
+      current.unknown ||= period.state === "Unknown";
+    }
+  }
+  if (current) interruptions.push(current);
+  return interruptions;
+}
+
+function addVoltageObservations(card, rows, start, duration) {
+  const section = document.createElement("section");
+  section.className = "voltage-observations";
+  const legend = document.createElement("p");
+  legend.textContent = "Supply observations: red >0 V · blue 0 V measured · white unknown. Times below are sample-based; unknown does not prove supply OFF.";
+  const band = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  band.setAttribute("role", "img");
+  band.setAttribute("aria-label", "Voltage observations. White gaps longer than 10 minutes have start times above and voltage return times below. Times are sample-based.");
+  const observations = tapoSampleData.voltage_periods || [];
+  const measure = document.createElement("canvas").getContext("2d");
+  measure.font = "12px sans-serif";
+  const lanes = {start: [], return: []};
+  const labels = [];
+  for (const [index, period] of observations.entries()) {
+    if (period.state !== "Unknown" || period.seconds <= 600) continue;
+    const boundaries = [];
+    if (index > 0) boundaries.push(["start", period.start]);
+    if (index + 1 < observations.length && observations[index + 1].state === "Voltage") {
+      boundaries.push(["return", period.end]);
+    }
+    for (const [edge, timestamp] of boundaries) {
+      const text = tapoGraphTime(timestamp, duration > 86400000);
+      const x = 75 + (Date.parse(timestamp) - start) / duration * 310;
+      const width = measure.measureText(text).width + 4;
+      const left = Math.min(Math.max(2, x - width / 2), 398 - width);
+      let lane = lanes[edge].findIndex(right => left >= right + 6);
+      if (lane === -1) { lane = lanes[edge].length; lanes[edge].push(0); }
+      lanes[edge][lane] = left + width;
+      labels.push({edge, timestamp, text, x, left, width, lane});
+    }
+  }
+  const bandTop = 2 + lanes.start.length * 18;
+  const bandBottom = bandTop + 16;
+  band.setAttribute("viewBox", `0 0 400 ${bandBottom + 2 + lanes.return.length * 18}`);
+  const value = row => !row.error && typeof row.voltage_v === "number" && Number.isFinite(row.voltage_v) && row.voltage_v >= 0;
+  for (const period of observations) {
+    const marker = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+    for (const [name, content] of Object.entries({
+      x: 75 + (Date.parse(period.start) - start) / duration * 310, y: bandTop,
+      width: period.seconds * 1000 / duration * 310, height: 16,
+      fill: {Voltage: "#ff3030", Zero: "#2288ff", Unknown: "#ffffff"}[period.state],
+    })) marker.setAttribute(name, String(content));
+    const title = document.createElementNS("http://www.w3.org/2000/svg", "title");
+    title.textContent = voltagePeriodLabel(period);
+    marker.append(title);
+    band.append(marker);
+  }
+  for (const label of labels) {
+    const ns = "http://www.w3.org/2000/svg";
+    const y = label.edge === "start" ? bandTop - (label.lane + 1) * 18 + 9
+      : bandBottom + label.lane * 18 + 9;
+    const leader = document.createElementNS(ns, "line");
+    for (const [name, content] of Object.entries({
+      x1: label.x, y1: label.edge === "start" ? bandTop : bandBottom,
+      x2: label.left + label.width / 2, y2: y, stroke: "#aaaaaa",
+    })) leader.setAttribute(name, String(content));
+    leader.classList.add("voltage-gap-leader");
+    band.prepend(leader);
+    const background = document.createElementNS(ns, "rect");
+    for (const [name, content] of Object.entries({
+      x: label.left, y: y - 8, width: label.width, height: 16,
+      fill: card.style.backgroundColor || "#193326",
+    })) background.setAttribute(name, String(content));
+    band.append(background);
+    const text = document.createElementNS(ns, "text");
+    for (const [name, content] of Object.entries({
+      x: label.left + 2, y, fill: "white", "font-size": 12,
+      "font-family": "sans-serif", "dominant-baseline": "central",
+    })) text.setAttribute(name, String(content));
+    text.classList.add("voltage-gap-time", `voltage-gap-${label.edge}`);
+    text.textContent = label.text;
+    const title = document.createElementNS(ns, "title");
+    title.textContent = `${label.edge === "start" ? "Readings missing from" : "Voltage observed again"} ${tapoGraphTime(label.timestamp, true)}`;
+    text.append(title);
+    band.append(text);
+  }
+  const slider = document.createElement("input");
+  slider.type = "range";
+  slider.min = "0";
+  slider.max = String(Math.max(0, rows.length - 1));
+  slider.value = slider.max;
+  slider.disabled = rows.length === 0;
+  slider.setAttribute("aria-label", "Inspect voltage snapshot by time");
+  const detail = document.createElement("p");
+  detail.setAttribute("role", "status");
+  const interruptions = document.createElement("div");
+  interruptions.className = "voltage-interruptions";
+  interruptions.setAttribute("aria-label", "Missing or zero voltage and return times, newest first");
+  const periods = voltageInterruptions(observations).reverse();
+  for (const period of periods) {
+    const row = document.createElement("p");
+    const kind = period.zero && period.unknown ? "0 V / missing" : period.zero ? "0 V measured" : "Missing";
+    const startText = period.atRangeStart ? "at range start" : "from";
+    const returned = period.return ? `voltage seen ${tapoGraphTime(period.return, true)}` : "no voltage return in range";
+    row.textContent = `${kind} ${startText} ${tapoGraphTime(period.start, true)} → ${returned}`;
+    interruptions.append(row);
+  }
+  if (!periods.length) interruptions.textContent = observations.length
+    ? "No missing or zero-voltage periods in this range." : "Voltage observation periods unavailable.";
+  const inspect = () => {
+    const row = rows[Number(slider.value)];
+    if (!row) {
+      detail.textContent = "No recorded snapshots.";
+      return;
+    }
+    const stamp = value(row) ? row.updated || row.timestamp : row.timestamp;
+    detail.textContent = `${tapoGraphTime(stamp, true)}: `
+      + (value(row) ? `${row.voltage_v.toFixed(3)} V measured` : "Unknown; no valid voltage reading");
+  };
+  slider.addEventListener("input", inspect);
+  band.addEventListener("click", event => {
+    if (!rows.length) return;
+    const rect = band.getBoundingClientRect();
+    const position = (event.clientX - rect.left) / rect.width * 400;
+    const fraction = Math.min(1, Math.max(0, (position - 75) / 310));
+    const target = start + fraction * duration;
+    let nearest = 0;
+    for (let index = 1; index < rows.length; index += 1) {
+      if (Math.abs(Date.parse(rows[index].timestamp) - target) < Math.abs(Date.parse(rows[nearest].timestamp) - target)) nearest = index;
+    }
+    slider.value = String(nearest);
+    inspect();
+  });
+  inspect();
+  section.append(band, legend, interruptions, slider, detail);
+  card.append(section);
+}
+
+function voltagePeriodLabel(period) {
+  const state = period.state === "Unknown"
+    ? period.seconds <= 120 ? "Brief unknown" : "Sustained unknown"
+    : period.state === "Voltage" ? "Voltage observed >0 V" : "0 V measured";
+  return `${tapoGraphTime(period.start, true)} — ${tapoGraphTime(period.end, true)}: ${state} (${(period.seconds / 60).toFixed(1)} minutes)`;
 }
 
 function drawTapoSamples() {
@@ -129,6 +307,9 @@ function drawTapoSamples() {
     label.setAttribute("text-anchor", x === 385 ? "end" : x === 230 ? "middle" : "start");
     label.textContent = text; svg.append(label);
   }
+  if (metric === "voltage_v" && tapoSampleData.off_peak) {
+    addVoltageObservations(card, rows, start, duration);
+  }
   const title = document.createElement("h4");
   title.textContent = heading;
   const reading = document.createElement("p");
@@ -148,11 +329,20 @@ function drawTapoSamples() {
   const count = document.createElement("p");
   count.className = "tapo-sample-recorded";
   count.textContent = `${valid.length} snapshots; gaps are not zero`;
-  card.append(title, reading, recorded, count);
+  card.append(title, reading);
+  if (["today_kwh", "month_kwh"].includes(metric) && tapoSampleData.rate_cents_per_kwh !== null
+      && tapoSampleData.rate_cents_per_kwh !== undefined) {
+    const cost = document.createElement("p");
+    cost.className = "tapo-sample-cost";
+    const amount = tapoSampleData.estimated_costs?.[metric];
+    cost.textContent = amount === null || amount === undefined ? "Estimated cost unavailable" : `Estimated cost: $${amount}`;
+    card.append(cost);
+  }
+  card.append(recorded, count);
   cards.append(card);
   }
   document.querySelector("#tapo-sample-status").textContent =
-    `${rows.length} intervals (${tapoSampleData.sample_interval_seconds / 60} minutes each). `
+    `${rows.length} snapshots; current polling interval ${tapoSampleData.sample_interval_seconds / 60} minute(s). Older readings retain their original cadence. `
     + "Recording starts when enabled; earlier measurements cannot be reconstructed. "
     + (tapoSampleData.samples_warning || "");
 }
@@ -369,6 +559,47 @@ document.querySelector("#tapo-graph-back").addEventListener("click", () => {
 document.querySelector("#tapo-graph-refresh").addEventListener("click", () => openTapoGraph(tapoGraphChannel));
 document.querySelector("#tapo-range").addEventListener("change", () => openTapoGraph(tapoGraphChannel));
 
+function shiftRateDecimal(value, places) {
+  const [whole, fraction = ""] = value.split(".");
+  const digits = (whole || "0") + fraction;
+  const point = (whole || "0").length + places;
+  const shifted = point <= 0 ? "0." + "0".repeat(-point) + digits
+    : point >= digits.length ? digits + "0".repeat(point - digits.length)
+    : digits.slice(0, point) + "." + digits.slice(point);
+  return shifted.replace(/^0+(?=\d)/, "").replace(/(\.\d*?)0+$/, "$1").replace(/\.$/, "");
+}
+
+document.querySelector("#tapo-rate-form").addEventListener("submit", async event => {
+  event.preventDefault();
+  if (tapoRateSaving || tapoGraphChannel === null || !tapoSampleData?.electricity_rate_supported) return;
+  const channel = tapoGraphChannel;
+  const view = tapoGraphRequestId;
+  const status = document.querySelector("#tapo-rate-status");
+  const button = document.querySelector("#tapo-rate-save");
+  const rate = document.querySelector("#tapo-rate").value.trim();
+  if (rate.length > 14 || (rate && !/^(?:[0-9]+(?:\.[0-9]{1,6})?|\.[0-9]{1,6})$/.test(rate))) {
+    status.textContent = "Enter non-negative dollars/kWh, e.g. 0.26268, with up to six decimal places.";
+    return;
+  }
+  button.disabled = true;
+  tapoRateSaving = true;
+  status.textContent = "Saving rate...";
+  try {
+    await request("/api/tapo-rate", {method: "POST", body: JSON.stringify({
+      channel, rate: rate ? shiftRateDecimal(rate, 2) : "", expected_rate: tapoSampleData.rate_cents_per_kwh,
+    })});
+    if (channel !== tapoGraphChannel || view !== tapoGraphRequestId || !tapoView) return;
+    await openTapoGraph(channel);
+  } catch (error) {
+    if (channel === tapoGraphChannel && view === tapoGraphRequestId && tapoView) {
+      status.textContent = `Rate not saved: ${error.message}`;
+      button.disabled = false;
+    }
+  } finally {
+    tapoRateSaving = false;
+  }
+});
+
 async function openTapoGraph(channel) {
   if (channel === null || !tapoView) return;
   if (tapoGraphChannel !== channel) {
@@ -387,6 +618,8 @@ async function openTapoGraph(channel) {
   const graph = document.querySelector("#tapo-timeline");
   const periods = document.querySelector("#tapo-periods");
   const events = document.querySelector("#tapo-events");
+  document.querySelector("#tapo-rate-save").disabled = true;
+  document.querySelector("#tapo-rate-status").textContent = "Loading rate...";
   graph.replaceChildren();
   document.querySelector("#tapo-requested-timeline").replaceChildren();
   document.querySelector("#tapo-requested-panel").classList.add("hidden");
@@ -399,6 +632,7 @@ async function openTapoGraph(channel) {
   events.replaceChildren();
   document.querySelector("#tapo-timeline-range").textContent = "";
   status.textContent = "Loading controller history...";
+  document.querySelector("#tapo-yearly-energy").textContent = "Loading yearly tally...";
   refreshButton.disabled = true;
   try {
     const {timeline} = await request(`/api/tapo-timeline?channel=${channel}&hours=${document.querySelector("#tapo-range").value}`);
@@ -407,6 +641,13 @@ async function openTapoGraph(channel) {
       `${document.querySelector("#tapo-range").selectedOptions[0].textContent} controller switching history`;
     status.textContent = `${timeline.name} — confirmed/recorded ON: ${(timeline.on_seconds / 3600).toFixed(2)} hours. ${timeline.description} ${timeline.warning}`;
     tapoSampleData = timeline;
+    showYearlyEnergy(timeline.yearly_energy);
+    const rate = timeline.rate_cents_per_kwh;
+    document.querySelector("#tapo-rate").value = rate == null ? "" : shiftRateDecimal(rate, -2);
+    document.querySelector("#tapo-rate-save").disabled = !timeline.electricity_rate_supported;
+    document.querySelector("#tapo-rate-status").textContent = !timeline.electricity_rate_supported
+      ? "Restart the updated controller to enable electricity rates."
+      : rate === null ? "No rate set; costs are hidden." : `Saved rate: $${shiftRateDecimal(rate, -2)}/kWh.`;
     drawTapoSamples();
     for (const row of timeline.daily_energy || []) {
       const item = document.createElement("li");
@@ -430,6 +671,16 @@ async function openTapoGraph(channel) {
     }
     const local = value => tapoGraphTime(value, true);
     document.querySelector("#tapo-timeline-range").textContent = `${local(timeline.start)} — ${local(timeline.end)}`;
+    if (timeline.off_peak) {
+      const heading = document.createElement("li");
+      heading.textContent = "Voltage / contact periods (sample-based estimates). Brief unknown: up to 2 minutes; sustained unknown: longer. Unknown does not prove supply OFF. Changes can occur between polls.";
+      periods.append(heading);
+      for (const period of timeline.voltage_periods || []) {
+        const item = document.createElement("li");
+        item.textContent = voltagePeriodLabel(period);
+        periods.append(item);
+      }
+    }
     for (const row of timeline.segments) {
       const label = `${local(row.start)} — ${local(row.end)}: ${row.state} (${(row.seconds / 60).toFixed(1)} minutes)`;
       const band = document.createElement("span");
@@ -459,7 +710,11 @@ async function openTapoGraph(channel) {
       }
     }
   } catch (error) {
-    if (id === tapoGraphRequestId && tapoView) status.textContent = `History unavailable: ${error.message}`;
+    if (id === tapoGraphRequestId && tapoView) {
+      status.textContent = `History unavailable: ${error.message}`;
+      document.querySelector("#tapo-rate-status").textContent = "Load history successfully before editing the rate.";
+      document.querySelector("#tapo-yearly-energy").textContent = `Yearly tally unavailable: ${error.message}`;
+    }
   } finally {
     if (id === tapoGraphRequestId) refreshButton.disabled = false;
   }

@@ -34,6 +34,27 @@ def service_status() -> dict[str, object]:
 
 
 class PhoneServerTests(unittest.TestCase):
+    def test_electricity_rate_requires_auth_csrf_valid_rate_and_expected_value(self):
+        body = {"channel": 15, "rate": "30.125", "expected_rate": None}
+        self.assertEqual(self.request("POST", "/api/tapo-rate", body)[0], 401)
+        cookie, csrf = self.login()
+        self.mock_exchange.reset_mock()
+        self.assertEqual(self.request("POST", "/api/tapo-rate", body, cookie)[0], 403)
+        for invalid in ({"channel": True}, {"channel": 7}, {"rate": "-1"},
+                        {"rate": "NaN"}, {"rate": 30}, {"rate": "1.12345"},
+                        {"expected_rate": 30}, {"expected_rate": "30.0"}, {"extra": 1}):
+            self.assertEqual(self.request("POST", "/api/tapo-rate", {**body, **invalid}, cookie, csrf)[0], 400)
+        missing = {key: value for key, value in body.items() if key != "expected_rate"}
+        self.assertEqual(self.request("POST", "/api/tapo-rate", missing, cookie, csrf)[0], 400)
+        self.mock_exchange.assert_not_called()
+        self.mock_exchange.return_value = {"rate_cents_per_kwh": "30.125"}
+        code, result, _ = self.request("POST", "/api/tapo-rate", body, cookie, csrf)
+        self.assertEqual(code, 200)
+        self.assertEqual(result["rate_cents_per_kwh"], "30.125")
+        self.mock_exchange.assert_called_once_with(self.socket_path, {"command": "tapo_rate", **body})
+        self.mock_exchange.side_effect = OSError("Rate storage unavailable")
+        self.assertEqual(self.request("POST", "/api/tapo-rate", body, cookie, csrf)[0], 503)
+
     def test_saved_24_7_mode_requires_auth_csrf_revision_and_appliance_channel(self):
         body = {"channel": 15, "enabled": True, "revision": "revision-1"}
         self.assertEqual(self.request("POST", "/api/continuous-schedule", body)[0], 401)
@@ -332,6 +353,7 @@ class PhoneServerTests(unittest.TestCase):
         page = response.read()
         self.assertIn(b"Sprinklers", page)
         self.assertIn(b'id="tapo-sample-graphs"', page)
+        self.assertIn(b'id="tapo-yearly-energy"', page)
         self.assertNotIn(b'id="tapo-metric"', page)
         self.assertIn(b'id="tapo-recorded-details" class="hidden"', page)
         self.assertIn(b"Back to graphs", page)

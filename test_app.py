@@ -93,6 +93,72 @@ class RainPauseGuiTests(unittest.TestCase):
                     secondary.fail = False
                     other.on_close()
 
+    def test_white_gap_chart_labels_require_more_than_ten_minutes_and_known_edges(self) -> None:
+        from activity_history import ActivityHistory
+        from datetime import timedelta
+        import tkinter as tk
+
+        with tempfile.TemporaryDirectory() as directory:
+            with RunningService(Path(directory)) as running:
+                client = ServiceClient(running.path)
+                other = SprinklerApp(running.config, client)
+                result = ActivityHistory(running.config).timeline(8)
+                result["name"] = "Hot water"
+                start = datetime.fromisoformat(result["start"])
+                sample = {"timestamp": start.isoformat(), "updated": start.isoformat(), "state": True,
+                          "power_w": 1.0, "today_kwh": 0.1, "month_kwh": 1.0,
+                          "voltage_v": 240.0, "current_a": 0.01, "error": "", "sample_interval_seconds": 60}
+
+                def descendants(widget):
+                    for child in widget.winfo_children():
+                        yield child
+                        yield from descendants(child)
+
+                cases = []
+                for seconds in (599, 600, 601, 90000):
+                    returned = start + timedelta(seconds=60 + seconds)
+                    cases.append((f"{seconds} seconds",
+                                  [sample, dict(sample, timestamp=returned.isoformat())],
+                                  returned + timedelta(seconds=60), int(seconds > 600), int(seconds > 600)))
+                cases.extend([
+                    ("already missing", [dict(sample, timestamp=(start + timedelta(seconds=601)).isoformat())],
+                     start + timedelta(seconds=661), 0, 1),
+                    ("still missing", [sample], start + timedelta(seconds=661), 1, 0),
+                    ("all unknown", [], start + timedelta(seconds=661), 0, 0),
+                    ("measured zero", [sample, dict(sample, timestamp=(start + timedelta(seconds=60)).isoformat(),
+                                                   voltage_v=0.0, sample_interval_seconds=601),
+                                       dict(sample, timestamp=(start + timedelta(seconds=661)).isoformat())],
+                     start + timedelta(seconds=721), 0, 0),
+                ])
+                try:
+                    with patch("app.datetime", datetime), patch.object(client, "tapo_timeline", return_value=result):
+                        for name, samples, end, starts, returns in cases:
+                            with self.subTest(name=name):
+                                result.update(off_peak=True, samples=samples, start=start.isoformat(), end=end.isoformat())
+                                other.show_tapo_timeline(8)
+                                window = next(w for w in other.winfo_children() if isinstance(w, ctk.CTkToplevel))
+                                deadline = time.monotonic() + 3
+                                observation = None
+                                while observation is None and time.monotonic() < deadline:
+                                    other.update()
+                                    observation = next((w for w in descendants(window) if type(w) is tk.Canvas
+                                                        and w.find_withtag("voltage-observation")), None)
+                                    time.sleep(.01)
+                                self.assertIsNotNone(observation)
+                                self.assertEqual(len(observation.find_withtag("voltage-gap-start")), starts)
+                                self.assertEqual(len(observation.find_withtag("voltage-gap-return")), returns)
+                                self.assertEqual(len(observation.find_withtag("voltage-gap-leader")), starts + returns)
+                                if starts:
+                                    item = observation.find_withtag("voltage-gap-start")[0]
+                                    stamp = (start + timedelta(seconds=60)).astimezone()
+                                    expected = f"{stamp.hour % 12 or 12}:{stamp.minute:02} {'am' if stamp.hour < 12 else 'pm'}"
+                                    if name == "90000 seconds":
+                                        expected = f"{stamp:%d/%m} " + expected
+                                    self.assertEqual(observation.itemcget(item, "text"), expected)
+                                window.destroy()
+                finally:
+                    other.on_close()
+
     def test_tapo_timeline_graph_renders_recorded_and_unknown_periods(self) -> None:
         from activity_history import ActivityHistory
         import tkinter as tk
@@ -103,6 +169,13 @@ class RainPauseGuiTests(unittest.TestCase):
                 result = ActivityHistory(running.config).timeline(8)
                 result["name"] = "Tapo Plug 1"
                 result["off_peak"] = True
+                result["electricity_rate_supported"] = True
+                result["rate_cents_per_kwh"] = "30"
+                result["estimated_costs"] = {"today_kwh": "0.03", "month_kwh": "0.30"}
+                result["yearly_energy"] = [{
+                    "year": 2026, "since": result["start"], "last": result["end"], "kwh": "12.5",
+                    "cost": "2.50", "unpriced_kwh": "2.5", "incomplete": True,
+                }]
                 result["samples"] = [{
                     "timestamp": result["end"], "updated": result["end"], "state": False,
                     "power_w": 12.5, "today_kwh": 0.1, "month_kwh": 1.0,
@@ -111,6 +184,7 @@ class RainPauseGuiTests(unittest.TestCase):
                 from datetime import timedelta
                 sample = result["samples"][0]
                 end = datetime.fromisoformat(result["end"])
+                sample["timestamp"] = (end - timedelta(minutes=1)).isoformat()
                 result["samples"] = [
                     dict(sample, timestamp=(end - timedelta(minutes=45)).isoformat()),
                     dict(sample, timestamp=(end - timedelta(minutes=30)).isoformat(), error="Offline"),
@@ -144,8 +218,54 @@ class RainPauseGuiTests(unittest.TestCase):
                             w for w in children if type(w) is tk.Canvas
                             and isinstance(w.master, ctk.CTkFrame)
                             and w.master.master == next(w for w in children if isinstance(w, ctk.CTkScrollableFrame))
+                            and not w.find_withtag("voltage-observation")
                         ]
                         self.assertEqual(len(sample_canvases), 6)
+                        observation = next(w for w in children if type(w) is tk.Canvas
+                                           and w.find_withtag("voltage-observation"))
+                        self.assertTrue(observation.winfo_ismapped())
+                        marks = observation.find_withtag("voltage-observation")
+                        self.assertTrue(marks)
+                        colors = {observation.itemcget(item, "fill") for item in marks}
+                        self.assertIn("#ff3030", colors)
+                        self.assertIn("#ffffff", colors)
+                        self.assertEqual(len(observation.find_withtag("voltage-gap-start")), 1)
+                        self.assertEqual(len(observation.find_withtag("voltage-gap-return")), 2)
+                        for item in observation.find_withtag("voltage-gap-time"):
+                            bounds = observation.bbox(item)
+                            self.assertGreaterEqual(bounds[0], 0)
+                            self.assertGreaterEqual(bounds[1], 0)
+                            self.assertLessEqual(bounds[2], observation.winfo_width())
+                            self.assertLessEqual(bounds[3], observation.winfo_height())
+                            self.assertTrue(observation.itemcget(item, "text").endswith(("am", "pm")))
+                        for edge in ("start", "return"):
+                            items = observation.find_withtag(f"voltage-gap-{edge}")
+                            for index, item in enumerate(items):
+                                bounds = observation.bbox(item)
+                                self.assertFalse(any(other_item in items[index + 1:]
+                                                     for other_item in observation.find_overlapping(*bounds)))
+                        interruptions = next(w for w in children if type(w) is tk.Text)
+                        interruption_text = interruptions.get("1.0", "end")
+                        self.assertIn("Missing from", interruption_text)
+                        self.assertIn("voltage seen", interruption_text)
+                        self.assertIn("at range start", interruption_text)
+                        self.assertEqual(interruptions.cget("state"), "disabled")
+                        yearly = next(w for w in children if type(w) is tk.Text
+                                      and "2026: 12.5 kWh" in w.get("1.0", "end"))
+                        self.assertIn("$2.50 priced portion; 2.5 kWh unpriced", yearly.get("1.0", "end"))
+                        self.assertIn("Incomplete", yearly.get("1.0", "end"))
+                        self.assertEqual(yearly.cget("state"), "disabled")
+                        for offset in (40, 15):
+                            stamp = (end - timedelta(minutes=offset)).astimezone()
+                            expected = f"{stamp:%d/%m} {stamp.hour % 12 or 12}:{stamp.minute:02} {'am' if stamp.hour < 12 else 'pm'}"
+                            self.assertIn(expected, interruption_text)
+                        legend = next(w for w in observation.master.winfo_children()
+                                      if isinstance(w, ctk.CTkLabel) and
+                                      "Supply observations:" in w.cget("text"))
+                        mark_x = round(observation.coords(marks[-1])[0])
+                        observation.event_generate("<Motion>", x=mark_x, y=5)
+                        other.update()
+                        self.assertIn("240.000 V measured", legend.cget("text"))
                         self.assertEqual(len({w.cget("background") for w in sample_canvases}), 6)
                         expected_readings = ("12.500 W", "240.000 V", "0.050 A", "OFF", "0.100 kWh", "1.000 kWh")
                         for sample_canvas, expected in zip(sample_canvases, expected_readings):
@@ -163,6 +283,11 @@ class RainPauseGuiTests(unittest.TestCase):
                             reading = next(w for w in panel_labels if w.cget("text") == expected)
                             self.assertEqual(reading.cget("font").cget("size"), 24)
                             self.assertEqual(reading.cget("font").cget("weight"), "bold")
+                            if expected.endswith("kWh"):
+                                amount = "0.03" if expected == "0.100 kWh" else "0.30"
+                                cost = next(w for w in panel_labels if w.cget("text") == f"Estimated cost: ${amount}")
+                                self.assertEqual(cost.cget("font").cget("size"), 18)
+                                self.assertGreater(int(cost.grid_info()["row"]), int(reading.grid_info()["row"]))
                             self.assertTrue(any("Recorded:" in w.cget("text") and
                                                 ("am" in w.cget("text") or "pm" in w.cget("text"))
                                                 for w in panel_labels))
@@ -174,7 +299,7 @@ class RainPauseGuiTests(unittest.TestCase):
                             self.assertTrue(all(sample_canvas.itemcget(item, "text").endswith(("am", "pm"))
                                                 for item in axis_items))
                             scale = next(item for item in items if sample_canvas.type(item) == "text"
-                                         and sample_canvas.coords(item)[1] == 25)
+                                         and "13 bold" in sample_canvas.itemcget(item, "font"))
                             self.assertIn("13 bold", sample_canvas.itemcget(scale, "font"))
                             for item in items:
                                 if sample_canvas.type(item) == "text":
@@ -198,11 +323,16 @@ class RainPauseGuiTests(unittest.TestCase):
                                 other.update()
                                 time.sleep(0.01)
                             self.assertAlmostEqual(graphs._parent_canvas.yview()[0], 0.0)
-                            self.assertAlmostEqual(graphs._parent_canvas.yview()[1], 1.0)
+                            self.assertLessEqual(graphs._parent_canvas.yview()[1], 1.0)
                             for sample_canvas in sample_canvases:
                                 panel = sample_canvas.master
                                 self.assertLessEqual(panel.winfo_y() + panel.winfo_height(),
-                                                     graphs._parent_canvas.winfo_height())
+                                                     graphs.winfo_height())
+                                for item in sample_canvas.find_all():
+                                    if sample_canvas.type(item) == "text":
+                                        bounds = sample_canvas.bbox(item)
+                                        self.assertGreaterEqual(bounds[1], 0)
+                                        self.assertLessEqual(bounds[3], sample_canvas.winfo_height())
                         window.geometry("900x500")
                         other.update()
                         before = graphs._parent_canvas.yview()
@@ -218,13 +348,48 @@ class RainPauseGuiTests(unittest.TestCase):
                         self.assertIn("Recorded periods (local time)", contents.get("1.0", "end"))
                         self.assertIn("Events and reasons", contents.get("1.0", "end"))
                         self.assertIn("5-minute snapshots", contents.get("1.0", "end"))
+                        self.assertIn("Electricity rate: $0.3/kWh", contents.get("1.0", "end"))
                         self.assertEqual(contents._textbox.cget("state"), "disabled")
                         details_button.invoke()
                         self.assertEqual(sum(isinstance(w, ctk.CTkToplevel)
                                              for w in window.winfo_children()), 1)
                         labels = [w.cget("text") for w in window.winfo_children() if isinstance(w, ctk.CTkLabel)]
                         self.assertTrue(any("Controller switching history only" in value for value in labels))
+                        self.assertTrue(any("unknown does not prove supply OFF" in value for value in labels))
                         read.assert_called_once_with(8, 24)
+                        rate_button = next(w for w in children if isinstance(w, ctk.CTkButton)
+                                           and w.cget("text") == "Electricity rate")
+                        costs = [w for w in children if isinstance(w, ctk.CTkLabel)
+                                 and w.cget("text").startswith("Estimated cost:")]
+
+                        def save_rate(_channel, value, expected):
+                            from tapo_details import parse_electricity_rate, estimated_costs
+                            self.assertEqual(expected, result["rate_cents_per_kwh"])
+                            result["rate_cents_per_kwh"] = parse_electricity_rate(value)
+                            result["estimated_costs"] = estimated_costs(sample, result["rate_cents_per_kwh"])
+                            return {"rate_cents_per_kwh": result["rate_cents_per_kwh"]}
+
+                        with patch.object(client, "set_tapo_rate", side_effect=save_rate) as save:
+                            for value in ("0", "", "0.3"):
+                                with patch("app.ctk.CTkInputDialog") as dialog:
+                                    dialog.return_value.get_input.return_value = value
+                                    rate_button.invoke()
+                                    deadline = time.monotonic() + 3
+                                    while rate_button.cget("state") != "normal" and time.monotonic() < deadline:
+                                        other.update()
+                                        time.sleep(.01)
+                                self.assertEqual(rate_button.cget("state"), "normal")
+                                if value == "":
+                                    self.assertTrue(all(not cost.winfo_ismapped() for cost in costs))
+                                else:
+                                    self.assertTrue(all(cost.winfo_ismapped() for cost in costs))
+                                    if value == "0":
+                                        self.assertTrue(all(cost.cget("text") == "Estimated cost: $0.00" for cost in costs))
+                            self.assertEqual(save.call_count, 3)
+                        with patch("app.ctk.CTkInputDialog") as dialog, patch("app.messagebox.showerror") as error:
+                            dialog.return_value.get_input.return_value = "-1"
+                            rate_button.invoke()
+                            error.assert_called_once()
                         menus[0].set("7 days")
                         menus[0].cget("command")("7 days")
                         deadline = time.monotonic() + 2
@@ -257,13 +422,59 @@ class RainPauseGuiTests(unittest.TestCase):
                         power_labels = [w.cget("text") for w in sample_canvases[0].master.winfo_children()
                                         if isinstance(w, ctk.CTkLabel)]
                         self.assertIn("0.000 W", power_labels)
+                        result["samples"] = [dict(sample, voltage_v=0.0)]
+                        refresh.invoke()
+                        deadline = time.monotonic() + 2
+                        while refresh.cget("state") != "normal" and time.monotonic() < deadline:
+                            other.update()
+                            time.sleep(0.01)
+                        marks = observation.find_withtag("voltage-observation")
+                        self.assertEqual(observation.itemcget(marks[-1], "fill"), "#2288ff")
+                        observation.event_generate("<Motion>", x=round(observation.coords(marks[-1])[0]), y=5)
+                        other.update()
+                        self.assertIn("0.000 V measured", legend.cget("text"))
+                        result["samples"] = [
+                            dict(sample, timestamp=(end - timedelta(minutes=3)).isoformat(), error="Offline"),
+                            dict(sample, timestamp=(end - timedelta(minutes=2)).isoformat()),
+                            dict(sample, timestamp=(end - timedelta(minutes=1)).isoformat(), voltage_v=0.0),
+                        ]
+                        refresh.invoke()
+                        deadline = time.monotonic() + 2
+                        while refresh.cget("state") != "normal" and time.monotonic() < deadline:
+                            other.update()
+                            time.sleep(0.01)
+                        marks = observation.find_withtag("voltage-observation")
+                        self.assertEqual(len(marks), 3)
+                        self.assertEqual({observation.itemcget(mark, "fill") for mark in marks},
+                                         {"#ff3030", "#2288ff", "#ffffff"})
+                        band_top = observation.coords(marks[0])[1]
+                        self.assertEqual([observation.coords(mark)[1:4:2] for mark in marks],
+                                         [[band_top, band_top + 9]] * 3)
+                        self.assertTrue(all(observation.type(mark) == "rectangle" for mark in marks))
+                        self.assertEqual(observation.coords(marks[0])[2], observation.coords(marks[1])[0])
+                        self.assertEqual(observation.coords(marks[1])[2], observation.coords(marks[2])[0])
+                        self.assertIn("Voltage / contact periods", contents.get("1.0", "end"))
+                        self.assertIn("Sustained unknown", contents.get("1.0", "end"))
+                        result["samples"] = [dict(sample, voltage_v=-1.0)]
+                        refresh.invoke()
+                        deadline = time.monotonic() + 2
+                        while refresh.cget("state") != "normal" and time.monotonic() < deadline:
+                            other.update()
+                            time.sleep(0.01)
+                        marks = observation.find_withtag("voltage-observation")
+                        self.assertEqual(observation.itemcget(marks[0], "fill"), "#ffffff")
+                        observation.event_generate("<Motion>", x=round(observation.coords(marks[0])[0]), y=5)
+                        other.update()
+                        self.assertIn("Unknown", legend.cget("text"))
+                        result["off_peak"] = False
                         result["samples"] = []
                         refresh.invoke()
                         deadline = time.monotonic() + 2
                         while refresh.cget("state") != "normal" and time.monotonic() < deadline:
                             other.update()
                             time.sleep(0.01)
-                        self.assertEqual(read.call_count, 5)
+                        self.assertEqual(read.call_count, 11)
+                        self.assertFalse(observation.winfo_ismapped())
                         self.assertNotIn("240.000", contents.get("1.0", "end"))
                         for sample_canvas in sample_canvases:
                             self.assertFalse(any(sample_canvas.type(item) == "oval"

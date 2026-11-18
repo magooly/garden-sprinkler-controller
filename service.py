@@ -237,7 +237,7 @@ class Service:
             for row in details["rows"]:
                 row["station_fault"] = self.controller.channel_faults.get(row["channel"], "")
             return details
-        if command == "tapo_timeline":
+        if command in ("tapo_timeline", "tapo_rate"):
             channel = request.get("channel")
             hours = request.get("hours", 24)
             if type(hours) is not int or hours not in (6, 24, 168):
@@ -249,14 +249,21 @@ class Service:
             plug = self.relay.plugs[channel - 8]
             if plug is None:
                 raise ValueError("This Tapo channel is unassigned.")
-            timeline = self.history.timeline(channel, hours=hours)
             if self.tapo_details.store is None:
                 raise OSError("Tapo sample storage is unavailable.")
+            if command == "tapo_rate":
+                if "expected_rate" not in request:
+                    raise ValueError("Refresh the graph before saving its electricity rate.")
+                return {"rate_cents_per_kwh": self.tapo_details.store.set_rate(
+                    plug.mac, request.get("rate"), request["expected_rate"],
+                )}
+            timeline = self.history.timeline(channel, hours=hours)
             return {
                 **timeline, "name": self.controller.zones[channel].name,
                 "off_peak": plug.off_peak,
                 **self.tapo_details.store.history(
                     plug.mac, datetime.fromisoformat(timeline["end"]), hours,
+                    interval=60 if plug.off_peak else 300,
                 ),
             }
         if command == "history":
@@ -289,6 +296,9 @@ class Service:
                     return {"summary": system_backup.summary(payload), "revision": self.revision}
                 if request.get("revision") != self.revision:
                     raise ValueError("Settings changed. Preview the backup again before restoring.")
+                with self.tapo_details.lock:
+                    if self.tapo_details.reading:
+                        raise ValueError("A Tapo reading is in progress. Wait for it to finish, then retry restore.")
                 recovery = system_backup.encrypt(
                     system_backup.capture(self.config, self.relay, self.history, self.controller.zones), request.get("password"),
                 )
@@ -491,7 +501,8 @@ def serve(
                 logging.info("Controller ready on %s (rain pause: %s)", path,
                              service.controller.rain_paused)
                 while not stop.is_set():
-                    service.tapo_details.sample_due()
+                    if not service.restore_restart_required:
+                        service.tapo_details.sample_due()
                     service.tick()
                     if isinstance(service.relay, TapoRelays) and service.relay.hot_water is not None:
                         service.relay.hot_water.reconcile()

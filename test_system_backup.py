@@ -23,6 +23,65 @@ PASSWORD = "four unrelated backup words"
 
 
 class SystemBackupTests(unittest.TestCase):
+    def test_restore_does_not_race_an_inflight_counter_sample(self):
+        archive = self.export()
+        revision = self.service.revision
+        self.service.tapo_details.reading = True
+        try:
+            with self.assertRaisesRegex(ValueError, "reading is in progress"):
+                self.service.dispatch({"command": "backup_restore", "archive": archive,
+                                       "password": PASSWORD, "revision": revision})
+            self.assertFalse(self.service.restore_restart_required)
+            self.assertFalse(backup.held(self.config))
+            self.assertEqual(self.service.revision, revision)
+        finally:
+            self.service.tapo_details.reading = False
+
+    def test_yearly_tally_roundtrip_and_legacy_backups_clear_excluded_telemetry(self):
+        from datetime import timedelta
+        from decimal import Decimal
+        from tapo_details import TapoSamples
+        store = TapoSamples(self.config)
+        mac = "12:34:56:78:9a:bc"
+        start = datetime(2026, 11, 17, 12).astimezone()
+        store.set_rate(mac, "30", None)
+        for i in range(2):
+            store.save(mac, int((start + timedelta(minutes=5 * i)).timestamp()),
+                       {"today_kwh": i, "month_kwh": i, "error": ""})
+        payload = backup.decrypt(self.export(), PASSWORD)
+        saved = payload["yearly_energy"]
+        self.assertIn("Yearly electricity totals: 1", backup.summary(payload))
+        store.save(mac, int((start + timedelta(minutes=10)).timestamp()),
+                   {"today_kwh": 2, "month_kwh": 2, "error": ""})
+        backup.install(self.config, payload, self.service.history)
+        self.assertEqual(store.yearly_backup(), saved)
+        self.assertEqual(Decimal(store.history(mac, start)["yearly_energy"][0]["kwh"]), 1)
+        bad = copy.deepcopy(payload)
+        bad["yearly_energy"]["years"][0][2]["cost"] = "-1"
+        with self.assertRaises(ValueError):
+            backup.validate(bad)
+        del payload["yearly_energy"]
+        backup.install(self.config, payload, self.service.history)
+        self.assertEqual(store.yearly_backup(), {"years": [], "cursors": []})
+
+    def test_electricity_rates_roundtrip_and_older_archives_remain_supported(self):
+        from tapo_details import TapoSamples
+        store = TapoSamples(self.config)
+        mac = "12:34:56:78:9a:bc"
+        store.set_rate(mac, "30.125", None)
+        payload = backup.decrypt(self.export(), PASSWORD)
+        self.assertEqual(payload["electricity_rates"], {mac: "30.125"})
+        store.set_rate(mac, "40", "30.125")
+        backup.install(self.config, payload, self.service.history)
+        self.assertEqual(store.rates(), {mac: "30.125"})
+        del payload["electricity_rates"]
+        backup.validate(payload)
+        backup.install(self.config, payload, self.service.history)
+        self.assertEqual(store.rates(), {})
+        for rates in ({mac: "-1"}, {mac: "30.0"}, {mac: None}, {"bad": "30"}, []):
+            with self.assertRaises(ValueError):
+                backup.validate({**payload, "electricity_rates": rates})
+
     def setUp(self) -> None:
         self.directory = self.enterContext(tempfile.TemporaryDirectory())
         self.root = Path(self.directory)

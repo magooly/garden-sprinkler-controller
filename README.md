@@ -6,7 +6,8 @@ Documentation updated **14 November 2026**.
 
 Version 1.5.0 adds true saved 24/7 appliance routines, desktop/phone graph
 dashboards, system-health views, quieter telemetry warnings, and 6-hour,
-24-hour and 7-day histories with five-minute measurements. Garden/appliance
+24-hour and 7-day histories with five-minute measurements (one minute for
+the off-peak hot-water plug). Garden/appliance
 fault isolation, off-peak reconciliation and compact phone stops are preserved.
 
 [Read the printable user and installation guide (PDF)](README.pdf).
@@ -282,9 +283,10 @@ guaranteed. Changes made through the physical button or Tapo app are not tracked
 this is not a historical power-usage graph. Refresh history updates the view
 without reading or switching plugs.
 
-The controller now also records a snapshot from each assigned plug every
-five minutes, even with desktop and phone closed. Sampling starts in the current
-five-minute slot after startup and runs in the telemetry worker, not the
+The controller also records a snapshot from ordinary assigned plugs every
+five minutes and from the off-peak hot-water plug every **60 seconds**, even
+with desktop and phone closed. Sampling starts in the current time slot after
+startup and runs in the telemetry worker, not the
 switching loop. On the desktop, all six measurement graphs appear together in
 two columns: power and voltage, current and reported state, then today's and
 this month's cumulative energy counters. Each graph has its own scale and a
@@ -320,11 +322,121 @@ is shown only when actual readings bracket both exact local midnights, with
 uninterrupted samples and a monotonic monthly counter. Missing boundaries,
 counter resets (including month changes), gaps and the current partial day
 show **Incomplete**. Values are never estimated by joining graph points.
+
+### Estimated electricity costs
+
+Each assigned plug can have its own saved **dollars per kWh ($/kWh)** rate, allowing
+off-peak hot water to use a different tariff from other appliances. Open that
+plug's graphs and choose **Electricity rate** on desktop, or expand
+**Electricity rate for this plug** on the phone and press **Save rate**.
+Enter dollars directly, for example `0.26268` for $0.26268/kWh.
+Use a non-negative number, with up to six decimal places (maximum 14
+characters). Blank removes the rate and hides day/month costs; an explicitly entered
+`0` means a zero-cost tariff. Invalid values or save failures are reported,
+and a conflicting change in another window requires refreshing before retrying.
+
+The **Today** and **Month** energy panels show **Estimated cost: $…** beneath
+the large kWh reading. At $0.30/kWh, 5 kWh costs $1.50 and 120 kWh costs
+$36.00. Costs use the latest reported day/month counters, not area under graph
+lines, and round to the nearest cent. Missing, failed or invalid readings show
+**Estimated cost unavailable**, never an invented $0. These are usage-only
+estimates: daily supply charges, tiered/time-varying tariffs and discounts are
+not calculated. Changing a rate recalculates the entire reported day/month at
+that rate; these two panels do not retain historical tariffs. The recorded timestamp
+also applies to the cost, so it is not a live billing figure.
+
+Rates are shared by desktop and phone, persist across restarts and follow the
+plug's MAC identity rather than its name or channel. They are stored in the
+original cents-based format internally; the entry fields and displayed rate
+convert exactly to dollars. Existing saved rates retain their monetary value,
+so an incorrectly entered old rate must be corrected explicitly, not silently
+reinterpreted as dollars. Rates are stored in the
+private telemetry database but are exported separately in new encrypted
+full-system backups; the telemetry readings themselves remain excluded.
+Older backups without rates remain supported and restore with no saved rates.
+Saving a rate does not switch devices or alter routines. Restart the updated
+controller and phone services once to enable the new API, then reopen the
+desktop graph or reload the phone page.
+
+**Yearly electricity** on each plug's graph keeps a permanent, calendar-year
+usage tally and estimated cost, separate from the day/month estimates. The
+desktop shows it in the scrollable footer and Recorded periods & details; the
+phone shows current and completed years above the charts. Totals follow the
+plug's MAC, survive restarts and the eight-day raw-reading retention limit,
+and are included in new encrypted backups.
+
+The tally counts increases in the monthly counter, falling back to the daily
+counter when appropriate: it never adds the overlapping daily and monthly
+figures together or estimates energy from watts/graph lines. Tracking begins
+with the first available recorded counter baseline, not an assumed January 1.
+The displayed tracking dates describe the covered part of each year, not a
+projected full-year bill. Retained old readings are imported once; usage before
+those readings cannot be reconstructed.
+
+Yearly costs accumulate using the saved rate for each measured increase;
+changing or clearing the rate does not rewrite earlier costs. An interval
+spanning a rate change, usage without a rate, and imported historical usage
+whose tariff was never recorded stay explicitly **unpriced**. The displayed
+cost is then only the priced portion, not the cost of the whole year's usage.
+Zero is a genuine free tariff. Costs use exact decimal arithmetic and are
+rounded to cents for display, not separately at each poll. Supply charges,
+tiered pricing and automatic time-of-use tariffs are excluded.
+
+Counter resets, failures and missing boundaries mark coverage incomplete.
+Where a later monthly counter recovers missed usage, its increase is retained;
+across a month/year rollover only the known new daily counter is added, so
+unobserved usage before the boundary may be missing. Completed years remain
+visible. Restoring a backup replaces the rates, tally and its duplicate-counting
+checkpoint together and clears excluded raw readings. Older backups without a
+tally restore with an empty tally. Restart the updated controller once to
+activate yearly recording, then reopen desktop graphs or reload the phone page.
+If a Tapo read is in flight, restoration asks you to wait and retry before
+changing anything. After restore, scheduled telemetry pauses until the required
+controller restart so readings from old assignments cannot alter the restored tally.
+
+For a plug configured as off-peak hot water, the voltage graph includes
+**voltage-observation time band** below the plot. Red means a positive voltage
+was measured; blue means 0 V was actually measured; white means no valid
+voltage reading. Consecutive observations form horizontal sections, not
+mixed-colour markers. Each reading covers at most its recorded polling interval;
+unrecorded gaps are white. This is a sample-based estimate, not continuous
+proof of supply. Hover or click
+the desktop band, or tap the phone band/use its snapshot slider, to see
+the nearest individual time and voltage or Unknown. A failed history refresh
+marks retained desktop readings stale. The selected reading time is the actual
+read time where available, otherwise the sample time. An unreachable plug may
+have lost supply or network access: **Unknown never means supply OFF**, and
+neither a measured voltage nor a relay state proves that the water is heating.
+**Recorded periods & details** lists the start, end and duration of each
+voltage/contact period in am/pm time. Unknown periods of up to two minutes are
+labelled **Brief unknown**; longer ones are **Sustained unknown**. These labels
+describe duration, not a diagnosis of off-peak loss. Changes can occur between
+polls, and short gaps can be hard to see at seven-day zoom; use the period list
+or a shorter range to inspect them. The plug must itself be powered from the
+off-peak supply for these observations to reflect that supply.
+White periods **longer than 10 minutes** also show their known start time
+above the voltage band and the next observed voltage time below it, with
+lines pointing to the boundaries. Exactly ten minutes and shorter gaps
+have no chart labels. A white period already in progress at the left edge
+has no invented start time; one still open at the right edge has no return
+time. Labels are staggered into extra rows when necessary to avoid overlap,
+and include the date on the seven-day view. Crowded charts may require
+vertical scrolling. These labels use the recorded interval boundaries, not
+continuous measurements, and do not diagnose the cause of missing readings.
+Immediately below the voltage band, a scrollable list shows the first missing
+or 0 V interval and the next observed voltage, newest first. Consecutive
+missing and 0 V periods are grouped; an interval already present at the start
+of the selected range is marked as such, and a return outside the range is not
+invented. These are sample times, not exact switching times: a missing reading
+can also be a communication failure. The list includes short gaps, which may
+not be actual supply interruptions. Older five-minute readings are less precise.
 Missing or failed samples break the line, rather than becoming zero. Counters
 can reset at day/month boundaries and are not interval consumption.
 Recording cannot reconstruct earlier readings.
-Existing quarter-hour readings are preserved after the five-minute upgrade;
-the new intermediate slots remain gaps until recorded. Restart the background
+Existing five-minute hot-water readings retain their original cadence; they
+are not turned into invented one-minute failures. Earlier quarter-hour readings
+are preserved, with unrecorded intermediate slots left unknown. One-minute
+recording begins after the updated controller starts. Restart the background
 controller service to activate the new cadence, then reopen desktop/reload phone.
 The separate private
 `settings.json.tapo-samples.sqlite3` retains eight days, survives restarts and
@@ -428,8 +540,9 @@ time for OFF and logs explicitly if it cannot be confirmed.
 The graph separates requested operation from last-confirmed ON/OFF history.
 An unreachable observation starts an Unknown period; no definite loss-of-supply
 time or cause is inferred. Outages can occur between checks. Last confirmation
-is a historical observation, not continuous proof. The five-minute measurement
-graphs remain snapshots with gaps for failed readings.
+is a historical observation, not continuous proof. The one-minute hot-water
+measurement graphs remain snapshots with gaps for failed readings; other plugs
+remain at five minutes.
 
 An unpowered plug cannot receive commands. "Unavailable" could mean off-peak
 supply loss, Wi-Fi trouble, credentials or firmware, not proof of any one cause.
@@ -541,6 +654,12 @@ Use the HTTPS `https://<computer>.<tailnet>.ts.net` URL shown by the status
 command in Chrome on the Android phone, with Tailscale connected. The browser
 will ask for the phone-control password. Tailscale Serve is tailnet-only; do
 not use Tailscale Funnel or configure router port forwarding for this service.
+
+An optional **Garden Sprinklers Android launcher** provides a single home-screen
+icon for checking the private page, opening Tailscale if needed, and checking
+again when you return. It opens the existing controls in your normal browser;
+it does not store passwords, sign in automatically or send sprinkler commands.
+See [Android launcher installation and build instructions](android-launcher/README.md).
 
 Choose **10 minutes**, **30 minutes**, **1 hour**, or **Custom**, then press
 **RUN**. For Custom on phone or desktop, enter minutes (for example `30` or
@@ -907,7 +1026,9 @@ write also requires a separate readback transaction.
   This is application recovery, not an Ubuntu image: reinstall this repository and
   its requirements on a replacement computer; OS packages, the app executable,
   router/network settings, TLS/Tailscale configuration and unrelated OS secrets
-  are not included. The separate five-minute telemetry database is **not included**.
+  are not included. The separate raw telemetry readings are **not included**;
+  saved electricity rates, yearly totals and their accounting checkpoints are
+  exported separately into the encrypted archive.
   The device-bound hot-water `off_peak` mapping flag is included.
   The experimental requirements file and virtual environment must be retained
   or recreated separately when the controller uses `.venv-tapo`.
@@ -1088,6 +1209,8 @@ The UI and scheduling code use the `RelayBackend` protocol in
   and opt-in hot-water reconciliation.
 - [tapo_details.py](tapo_details.py): read-only telemetry and persistent
   five-minute measurements.
+- [energy_ledger.py](energy_ledger.py): permanent yearly counter totals, tariff
+  accounting and validated backup checkpoints.
 - [activity_history.py](activity_history.py): bounded event history and selectable
   requested/confirmed timelines.
 - [phone_server.py](phone_server.py), [phone_ui.html](phone_ui.html),

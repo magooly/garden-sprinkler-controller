@@ -1,0 +1,18 @@
+<resources>
+    <string name="app_name">Garden Sprinklers</string>
+    <string name="heading">Garden Sprinklers</string>
+    <string name="intro">Connect privately, then open your sprinkler controls.</string>
+    <string name="checking">Checking the sprinkler page&#8230;</string>
+    <string name="connect_tailscale">Connect Tailscale</string>
+    <string name="check_again">Check connection / Open Sprinklers</string>
+    <string name="install_tailscale">Get Tailscale</string>
+    <string name="instructions">1. Tap Connect Tailscale.\n2. In Tailscale, connect or sign in if prompted.\n3. Return here using Android Back or Recent apps.\n\nThis launcher checks again when you return and opens Sprinklers when reachable. You still use the normal sprinkler web password.</string>
+    <string name="privacy">No VPN passwords are stored. No sprinkler commands are sent. A connection failure can also mean the controller computer is unavailable.</string>
+    <string name="waiting">Return here after connecting Tailscale. Checking for up to about a minute&#8230;</string>
+    <string name="opened">Sprinklers opened in your browser. To open it again, tap Check connection / Open Sprinklers.</string>
+    <string name="not_installed">Tailscale is not installed or cannot be opened. Use Get Tailscale, sign in, then return here.</string>
+    <string name="no_browser">No browser could be opened. Install or enable a browser, then try again.</string>
+    <string name="check_failed">Could not reach Sprinklers. %1$s\n\nConnect Tailscale and return here. If it is already connected, check that the controller computer is on and the phone web service is running.</string>
+    <string name="retrying">Waiting for the private page (%1$d/%2$d). %3$s</string>
+    <string name="page_address">Private page: %1$s</string>
+</resources>

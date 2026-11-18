@@ -93,6 +93,10 @@ class ServiceClient:
             raise OSError("History range unsupported. Restart the controller service and reopen the app.")
         return result
 
+    def set_tapo_rate(self, channel: int, rate: str, expected_rate: str | None) -> dict:
+        return exchange(self.path, {"command": "tapo_rate", "channel": channel,
+                                    "rate": rate, "expected_rate": expected_rate})
+
     def history(self, offset: int, category: str = "all") -> dict:
         if not self.history_supported:
             raise ValueError("Restart the updated controller service to view activity history.")

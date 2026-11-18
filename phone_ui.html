@@ -63,7 +63,7 @@
         <dl id="health-checks"></dl>
       </dialog>
       <section id="tapo-panel" class="panel hidden" aria-labelledby="tapo-heading">
-        <h2 id="tapo-heading">Tapo details (read-only)</h2>
+        <h2 id="tapo-heading">Tapo readings and estimated costs</h2>
         <p>Unavailable is not zero. Readings do not prove electrical isolation or appliance operation.</p>
         <div id="tapo-status" role="status"></div>
         <div class="tapo-table-scroll">
@@ -80,6 +80,21 @@
           <label for="tapo-range">History period</label>
           <select id="tapo-range"><option value="6">6 hours</option><option value="24" selected>24 hours</option><option value="168">7 days</option></select>
           <p id="tapo-graph-status" role="status"></p>
+          <details id="tapo-rate-settings">
+            <summary>Electricity rate for this plug</summary>
+            <form id="tapo-rate-form">
+              <label for="tapo-rate">Dollars per kWh ($/kWh)</label>
+              <input id="tapo-rate" type="text" inputmode="decimal" maxlength="14" autocomplete="off" placeholder="e.g. 0.26268">
+              <p>Enter dollars, e.g. 0.26268 means $0.26268/kWh. Blank hides day/month cost; 0 is a zero-cost rate. Up to six decimal places. Usage estimates exclude supply charges. Day/month costs recalculate; yearly costs retain recorded tariffs. A tariff change between readings leaves that interval unpriced.</p>
+              <button id="tapo-rate-save" class="quiet" type="submit" disabled>Save rate</button>
+              <p id="tapo-rate-status" role="status"></p>
+            </form>
+          </details>
+          <section aria-labelledby="tapo-yearly-heading">
+            <h4 id="tapo-yearly-heading">Yearly electricity — recorded usage and cost</h4>
+            <p>Only usage since tracking began, not a projected full-year bill. Historical tariffs are retained; missing rates stay unpriced. Supply charges excluded.</p>
+            <div id="tapo-yearly-energy" role="status"></div>
+          </section>
           <div id="tapo-graph-overview">
           <p>Green: recorded ON · Blue: recorded OFF · Grey: Unknown</p>
           <div id="tapo-timeline" aria-label="24-hour switching timeline"></div>
@@ -89,7 +104,7 @@
             <div id="tapo-requested-timeline" aria-label="Requested operation timeline"></div>
             <p>Unavailable means supply or connection unknown, not proven off-peak loss. Above: last confirmed state history. Below: measured samples; missing readings remain gaps.</p>
           </section>
-          <h4>Recorded readings — every 5 minutes</h4>
+          <h4>Recorded readings — every 5 minutes; hot water every 1 minute</h4>
           <p>Snapshots, not interval averages. Missing readings break the line; short runs can occur between samples.</p>
           <div id="tapo-sample-graphs"></div>
           <button id="tapo-details-open" class="quiet" type="button">Recorded periods &amp; details</button>

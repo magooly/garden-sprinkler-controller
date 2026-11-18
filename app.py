@@ -12,11 +12,12 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, font as tkfont, messagebox, ttk
 from typing import Callable, Iterable
 
 import customtkinter as ctk
 import system_backup
+import energy_ledger
 
 from controller import (
     DAY_NAMES,
@@ -41,6 +42,7 @@ from controller import (
 from waveshare_relay import WaveshareRelays
 from service import DEFAULT_CONFIG, default_socket
 from service_client import ServiceClient
+from tapo_details import voltage_periods, voltage_interruptions, dollars_to_rate, rate_to_dollars
 from schedule_overview import ScheduleOverview, WeeklyOverview
 from timetable_profiles import RECOVERY_PROFILE, TimetableProfiles, profile_name, timetable
 
@@ -834,9 +836,14 @@ class SprinklerApp(ctk.CTk):
         sample_canvases: dict[str, tk.Canvas] = {}
         reading_labels: dict[str, ctk.CTkLabel] = {}
         reading_times: dict[str, ctk.CTkLabel] = {}
+        cost_labels: dict[str, ctk.CTkLabel] = {}
         units = {"power_w": "W", "voltage_v": "V", "current_a": "A",
                  "today_kwh": "kWh", "month_kwh": "kWh"}
         panel_colors = ("#17283b", "#193326", "#30223b", "#173438", "#392d1c", "#29313d")
+        observation_band: tk.Canvas | None = None
+        observation_label: ctk.CTkLabel | None = None
+        interruption_frame: ctk.CTkFrame | None = None
+        interruption_list: tk.Text | None = None
         for index, (title, key) in enumerate(metrics.items()):
             color = panel_colors[index]
             panel = ctk.CTkFrame(graphs, fg_color=color, border_color="white",
@@ -846,12 +853,32 @@ class SprinklerApp(ctk.CTk):
             sample_canvas = tk.Canvas(panel, height=130, width=300, background=color,
                                       highlightthickness=0)
             sample_canvas.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 0))
-            ctk.CTkLabel(panel, text=title, text_color="white", height=20).grid(row=1, column=0, padx=6)
+            if key == "voltage_v":
+                observation_band = tk.Canvas(panel, height=13, width=300, background=color,
+                                             highlightthickness=0)
+                observation_label = ctk.CTkLabel(
+                    panel, text="Supply observations: red >0 V · blue 0 V · white unknown (times are estimates)",
+                    text_color="white", height=18, font=ctk.CTkFont(size=10),
+                )
+                interruption_frame = ctk.CTkFrame(panel, fg_color="transparent")
+                interruption_frame.grid_columnconfigure(0, weight=1)
+                interruption_list = tk.Text(interruption_frame, height=2, wrap="word",
+                                            background=color, foreground="white", relief="flat",
+                                            highlightthickness=0, font=("TkDefaultFont", 10))
+                interruption_list.grid(row=0, column=0, sticky="nsew")
+                interruption_scroll = tk.Scrollbar(interruption_frame, command=interruption_list.yview)
+                interruption_scroll.grid(row=0, column=1, sticky="ns")
+                interruption_list.configure(yscrollcommand=interruption_scroll.set, state="disabled")
+            ctk.CTkLabel(panel, text=title, text_color="white", height=20).grid(row=3, column=0, padx=6)
             reading = ctk.CTkLabel(panel, text="Unavailable", text_color="white",
                                    height=28, font=ctk.CTkFont(size=24, weight="bold"))
-            reading.grid(row=2, column=0, padx=6)
+            reading.grid(row=4, column=0, padx=6)
+            if key in ("today_kwh", "month_kwh"):
+                cost = ctk.CTkLabel(panel, text="", text_color="white",
+                                  height=20, font=ctk.CTkFont(size=18, weight="bold"))
+                cost_labels[key] = cost
             recorded = ctk.CTkLabel(panel, text="No recorded sample", text_color="white", height=20)
-            recorded.grid(row=3, column=0, padx=6, pady=(0, 6))
+            recorded.grid(row=6, column=0, padx=6, pady=(0, 6))
             sample_canvases[key] = sample_canvas
             reading_labels[key] = reading
             reading_times[key] = recorded
@@ -860,10 +887,11 @@ class SprinklerApp(ctk.CTk):
             viewport_height = graphs._parent_canvas.winfo_height()
             if viewport_height <= 1:
                 return
-            panel = next(iter(sample_canvases.values())).master
-            plot = next(iter(sample_canvases.values()))
-            overhead = panel.winfo_reqheight() - plot.winfo_reqheight()
-            plot_height = max(90, (viewport_height - 24) // 3 - overhead - 8)
+            plots = list(sample_canvases.values())
+            overhead = sum(max(plot.master.winfo_reqheight() - plot.winfo_reqheight()
+                               for plot in plots[index:index + 2])
+                           for index in range(0, len(plots), 2))
+            plot_height = max(64, (viewport_height - 24 - overhead - 24) // 3)
             for sample_canvas in sample_canvases.values():
                 if int(sample_canvas.cget("height")) != plot_height:
                     sample_canvas.configure(height=plot_height)
@@ -882,6 +910,15 @@ class SprinklerApp(ctk.CTk):
         window.bind("<Button-5>", scroll_graphs, add="+")
         controls = ctk.CTkFrame(window, fg_color="transparent")
         controls.grid(row=4, column=0, pady=8)
+        yearly_frame = ctk.CTkFrame(window)
+        yearly_frame.grid(row=5, column=0, sticky="ew", padx=12, pady=(0, 8))
+        yearly_frame.grid_columnconfigure(0, weight=1)
+        yearly_text = tk.Text(yearly_frame, height=3, wrap="word", background="#202020",
+                              foreground="white", relief="flat", font=("TkDefaultFont", 10))
+        yearly_text.grid(row=0, column=0, sticky="ew")
+        yearly_scroll = tk.Scrollbar(yearly_frame, command=yearly_text.yview)
+        yearly_scroll.grid(row=0, column=1, sticky="ns")
+        yearly_text.configure(yscrollcommand=yearly_scroll.set, state="disabled")
         details_window: ctk.CTkToplevel | None = None
         text: ctk.CTkTextbox | None = None
         replies: queue.Queue[dict | Exception] = queue.Queue()
@@ -889,9 +926,67 @@ class SprinklerApp(ctk.CTk):
         history_error = ""
         history_range = tk.StringVar(window, "24 hours")
         ranges = {"6 hours": 6, "24 hours": 24, "7 days": 168}
+        observation_left = 70
+        observation_width = 1
         range_menu = ctk.CTkOptionMenu(controls, variable=history_range, values=list(ranges),
                                        command=lambda _value: refresh())
         range_menu.grid(row=0, column=2, padx=6)
+        rate_status = ctk.CTkLabel(controls, text="", wraplength=230, height=18,
+                                 font=ctk.CTkFont(size=10))
+        rate_status.grid(row=0, column=4, sticky="ew", padx=6)
+
+        def edit_rate() -> None:
+            current = data.get("rate_cents_per_kwh")
+            dialog = ctk.CTkInputDialog(
+                title="Electricity rate for this plug",
+                text=f"Current: {'$' + rate_to_dollars(current) + '/kWh' if current is not None else 'not set'}\n"
+                     "Enter dollars/kWh, e.g. 0.26268 (up to 6 decimal places).\n"
+                     "Blank hides day/month costs; yearly history stays. 0 means free electricity.\n"
+                     "Day/month costs recalculate; yearly costs retain recorded tariffs.\n"
+                     "Supply charges excluded. A tariff change between readings leaves that interval unpriced.",
+            )
+            value = dialog.get_input()
+            if value is None:
+                return
+            try:
+                cents = dollars_to_rate(value)
+            except ValueError as error:
+                messagebox.showerror("Invalid electricity rate", str(error), parent=window)
+                return
+            rate_button.configure(state="disabled")
+            button.configure(state="disabled")
+            range_menu.configure(state="disabled")
+            rate_status.configure(text="Saving electricity rate...")
+            saved: queue.Queue[dict | Exception] = queue.Queue()
+
+            def save() -> None:
+                try:
+                    saved.put(client.set_tapo_rate(channel, cents or "", current))
+                except (OSError, RuntimeError, ValueError) as error:
+                    saved.put(error)
+
+            def finish() -> None:
+                if not window.winfo_exists():
+                    return
+                try:
+                    result = saved.get_nowait()
+                except queue.Empty:
+                    window.after(100, finish)
+                    return
+                if isinstance(result, Exception):
+                    rate_status.configure(text=f"Rate not saved: {result}")
+                    rate_button.configure(state="normal")
+                    button.configure(state="normal")
+                    range_menu.configure(state="normal")
+                else:
+                    rate_status.configure(text="Rate saved. Refreshing estimated costs...")
+                    refresh()
+
+            threading.Thread(target=save, daemon=True).start()
+            window.after(100, finish)
+
+        rate_button = ctk.CTkButton(controls, text="Electricity rate", command=edit_rate, state="disabled")
+        rate_button.grid(row=0, column=3, padx=6)
 
         def graph_time(stamp: datetime) -> str:
             local = stamp.astimezone()
@@ -926,6 +1021,7 @@ class SprinklerApp(ctk.CTk):
                 draw_samples(key, sample_canvas, start)
 
         def draw_samples(key: str, sample_canvas: tk.Canvas, start: datetime) -> None:
+            nonlocal observation_left, observation_width
             sample_canvas.delete("all")
             samples = data.get("samples", [])
             latest = max(samples, key=lambda row: datetime.fromisoformat(row["timestamp"])) if samples else None
@@ -936,6 +1032,16 @@ class SprinklerApp(ctk.CTk):
                 reading_labels[key].configure(text="ON" if value else "OFF")
             else:
                 reading_labels[key].configure(text=f"{float(value):.3f} {units[key]}")
+            if key in cost_labels:
+                if data.get("rate_cents_per_kwh") is None:
+                    cost_labels[key].grid_remove()
+                else:
+                    cost = data.get("estimated_costs", {}).get(key)
+                    cost_labels[key].configure(
+                        text=("Estimated cost unavailable" if cost is None else f"Estimated cost: ${cost}")
+                             + (" (stale)" if history_error else ""),
+                    )
+                    cost_labels[key].grid(row=5, column=0, padx=6)
             if latest is None:
                 recorded = "No recorded sample"
             else:
@@ -953,13 +1059,14 @@ class SprinklerApp(ctk.CTk):
             maximum = max([1.0] + [value for value in values if value is not None])
             scale_font = ("TkDefaultFont", 13, "bold")
             scale_text = f"{maximum:.3f}"
-            scale_item = sample_canvas.create_text(3, 25, text=scale_text, fill="white",
+            plot_bottom = max(25, sample_canvas.winfo_height() - 40)
+            plot_top = max(12, min(25, plot_bottom - 15))
+            scale_item = sample_canvas.create_text(3, plot_top, text=scale_text, fill="white",
                                                   anchor="w", font=scale_font)
             scale_bounds = sample_canvas.bbox(scale_item)
             left_margin = max(70, scale_bounds[2] + 12) if scale_bounds else 70
             sample_width = max(1, sample_canvas.winfo_width() - left_margin - 15)
-            plot_bottom = max(35, sample_canvas.winfo_height() - 50)
-            axis_y = plot_bottom + 20
+            axis_y = plot_bottom + 12
             previous = None
             count = 0
             for row, value in zip(data.get("samples", []), values):
@@ -968,7 +1075,7 @@ class SprinklerApp(ctk.CTk):
                     continue
                 duration = (datetime.fromisoformat(data["end"]) - start).total_seconds()
                 x = left_margin + (datetime.fromisoformat(row["timestamp"]) - start).total_seconds() / duration * sample_width
-                y = plot_bottom - value / maximum * (plot_bottom - 25)
+                y = plot_bottom - value / maximum * (plot_bottom - plot_top)
                 if previous is not None:
                     sample_canvas.create_line(*previous, x, y, fill="#f6b73c", width=2)
                 sample_canvas.create_oval(x - 3, y - 3, x + 3, y + 3, fill="#f6b73c", outline="")
@@ -983,8 +1090,94 @@ class SprinklerApp(ctk.CTk):
                     text=(stamp.strftime("%d/%m ") if duration > 86400 else "") + graph_time(stamp),
                     fill="white", anchor="w" if fraction == 0 else "e" if fraction == 1 else "center",
                 )
-            sample_canvas.create_text(left_margin, axis_y + 18, text=f"{count} snapshots; gaps are not zero",
+            sample_canvas.create_text(left_margin, axis_y + 14, text=f"{count} snapshots; gaps are not zero",
                                       fill="white", anchor="w")
+            if key == "voltage_v" and observation_band is not None and data.get("off_peak"):
+                observation_left, observation_width = left_margin, sample_width
+                observation_band.delete("all")
+                periods = voltage_periods(samples, start, start + timedelta(seconds=duration))
+                label_font = tkfont.Font(family="TkDefaultFont", size=9)
+                lanes: dict[str, list[float]] = {"start": [], "return": []}
+                labels = []
+                for index, period in enumerate(periods):
+                    if period["state"] != "Unknown" or period["seconds"] <= 600:
+                        continue
+                    boundaries = []
+                    if index > 0:
+                        boundaries.append(("start", period["start"]))
+                    if index + 1 < len(periods) and periods[index + 1]["state"] == "Voltage":
+                        boundaries.append(("return", period["end"]))
+                    for edge, timestamp in boundaries:
+                        stamp = datetime.fromisoformat(timestamp)
+                        text = (stamp.astimezone().strftime("%d/%m ") if duration > 86400 else "") + graph_time(stamp)
+                        x = left_margin + (stamp - start).total_seconds() / duration * sample_width
+                        label_width = label_font.measure(text) + 4
+                        left = min(max(2, x - label_width / 2),
+                                   observation_band.winfo_width() - label_width - 2)
+                        lane = next((i for i, right in enumerate(lanes[edge]) if left >= right + 6),
+                                    len(lanes[edge]))
+                        if lane == len(lanes[edge]):
+                            lanes[edge].append(0)
+                        lanes[edge][lane] = left + label_width
+                        labels.append((edge, lane, x, left, label_width, text))
+                line_height = label_font.metrics("linespace") + 4
+                band_top = 2 + len(lanes["start"]) * line_height
+                band_bottom = band_top + 9
+                band_height = band_bottom + 2 + len(lanes["return"]) * line_height
+                if int(observation_band.cget("height")) != band_height:
+                    observation_band.configure(height=band_height)
+                    window.after_idle(fit_graphs)
+                for period in periods:
+                    x1 = left_margin + (datetime.fromisoformat(period["start"]) - start).total_seconds() / duration * sample_width
+                    x2 = left_margin + (datetime.fromisoformat(period["end"]) - start).total_seconds() / duration * sample_width
+                    observation_band.create_rectangle(
+                        x1, band_top, x2, band_bottom, outline="",
+                        fill={"Voltage": "#ff3030", "Zero": "#2288ff", "Unknown": "#ffffff"}[period["state"]],
+                        tags=("voltage-observation",),
+                    )
+                for edge, lane, x, left, label_width, text in labels:
+                    y = (band_top - (lane + 1) * line_height + line_height / 2 if edge == "start" else
+                         band_bottom + lane * line_height + line_height / 2)
+                    observation_band.create_line(x, band_top if edge == "start" else band_bottom,
+                                                 left + label_width / 2, y, fill="#aaaaaa",
+                                                 tags=("voltage-gap-leader",))
+                    item = observation_band.create_text(
+                        left + 2, y, text=text, fill="white", anchor="w", font=("TkDefaultFont", 9),
+                        tags=("voltage-gap-time", f"voltage-gap-{edge}"),
+                    )
+                    bounds = observation_band.bbox(item)
+                    if bounds:
+                        background = observation_band.create_rectangle(
+                            bounds, fill=observation_band.cget("background"), outline="",
+                            tags=("voltage-gap-background",),
+                        )
+                        observation_band.tag_raise(item, background)
+                observation_band.tag_lower("voltage-gap-leader")
+
+        def inspect_observation(event: tk.Event) -> None:
+            if observation_label is None or not data.get("samples"):
+                return
+            start = datetime.fromisoformat(data["start"])
+            duration = (datetime.fromisoformat(data["end"]) - start).total_seconds()
+            fraction = min(1.0, max(0.0, (event.x - observation_left) / observation_width))
+            target = start + timedelta(seconds=fraction * duration)
+            row = min(data["samples"], key=lambda item: abs(
+                (datetime.fromisoformat(item["timestamp"]) - target).total_seconds()))
+            value = row.get("voltage_v")
+            measured = (not row.get("error") and type(value) in (int, float)
+                        and math.isfinite(value) and value >= 0)
+            stamp = datetime.fromisoformat((row.get("updated") or row["timestamp"])
+                                           if measured else row["timestamp"]).astimezone()
+            reading = f"{value:.3f} V measured" if measured else "Unknown; no valid voltage reading"
+            observation_label.configure(text=f"{stamp:%d/%m} {graph_time(stamp)}: {reading}"
+                                        + (" (stale history)" if history_error else ""))
+
+        if observation_band is not None:
+            observation_band.bind("<Motion>", inspect_observation)
+            observation_band.bind("<Button-1>", inspect_observation)
+            observation_band.bind("<Leave>", lambda _event: observation_label.configure(
+                text="Supply observations: red >0 V · blue 0 V · white unknown (times are estimates)"))
+            observation_band.bind("<Configure>", lambda _event: draw())
 
         def fetch(hours: int) -> None:
             try:
@@ -1006,15 +1199,70 @@ class SprinklerApp(ctk.CTk):
             if isinstance(result, Exception):
                 history_error = f"History unavailable: {result}. Previous details are stale.\n\n"
                 label.configure(text=f"History unavailable: {result}. Previous graph, if any, is stale.")
+                rate_button.configure(state="disabled")
+                rate_status.configure(text="Refresh history successfully before editing the rate.")
+                yearly_text.configure(state="normal")
+                yearly_text.delete("1.0", "end")
+                yearly_text.insert("end", "Stale yearly tally — refresh failed.\n"
+                                   + energy_ledger.summary(data.get("yearly_energy", [])))
+                yearly_text.configure(state="disabled")
                 update_details()
                 draw()
                 return
             history_error = ""
             data.clear()
             data.update(result)
+            yearly_text.configure(state="normal")
+            yearly_text.delete("1.0", "end")
+            yearly_text.insert("end", "Yearly electricity — recorded usage, no supply charges\n"
+                               + (energy_ledger.summary(result["yearly_energy"])
+                                  if "yearly_energy" in result else
+                                  "Yearly electricity tally unavailable. Restart the updated controller to enable it."))
+            yearly_text.configure(state="disabled")
+            rate_button.configure(state="normal" if result.get("electricity_rate_supported") else "disabled")
+            current_rate = result.get("rate_cents_per_kwh")
+            rate_status.configure(text=(f"${rate_to_dollars(current_rate)}/kWh; usage estimate only."
+                                        if current_rate is not None else "Set a rate to show costs.")
+                                  if result.get("electricity_rate_supported") else
+                                  "Restart the updated controller to enable electricity rates.")
+            if observation_band is not None and observation_label is not None:
+                if result.get("off_peak"):
+                    observation_band.grid(row=1, column=0, sticky="ew", padx=6)
+                    observation_label.grid(row=2, column=0, sticky="ew", padx=6)
+                    if interruption_frame is not None and interruption_list is not None:
+                        interruption_frame.grid(row=7, column=0, sticky="ew", padx=6, pady=(0, 4))
+                        interruption_list.configure(state="normal")
+                        interruption_list.delete("1.0", "end")
+                        periods = voltage_periods(result.get("samples", []),
+                                                  datetime.fromisoformat(result["start"]),
+                                                  datetime.fromisoformat(result["end"]))
+                        interruptions = voltage_interruptions(periods)
+                        for item in reversed(interruptions):
+                            first = datetime.fromisoformat(item["start"]).astimezone()
+                            kind = ("0 V / missing" if item["zero"] and item["unknown"] else
+                                    "0 V measured" if item["zero"] else "Missing")
+                            start_text = "at range start" if item["at_range_start"] else "from"
+                            if item["return"]:
+                                last = datetime.fromisoformat(item["return"]).astimezone()
+                                returned = f"voltage seen {last:%d/%m} {graph_time(last)}"
+                            else:
+                                returned = "no voltage return in range"
+                            interruption_list.insert("end", f"{kind} {start_text} {first:%d/%m} "
+                                                     f"{graph_time(first)}  →  {returned}\n")
+                        if not interruptions:
+                            interruption_list.insert("end", "No missing or zero-voltage periods in this range.")
+                        interruption_list.configure(state="disabled")
+                else:
+                    observation_band.grid_remove()
+                    observation_label.grid_remove()
+                    if interruption_frame is not None:
+                        interruption_frame.grid_remove()
+                window.after_idle(fit_graphs)
             label.configure(text=f"{result['name']} — {history_range.get()}. Recorded ON: "
                             f"{result['on_seconds'] / 3600:.2f} hours.\n{result['description']}\n"
-                            f"{result['warning']} {result.get('samples_warning', '')}")
+                            f"{result['warning']} {result.get('samples_warning', '')}"
+                            + ("\nVoltage snapshots: unknown does not prove supply OFF."
+                               if result.get("off_peak") else ""))
             details_button.configure(state="normal")
             update_details()
             draw()
@@ -1026,7 +1274,14 @@ class SprinklerApp(ctk.CTk):
             text.configure(state="normal")
             text.delete("1.0", "end")
             text.insert("end", history_error)
+            rate = result.get("rate_cents_per_kwh")
+            if rate is not None:
+                text.insert("end", f"Electricity rate: ${rate_to_dollars(rate)}/kWh. Estimated usage cost only; "
+                            "current rate applied to the entire reported day/month, excluding supply charges.\n")
             text.insert("end", "Recorded periods (local time)\n")
+            text.insert("end", "\nYearly electricity (usage only; recorded tariffs, no supply charges)\n"
+                        + (energy_ledger.summary(result["yearly_energy"]) if "yearly_energy" in result else
+                           "Yearly tally unavailable; restart the updated controller.") + "\n")
             text.insert("end", "\nDaily energy (not inferred from graph lines)\n")
             for row in result.get("daily_energy", []):
                 total = "Incomplete" if row["kwh"] is None else f"{row['kwh']:.3f} kWh"
@@ -1034,6 +1289,19 @@ class SprinklerApp(ctk.CTk):
             if result.get("off_peak"):
                 text.insert("end", "Upper band: last confirmed state. Thin lower band: requested operation.\n"
                             "Unavailable means supply or connection unknown; not proven off-peak loss.\n")
+                text.insert("end", "\nVoltage / contact periods (sample-based estimates)\n"
+                            "Red: voltage >0 V; blue: measured 0 V; white: unknown.\n"
+                            "Brief unknown: up to 2 minutes. Sustained unknown: longer; neither proves supply OFF.\n"
+                            "Changes can occur between polls; old readings retain their original cadence.\n")
+                for period in voltage_periods(result.get("samples", []),
+                                              datetime.fromisoformat(result["start"]),
+                                              datetime.fromisoformat(result["end"])):
+                    first = datetime.fromisoformat(period["start"]).astimezone()
+                    last = datetime.fromisoformat(period["end"]).astimezone()
+                    state = {"Voltage": "Voltage observed >0 V", "Zero": "0 V measured",
+                             "Unknown": "Brief unknown" if period["seconds"] <= 120 else "Sustained unknown"}[period["state"]]
+                    text.insert("end", f"{first:%d/%m} {graph_time(first)} — {last:%d/%m} {graph_time(last)}: "
+                                f"{state} ({period['seconds'] / 60:.1f} minutes)\n")
                 for row in result.get("requested_segments", []):
                     text.insert("end", f"Requested {row['state']}: {row['start']} — {row['end']}\n")
             for row in result["segments"]:
@@ -1073,6 +1341,7 @@ class SprinklerApp(ctk.CTk):
 
         def refresh() -> None:
             button.configure(state="disabled")
+            rate_button.configure(state="disabled")
             range_menu.configure(state="disabled")
             threading.Thread(target=fetch, args=(ranges[history_range.get()],), daemon=True).start()
             receive()
